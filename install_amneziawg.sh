@@ -16,9 +16,9 @@ STATE_FILE="$AWG_DIR/setup_state"
 LOG_FILE="$AWG_DIR/install_amneziawg.log"
 KEYS_DIR="$AWG_DIR/keys"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
-COMMON_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/feature/awg2.0/awg_common.sh"
+COMMON_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/main/awg_common.sh"
 COMMON_SCRIPT_PATH="$AWG_DIR/awg_common.sh"
-MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/feature/awg2.0/manage_amneziawg.sh"
+MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/main/manage_amneziawg.sh"
 MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 
 # Флаги CLI
