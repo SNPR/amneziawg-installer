@@ -25,9 +25,15 @@ jobs:
           shellcheck -s bash -S warning install_amneziawg.sh
           shellcheck -s bash -S warning manage_amneziawg.sh
           shellcheck -s bash -S warning awg_common.sh
+          shellcheck -s bash -S warning install_amneziawg_en.sh
+          shellcheck -s bash -S warning manage_amneziawg_en.sh
+          shellcheck -s bash -S warning awg_common_en.sh
 
       - name: Run bash syntax check
         run: |
           bash -n install_amneziawg.sh
           bash -n manage_amneziawg.sh
           bash -n awg_common.sh
+          bash -n install_amneziawg_en.sh
+          bash -n manage_amneziawg_en.sh
+          bash -n awg_common_en.sh

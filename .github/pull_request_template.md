@@ -17,3 +17,4 @@
 - [ ] Tested on clean Ubuntu 24.04 VPS (if script changes)
 - [ ] CHANGELOG.md updated
 - [ ] Documentation updated (if applicable)
+- [ ] English script versions (`_en.sh`) synchronized (if Russian scripts modified)
