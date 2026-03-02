@@ -1,3 +1,7 @@
+<p align="center">
+  🇷🇺 <b>Русский</b> | 🇬🇧 <a href="CHANGELOG.en.md">English</a>
+</p>
+
 # Changelog
 
 Все заметные изменения в проекте документируются в этом файле.

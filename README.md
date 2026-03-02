@@ -1,4 +1,8 @@
 <p align="center">
+  🇷🇺 <b>Русский</b> | 🇬🇧 <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
   <img src="logo.jpg" alt="AmneziaWG 2.0 Installer" width="600">
 </p>
 
