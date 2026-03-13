@@ -547,18 +547,19 @@ generate_vpn_uri() {
 
     load_awg_params || return 1
 
-    local client_privkey client_ip server_pubkey endpoint
+    local client_privkey client_ip server_pubkey endpoint allowed_ips
     client_privkey=$(grep -oP 'PrivateKey\s*=\s*\K\S+' "$conf_file") || return 1
     client_ip=$(grep -oP 'Address\s*=\s*\K[0-9./]+' "$conf_file") || return 1
     server_pubkey=$(cat "$AWG_DIR/server_public.key" 2>/dev/null) || return 1
     endpoint=$(grep -oP 'Endpoint\s*=\s*\K[^:]+' "$conf_file") || return 1
+    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0"
 
     local vpn_uri perl_err
     perl_err=$(awg_mktemp) || perl_err="/tmp/awg_perl_err.$$"
     # shellcheck disable=SC2016
     vpn_uri=$(perl -MCompress::Zlib -MMIME::Base64 -e '
         my ($conf_path, $h1,$h2,$h3,$h4, $jc,$jmin,$jmax,
-            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cpk, $spk) = @ARGV;
+            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cpk, $spk, $aips) = @ARGV;
 
         open my $fh, "<", $conf_path or die;
         local $/; my $raw = <$fh>; close $fh;
@@ -580,7 +581,9 @@ generate_vpn_uri() {
             $inner .= qq("I1":"$ei1","I2":"","I3":"","I4":"","I5":"",);
         }
         my $eraw = je($raw);
-        $inner .= qq("allowed_ips":["0.0.0.0/0"],);
+        my @ips = split(/,/, $aips);
+        my $ips_json = join(",", map { qq("$_") } @ips);
+        $inner .= qq("allowed_ips":[$ips_json],);
         $inner .= qq("client_ip":"$cip","client_priv_key":"$cpk",);
         $inner .= qq("config":"$eraw",);
         $inner .= qq("hostName":"$ep","mtu":"1280",);
@@ -609,7 +612,7 @@ generate_vpn_uri() {
         "$AWG_Jc" "$AWG_Jmin" "$AWG_Jmax" \
         "$AWG_S1" "$AWG_S2" "$AWG_S3" "$AWG_S4" \
         "$AWG_I1" "$AWG_PORT" "$endpoint" \
-        "$client_ip" "$client_privkey" "$server_pubkey" 2>"$perl_err"
+        "$client_ip" "$client_privkey" "$server_pubkey" "$allowed_ips" 2>"$perl_err"
     )
 
     if [[ -z "$vpn_uri" ]]; then
