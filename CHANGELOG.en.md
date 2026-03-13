@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **--no-tweaks:** Installer flag — skips hardening (UFW, Fail2Ban, sysctl tweaks, cleanup) for advanced users with pre-configured servers (#21).
 - **setup_minimal_sysctl():** Minimal sysctl configuration for `--no-tweaks` — only `ip_forward` and IPv6 settings.
 
+### Fixed
+
+- **trap conflict:** Fixed EXIT handler being overwritten when sourcing `awg_common.sh`. Each script now owns its trap and chains the library cleanup explicitly.
+
 ### Changed
 
 - **Expiry cleanup:** Auto-removal of expired clients now uses `syncconf` instead of full restart.
