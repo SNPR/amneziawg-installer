@@ -293,6 +293,7 @@ Options:
   --route-custom=NETS   Mode: Only specified networks
   --endpoint=IP         Specify external IP (for servers behind NAT)
   -y, --yes             Non-interactive mode (all confirmations auto-yes)
+  --no-tweaks           Skip hardening/optimization (no UFW, Fail2Ban, sysctl tweaks)
 ```
 
 <a id="manage-cli-adv"></a>
@@ -594,10 +595,11 @@ sudo bash /root/awg/manage_amneziawg.sh stats --json
 [
   {
     "name": "my_phone",
-    "public_key": "abc123...",
-    "received_bytes": 1332477952,
-    "sent_bytes": 374083174,
-    "latest_handshake": 1710312180
+    "ip": "10.9.9.2",
+    "rx": 1332477952,
+    "tx": 374083174,
+    "last_handshake": 1710312180,
+    "status": "active"
   }
 ]
 ```

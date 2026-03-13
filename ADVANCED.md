@@ -293,6 +293,7 @@ PersistentKeepalive = 33
   --route-custom=СЕТИ   Режим: Только указанные сети
   --endpoint=IP         Указать внешний IP (для серверов за NAT)
   -y, --yes             Неинтерактивный режим (все подтверждения auto-yes)
+  --no-tweaks           Пропустить hardening/оптимизацию (без UFW, Fail2Ban, sysctl tweaks)
 ```
 
 <a id="manage-cli-adv"></a>
@@ -590,10 +591,11 @@ sudo bash /root/awg/manage_amneziawg.sh stats --json
 [
   {
     "name": "my_phone",
-    "public_key": "abc123...",
-    "received_bytes": 1332477952,
-    "sent_bytes": 374083174,
-    "latest_handshake": 1710312180
+    "ip": "10.9.9.2",
+    "rx": 1332477952,
+    "tx": 374083174,
+    "last_handshake": 1710312180,
+    "status": "active"
   }
 ]
 ```
