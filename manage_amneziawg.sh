@@ -14,6 +14,7 @@ fi
 # ==============================================================================
 
 # --- Безопасный режим и Константы ---
+SCRIPT_VERSION="5.6.0"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
