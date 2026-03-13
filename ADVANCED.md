@@ -275,7 +275,7 @@ PersistentKeepalive = 33
 ## 🖥️ CLI Параметры запуска скриптов
 
 <a id="install-cli-adv"></a>
-### install_amneziawg.sh (v5.6.0)
+### install_amneziawg.sh (v5.7.1)
 
 ```
 Опции:
@@ -296,7 +296,7 @@ PersistentKeepalive = 33
 ```
 
 <a id="manage-cli-adv"></a>
-### manage_amneziawg.sh (v5.6.0)
+### manage_amneziawg.sh (v5.7.1)
 
 ```
 Опции:
@@ -357,7 +357,7 @@ sudo bash /root/awg/manage_amneziawg.sh restore
 ## 🛠️ Технические детали
 
 <a id="architecture-adv"></a>
-### Архитектура скриптов (v5.6.0)
+### Архитектура скриптов (v5.7.1)
 
 | Файл | Назначение |
 |------|-----------|
