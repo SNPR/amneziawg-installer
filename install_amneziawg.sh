@@ -936,7 +936,7 @@ step_uninstall() {
     fi
     sysctl -p --system 2>/dev/null
     rm -rf /etc/fail2ban/ 2>/dev/null || true
-    rm -f /etc/apt/sources.list.d/*.bak-* 2>/dev/null || true
+    rm -f /etc/apt/sources.list.d/*.bak-* "$AWG_DIR"/ubuntu.sources.bak-* 2>/dev/null || true
     log "Удаление cron и скриптов..."
     rm -f /etc/cron.d/*amneziawg* /etc/cron.d/awg-expiry /usr/local/bin/*amneziawg*.sh 2>/dev/null
     log "=== ДЕИНСТАЛЛЯЦИЯ ЗАВЕРШЕНА ==="
@@ -1161,7 +1161,7 @@ step2_install_amnezia() {
             if grep -q "^Types: deb$" "$sources_file"; then
                 log "Включение deb-src..."
                 local bak
-                bak="${sources_file}.bak-$(date +%F_%H%M%S)"
+                bak="${AWG_DIR}/ubuntu.sources.bak-$(date +%F_%H%M%S)"
                 cp "$sources_file" "$bak" || log_warn "Ошибка бэкапа"
                 local tmp_sed
                 tmp_sed=$(mktemp)
