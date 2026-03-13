@@ -14,6 +14,7 @@ fi
 # ==============================================================================
 
 # --- Safe mode and Constants ---
+# shellcheck disable=SC2034
 SCRIPT_VERSION="5.7.0"
 set -o pipefail
 AWG_DIR="/root/awg"
