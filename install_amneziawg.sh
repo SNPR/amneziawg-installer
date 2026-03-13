@@ -8,15 +8,15 @@ fi
 # ==============================================================================
 # Скрипт для установки и настройки AmneziaWG 2.0 на Ubuntu/Debian серверах
 # Автор: @bivlked
-# Версия: 5.6.0
-# Дата: 2026-03-12
+# Версия: 5.7.0
+# Дата: 2026-03-13
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Безопасный режим и Константы ---
 set -o pipefail
 
-SCRIPT_VERSION="5.6.0"
+SCRIPT_VERSION="5.7.0"
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
 STATE_FILE="$AWG_DIR/setup_state"
@@ -29,7 +29,7 @@ MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer
 MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 
 # Флаги CLI
-UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0
+UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
 CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"
 CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""
 
@@ -58,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --route-custom=*) CLI_ROUTING_MODE=3; CLI_CUSTOM_ROUTES="${1#*=}" ;;
         --endpoint=*)    CLI_ENDPOINT="${1#*=}" ;;
         --yes|-y)        AUTO_YES=1 ;;
+        --no-tweaks)     NO_TWEAKS=1 ;;
         *) echo "Неизвестный аргумент: $1"; HELP=1 ;;
     esac
     shift
@@ -132,6 +133,7 @@ show_help() {
   --route-custom=СЕТИ   Использовать режим 'Пользовательский' неинтерактивно
   --endpoint=IP         Указать внешний IP сервера (для серверов за NAT)
   -y, --yes             Автоматическое подтверждение (перезагрузки, UFW и т.д.)
+  --no-tweaks           Пропустить hardening/оптимизацию (без UFW, Fail2Ban, sysctl tweaks)
 
 Примеры:
   sudo bash install_amneziawg.sh                             # Интерактивная установка
@@ -563,6 +565,32 @@ optimize_system() {
     optimize_swap
     optimize_nic
     log "Оптимизация системы завершена."
+}
+
+# ==============================================================================
+# Настройка sysctl (минимальная, для --no-tweaks)
+# ==============================================================================
+
+setup_minimal_sysctl() {
+    log "Настройка минимального sysctl (--no-tweaks)..."
+    local f="/etc/sysctl.d/99-amneziawg-forwarding.conf"
+    cat > "$f" << SYSEOF
+# AmneziaWG — минимальные настройки (--no-tweaks)
+net.ipv4.ip_forward = 1
+SYSEOF
+    if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+SYSEOF
+    else
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.forwarding = 1
+SYSEOF
+    fi
+    sysctl -p "$f" >/dev/null 2>&1 || log_warn "Ошибка sysctl -p"
+    log "Минимальный sysctl настроен."
 }
 
 # ==============================================================================
@@ -1078,6 +1106,7 @@ export AWG_H2='${AWG_H2}'
 export AWG_H3='${AWG_H3}'
 export AWG_H4='${AWG_H4}'
 export AWG_I1='${AWG_I1}'
+export NO_TWEAKS=${NO_TWEAKS}
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -1118,7 +1147,11 @@ step1_update_and_optimize() {
     log "### ШАГ 1: Обновление, очистка и оптимизация системы ###"
 
     # Очистка ненужных компонентов (ДО обновления для экономии трафика/времени)
-    cleanup_system
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        cleanup_system
+    else
+        log "Пропуск очистки системы (--no-tweaks)."
+    fi
 
     log "Обновление списка пакетов..."
     apt update -y || die "Ошибка apt update."
@@ -1135,11 +1168,15 @@ step1_update_and_optimize() {
 
     install_packages curl wget gpg sudo ethtool
 
-    # Оптимизация системы
-    optimize_system
-
-    # Настройка sysctl
-    setup_advanced_sysctl
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        # Оптимизация системы
+        optimize_system
+        # Настройка sysctl
+        setup_advanced_sysctl
+    else
+        log "Пропуск оптимизации и hardening (--no-tweaks)."
+        setup_minimal_sysctl
+    fi
 
     log "Шаг 1 успешно завершен."
     request_reboot 2
@@ -1341,10 +1378,14 @@ step3_check_module() {
 
 step4_setup_firewall() {
     update_state 4
-    log "### ШАГ 4: Настройка фаервола UFW ###"
-    install_packages ufw
-    setup_improved_firewall || die "Ошибка настройки UFW."
-    log "Шаг 4 завершен."
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        log "### ШАГ 4: Настройка фаервола UFW ###"
+        install_packages ufw
+        setup_improved_firewall || die "Ошибка настройки UFW."
+        log "Шаг 4 завершен."
+    else
+        log "### ШАГ 4: Пропуск настройки UFW (--no-tweaks) ###"
+    fi
     update_state 5
 }
 
@@ -1467,7 +1508,11 @@ step7_start_service() {
     check_service_status || die "Проверка статуса сервиса не пройдена."
 
     # Fail2Ban
-    setup_fail2ban
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        setup_fail2ban
+    else
+        log "Пропуск Fail2Ban (--no-tweaks)."
+    fi
 
     log "Шаг 7 успешно завершен."
     update_state 99

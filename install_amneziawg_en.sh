@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.6.0
-# Date: 2026-03-12
+# Version: 5.7.0
+# Date: 2026-03-13
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.6.0"
+SCRIPT_VERSION="5.7.0"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -29,7 +29,7 @@ MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer
 MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 
 # CLI flags
-UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0
+UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
 CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"
 CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""
 
@@ -58,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --route-custom=*) CLI_ROUTING_MODE=3; CLI_CUSTOM_ROUTES="${1#*=}" ;;
         --endpoint=*)    CLI_ENDPOINT="${1#*=}" ;;
         --yes|-y)        AUTO_YES=1 ;;
+        --no-tweaks)     NO_TWEAKS=1 ;;
         *) echo "Unknown argument: $1"; HELP=1 ;;
     esac
     shift
@@ -132,6 +133,7 @@ Options:
   --route-custom=NETS   Use 'Custom' mode non-interactively
   --endpoint=IP         Specify external server IP (for servers behind NAT)
   -y, --yes             Auto-confirm (reboots, UFW, etc.)
+  --no-tweaks           Skip hardening/optimization (no UFW, Fail2Ban, sysctl tweaks)
 
 Examples:
   sudo bash install_amneziawg_en.sh                             # Interactive installation
@@ -563,6 +565,32 @@ optimize_system() {
     optimize_swap
     optimize_nic
     log "System optimization completed."
+}
+
+# ==============================================================================
+# Sysctl configuration (minimal, for --no-tweaks)
+# ==============================================================================
+
+setup_minimal_sysctl() {
+    log "Configuring minimal sysctl (--no-tweaks)..."
+    local f="/etc/sysctl.d/99-amneziawg-forwarding.conf"
+    cat > "$f" << SYSEOF
+# AmneziaWG — minimal settings (--no-tweaks)
+net.ipv4.ip_forward = 1
+SYSEOF
+    if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+SYSEOF
+    else
+        cat >> "$f" << SYSEOF
+net.ipv6.conf.all.forwarding = 1
+SYSEOF
+    fi
+    sysctl -p "$f" >/dev/null 2>&1 || log_warn "sysctl -p error"
+    log "Minimal sysctl configured."
 }
 
 # ==============================================================================
@@ -1078,6 +1106,7 @@ export AWG_H2='${AWG_H2}'
 export AWG_H3='${AWG_H3}'
 export AWG_H4='${AWG_H4}'
 export AWG_I1='${AWG_I1}'
+export NO_TWEAKS=${NO_TWEAKS}
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -1118,7 +1147,11 @@ step1_update_and_optimize() {
     log "### STEP 1: System update, cleanup, and optimization ###"
 
     # Clean unnecessary components (BEFORE update to save bandwidth/time)
-    cleanup_system
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        cleanup_system
+    else
+        log "Skipping system cleanup (--no-tweaks)."
+    fi
 
     log "Updating package lists..."
     apt update -y || die "apt update error."
@@ -1135,11 +1168,15 @@ step1_update_and_optimize() {
 
     install_packages curl wget gpg sudo ethtool
 
-    # System optimization
-    optimize_system
-
-    # Sysctl configuration
-    setup_advanced_sysctl
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        # System optimization
+        optimize_system
+        # Sysctl configuration
+        setup_advanced_sysctl
+    else
+        log "Skipping optimization and hardening (--no-tweaks)."
+        setup_minimal_sysctl
+    fi
 
     log "Step 1 completed successfully."
     request_reboot 2
@@ -1341,10 +1378,14 @@ step3_check_module() {
 
 step4_setup_firewall() {
     update_state 4
-    log "### STEP 4: UFW firewall configuration ###"
-    install_packages ufw
-    setup_improved_firewall || die "UFW configuration error."
-    log "Step 4 completed."
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        log "### STEP 4: UFW firewall configuration ###"
+        install_packages ufw
+        setup_improved_firewall || die "UFW configuration error."
+        log "Step 4 completed."
+    else
+        log "### STEP 4: Skipping UFW configuration (--no-tweaks) ###"
+    fi
     update_state 5
 }
 
@@ -1467,7 +1508,11 @@ step7_start_service() {
     check_service_status || die "Service status check failed."
 
     # Fail2Ban
-    setup_fail2ban
+    if [[ "$NO_TWEAKS" -eq 0 ]]; then
+        setup_fail2ban
+    else
+        log "Skipping Fail2Ban (--no-tweaks)."
+    fi
 
     log "Step 7 completed successfully."
     update_state 99
