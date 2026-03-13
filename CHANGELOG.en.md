@@ -10,6 +10,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [5.7.0] — 2026-03-13
+
+### Added
+
+- **syncconf:** `add` and `remove` commands now auto-apply changes via `awg syncconf` — zero-downtime, no active connection drops (#19).
+- **apply_config():** New function in `awg_common.sh` — applies config via `awg syncconf` with fallback to full restart.
+- **--no-tweaks:** Installer flag — skips hardening (UFW, Fail2Ban, sysctl tweaks, cleanup) for advanced users with pre-configured servers (#21).
+- **setup_minimal_sysctl():** Minimal sysctl configuration for `--no-tweaks` — only `ip_forward` and IPv6 settings.
+
+### Changed
+
+- **Expiry cleanup:** Auto-removal of expired clients now uses `syncconf` instead of full restart.
+- **Manage help:** Removed manual restart warning after `add`/`remove` (no longer required).
+- **Version:** 5.6.0 → 5.7.0 across all scripts.
+
+---
+
 ## [5.6.0] — 2026-03-13
 
 ### Added
