@@ -56,6 +56,10 @@ Before submitting a PR, ensure:
    - All management commands: add, remove, list, regen, check, restart
    - Reboot-resume between critical installer steps
    - Client connectivity (handshake, ping, DNS resolution)
+   - Fresh install on clean Debian 12 (bookworm)
+   - Fresh install on clean Debian 13 (trixie)
+   - Client expiry: add with --expires, verify cron auto-removal
+   - Stats: verify `stats` and `stats --json` output
 
 ## Multilingual Scripts
 

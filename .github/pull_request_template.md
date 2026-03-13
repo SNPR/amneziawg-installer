@@ -18,3 +18,4 @@
 - [ ] CHANGELOG.md updated
 - [ ] Documentation updated (if applicable)
 - [ ] English script versions (`_en.sh`) synchronized (if Russian scripts modified)
+- [ ] Tested on Debian 12/13 (if OS-specific changes)

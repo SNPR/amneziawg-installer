@@ -19,13 +19,15 @@ body:
       required: true
 
   - type: dropdown
-    id: ubuntu-version
+    id: os-version
     attributes:
-      label: Ubuntu Version
-      description: Which Ubuntu version are you running?
+      label: OS Version
+      description: Which OS version are you running?
       options:
-        - 24.04 LTS
-        - "25.10"
+        - Ubuntu 24.04 LTS
+        - Ubuntu 25.10
+        - Debian 12 (bookworm)
+        - Debian 13 (trixie)
         - Other
     validations:
       required: true
