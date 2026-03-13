@@ -196,3 +196,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Resume-after-reboot support.
 - Diagnostic report (`--diagnostic`).
 - Full uninstall (`--uninstall`).
+
+[5.6.0]: https://github.com/bivlked/amneziawg-installer/compare/v5.5.1...v5.6.0
+[5.5.1]: https://github.com/bivlked/amneziawg-installer/compare/v5.5...v5.5.1
+[5.5]: https://github.com/bivlked/amneziawg-installer/compare/v5.4...v5.5
+[5.4]: https://github.com/bivlked/amneziawg-installer/compare/v5.3...v5.4
+[5.3]: https://github.com/bivlked/amneziawg-installer/compare/v5.2...v5.3
+[5.2]: https://github.com/bivlked/amneziawg-installer/compare/v5.1...v5.2
+[5.1]: https://github.com/bivlked/amneziawg-installer/compare/v5.0...v5.1
+[5.0]: https://github.com/bivlked/amneziawg-installer/compare/v4.0...v5.0
+[4.0]: https://github.com/bivlked/amneziawg-installer/releases/tag/v4.0
