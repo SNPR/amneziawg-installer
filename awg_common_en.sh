@@ -62,7 +62,7 @@ get_main_nic() {
 get_server_public_ip() {
     local ip=""
     local svc
-    for svc in ifconfig.me api.ipify.org icanhazip.com ipinfo.io/ip; do
+    for svc in https://ifconfig.me https://api.ipify.org https://icanhazip.com https://ipinfo.io/ip; do
         ip=$(curl -4 -sf --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]')
         if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "$ip"
@@ -77,14 +77,43 @@ get_server_public_ip() {
 # Loading / saving parameters
 # ==============================================================================
 
+# Safe configuration loader (whitelist parser, no source/eval)
+# Parses only allowed keys in KEY=VALUE or export KEY=VALUE format
+safe_load_config() {
+    local config_file="${1:-$CONFIG_FILE}"
+    if [[ ! -f "$config_file" ]]; then return 1; fi
+
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+        line="${line#export }"
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [[ "$value" == \'*\' ]]; then
+                value="${value#\'}"
+                value="${value%\'}"
+            fi
+            case "$key" in
+                OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
+                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
+                AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|NO_TWEAKS)
+                    export "$key=$value"
+                    ;;
+            esac
+        fi
+    done < "$config_file"
+}
+
 # Load AWG parameters from configuration file
 load_awg_params() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_error "Configuration file $CONFIG_FILE not found."
         return 1
     fi
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE" || {
+    safe_load_config "$CONFIG_FILE" || {
         log_error "Failed to load $CONFIG_FILE"
         return 1
     }
@@ -322,16 +351,18 @@ EOF
 # Uses awg syncconf for zero-downtime peer updates
 # Falls back to full restart on error
 apply_config() {
-    local strip_out
+    local strip_out rc
     strip_out=$(awg-quick strip awg0 2>/dev/null) || {
         log_warn "awg-quick strip failed, falling back to full restart."
-        systemctl restart awg-quick@awg0 2>/dev/null || log_warn "Service restart error."
-        return $?
+        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Service restart error."
+        return $rc
     }
     echo "$strip_out" | awg syncconf awg0 /dev/stdin 2>/dev/null || {
         log_warn "awg syncconf failed, falling back to full restart."
-        systemctl restart awg-quick@awg0 2>/dev/null || log_warn "Service restart error."
-        return $?
+        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Service restart error."
+        return $rc
     }
     log_debug "Config applied (syncconf)."
 }
@@ -373,7 +404,7 @@ get_next_client_ip() {
     return 1
 }
 
-# Atomic [Peer] addition to server config
+# Atomic [Peer] addition to server config (with locking)
 # add_peer_to_server <name> <pubkey> <client_ip>
 add_peer_to_server() {
     local name="$1"
@@ -385,18 +416,30 @@ add_peer_to_server() {
         return 1
     fi
 
-    if grep -q "^#_Name = ${name}$" "$SERVER_CONF_FILE" 2>/dev/null; then
+    # Inter-process lock (prevents race between cron expiry + manual operation)
+    local lockfile="${AWG_DIR}/.awg_config.lock"
+    local lock_fd
+    exec {lock_fd}>"$lockfile"
+    if ! flock -x -w 10 "$lock_fd"; then
+        log_error "Failed to acquire config lock"
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    if grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Peer '$name' already exists in config"
+        exec {lock_fd}>&-
         return 1
     fi
 
     # Add peer via temp file (atomic)
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
+    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; exec {lock_fd}>&-; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
         log_error "Failed to copy server config"
+        exec {lock_fd}>&-
         return 1
     }
 
@@ -411,14 +454,16 @@ EOF
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Failed to update server config"
+        exec {lock_fd}>&-
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
+    exec {lock_fd}>&-
     log "Peer '$name' added to server config."
     return 0
 }
 
-# Remove [Peer] from server config by name
+# Remove [Peer] from server config by name (with locking)
 # remove_peer_from_server <name>
 remove_peer_from_server() {
     local name="$1"
@@ -428,13 +473,24 @@ remove_peer_from_server() {
         return 1
     fi
 
-    if ! grep -q "^#_Name = ${name}$" "$SERVER_CONF_FILE" 2>/dev/null; then
+    # Inter-process lock
+    local lockfile="${AWG_DIR}/.awg_config.lock"
+    local lock_fd
+    exec {lock_fd}>"$lockfile"
+    if ! flock -x -w 10 "$lock_fd"; then
+        log_error "Failed to acquire config lock"
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    if ! grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Peer '$name' not found in config"
+        exec {lock_fd}>&-
         return 1
     fi
 
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
+    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; exec {lock_fd}>&-; return 1; }
 
     # Remove [Peer] block containing #_Name = name
     # Logic: buffer each [Peer] block, check name, print only if not matching
@@ -471,9 +527,11 @@ remove_peer_from_server() {
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Failed to update server config"
+        exec {lock_fd}>&-
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
+    exec {lock_fd}>&-
     log "Peer '$name' removed from server config."
     return 0
 }
@@ -537,7 +595,16 @@ generate_vpn_uri() {
     client_privkey=$(grep -oP 'PrivateKey\s*=\s*\K\S+' "$conf_file") || return 1
     client_ip=$(grep -oP 'Address\s*=\s*\K[0-9./]+' "$conf_file") || return 1
     server_pubkey=$(cat "$AWG_DIR/server_public.key" 2>/dev/null) || return 1
-    endpoint=$(grep -oP 'Endpoint\s*=\s*\K[^:]+' "$conf_file") || return 1
+    local raw_endpoint
+    raw_endpoint=$(grep -oP 'Endpoint\s*=\s*\K\S+' "$conf_file") || return 1
+    if [[ "$raw_endpoint" == \[* ]]; then
+        # IPv6: [addr]:port
+        endpoint="${raw_endpoint%%]:*}"
+        endpoint="${endpoint#\[}"
+    else
+        # IPv4/hostname: addr:port
+        endpoint="${raw_endpoint%:*}"
+    fi
     allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0"
 
     local vpn_uri perl_err
@@ -702,7 +769,7 @@ regenerate_client() {
     load_awg_params || return 1
 
     # Check that client exists in server config
-    if ! grep -q "^#_Name = ${name}$" "$SERVER_CONF_FILE" 2>/dev/null; then
+    if ! grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Client '$name' not found in server config"
         return 1
     fi
@@ -832,7 +899,7 @@ parse_duration() {
 set_client_expiry() {
     local name="$1"
     local duration="$2"
-    if ! grep -q "^#_Name = ${name}$" "$SERVER_CONF_FILE" 2>/dev/null; then
+    if ! grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Client '$name' not found."
         return 1
     fi
@@ -878,8 +945,15 @@ format_remaining() {
         local ago=$(( (-diff) / 3600 ))
         if [[ $ago -ge 24 ]]; then
             echo "expired $(( ago / 24 ))d ago"
-        else
+        elif [[ $ago -ge 1 ]]; then
             echo "expired ${ago}h ago"
+        else
+            local ago_mins=$(( (-diff) / 60 ))
+            if [[ $ago_mins -ge 1 ]]; then
+                echo "expired ${ago_mins}m ago"
+            else
+                echo "just expired"
+            fi
         fi
         return 0
     fi
@@ -906,6 +980,7 @@ check_expired_clients() {
         local expires_at
         expires_at=$(cat "$efile" 2>/dev/null)
         if [[ -z "$expires_at" || ! "$expires_at" =~ ^[0-9]+$ ]]; then
+            log_warn "Malformed expiry data for '$name': '$(head -c 50 "$efile" 2>/dev/null)'"
             continue
         fi
 
@@ -939,6 +1014,9 @@ install_expiry_cron() {
     fi
     cat > "$EXPIRY_CRON" << CRONEOF
 # AmneziaWG client expiry check — every 5 minutes
+AWG_DIR=${AWG_DIR}
+CONFIG_FILE=${CONFIG_FILE}
+SERVER_CONF_FILE=${SERVER_CONF_FILE}
 */5 * * * * root /bin/bash -c 'source ${AWG_DIR}/awg_common.sh || exit 1; check_expired_clients' >> ${AWG_DIR}/expiry.log 2>&1
 CRONEOF
     chmod 644 "$EXPIRY_CRON"

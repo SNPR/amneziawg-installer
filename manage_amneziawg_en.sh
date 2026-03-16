@@ -196,8 +196,13 @@ backup_configs() {
     cp -a "$AWG_DIR"/*.conf "$AWG_DIR"/*.png "$AWG_DIR"/*.vpnuri "$CONFIG_FILE" "$td/clients/" 2>/dev/null || true
     cp -a "$KEYS_DIR"/* "$td/keys/" 2>/dev/null || true
     cp -a "$AWG_DIR/server_private.key" "$AWG_DIR/server_public.key" "$td/" 2>/dev/null || true
+    if [[ -d "${EXPIRY_DIR:-$AWG_DIR/expiry}" ]]; then
+        cp -a "${EXPIRY_DIR:-$AWG_DIR/expiry}" "$td/expiry" 2>/dev/null || true
+    fi
+    [[ -f /etc/cron.d/awg-expiry ]] && cp -a /etc/cron.d/awg-expiry "$td/" 2>/dev/null || true
 
     tar -czf "$bf" -C "$td" . || { rm -rf "$td"; die "tar error $bf"; }
+    log_debug "tar: archive created $bf"
     rm -rf "$td"
     chmod 600 "$bf" || log_warn "chmod error on backup"
 
@@ -267,6 +272,7 @@ restore_backup() {
         cp -a "$td/server/"* "$server_conf_dir/" || log_error "Error copying server"
         chmod 600 "$server_conf_dir"/*.conf 2>/dev/null
         chmod 700 "$server_conf_dir"
+        log_debug "Server config restored to $server_conf_dir"
     fi
 
     if [[ -d "$td/clients" ]]; then
@@ -274,6 +280,7 @@ restore_backup() {
         cp -a "$td/clients/"* "$AWG_DIR/" || log_error "Error copying clients"
         chmod 600 "$AWG_DIR"/*.conf 2>/dev/null
         chmod 600 "$CONFIG_FILE" 2>/dev/null
+        log_debug "Client files restored to $AWG_DIR"
     fi
 
     if [[ -d "$td/keys" ]]; then
@@ -281,11 +288,23 @@ restore_backup() {
         mkdir -p "$KEYS_DIR"
         cp -a "$td/keys/"* "$KEYS_DIR/" || log_error "Error copying keys"
         chmod 600 "$KEYS_DIR"/* 2>/dev/null
+        log_debug "Keys restored to $KEYS_DIR"
     fi
 
     # Server keys
     [[ -f "$td/server_private.key" ]] && cp -a "$td/server_private.key" "$AWG_DIR/"
     [[ -f "$td/server_public.key" ]] && cp -a "$td/server_public.key" "$AWG_DIR/"
+
+    if [[ -d "$td/expiry" ]]; then
+        log "Restoring expiry data..."
+        mkdir -p "${EXPIRY_DIR:-$AWG_DIR/expiry}"
+        cp -a "$td/expiry/"* "${EXPIRY_DIR:-$AWG_DIR/expiry}/" 2>/dev/null || true
+        chmod 600 "${EXPIRY_DIR:-$AWG_DIR/expiry}"/* 2>/dev/null
+    fi
+    if [[ -f "$td/awg-expiry" ]]; then
+        cp -a "$td/awg-expiry" /etc/cron.d/awg-expiry
+        chmod 644 /etc/cron.d/awg-expiry
+    fi
 
     rm -rf "$td"
 
@@ -313,21 +332,21 @@ modify_client() {
     fi
 
     # Parameters allowed for modification
-    local allowed_params="DNS|Endpoint|AllowedIPs|Address|PersistentKeepalive|MTU"
+    local allowed_params="DNS|Endpoint|AllowedIPs|PersistentKeepalive"
     if ! [[ "$param" =~ ^($allowed_params)$ ]]; then
         log_error "Parameter '$param' cannot be changed via modify."
         log_error "Allowed parameters: ${allowed_params//|/, }"
         return 1
     fi
 
-    if ! grep -q "^#_Name = ${name}$" "$SERVER_CONF_FILE"; then
+    if ! grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE"; then
         die "Client '$name' not found."
     fi
 
     local cf="$AWG_DIR/$name.conf"
     if [[ ! -f "$cf" ]]; then die "File $cf not found."; fi
 
-    if ! grep -q -E "^${param}\s*=" "$cf"; then
+    if ! grep -q -E "^${param}[[:space:]]*=" "$cf"; then
         log_error "Parameter '$param' not found in $cf."
         return 1
     fi
@@ -345,14 +364,13 @@ modify_client() {
         cp "$bak" "$cf" || log_warn "Restore error."
         return 1
     fi
+    log_debug "sed: ${param} = ${value} in $cf"
 
     log "Parameter '$param' changed."
 
-    # Regenerate QR for important parameters
-    if [[ "$param" =~ ^(AllowedIPs|Address|PublicKey|Endpoint|PrivateKey|DNS)$ ]]; then
-        log "Regenerating QR code..."
-        generate_qr "$name" || log_warn "Failed to update QR code."
-    fi
+    log "Regenerating QR code and vpn:// URI..."
+    generate_qr "$name" || log_warn "Failed to update QR code."
+    generate_vpn_uri "$name" || log_warn "Failed to update vpn:// URI."
 
     return 0
 }
@@ -378,7 +396,7 @@ check_server() {
 
     log "Port listening:"
     # shellcheck source=/dev/null
-    source "$CONFIG_FILE" 2>/dev/null
+    safe_load_config "$CONFIG_FILE" 2>/dev/null
     local port=${AWG_PORT:-0}
     if [[ "$port" -eq 0 ]]; then
         log_warn " - Failed to determine port."
@@ -445,8 +463,34 @@ list_clients() {
     fi
 
     local verbose=$VERBOSE_LIST
-    local awg_stat act=0 tot=0
-    awg_stat=$(awg show 2>/dev/null) || awg_stat=""
+    local act=0 tot=0
+
+    # Single-pass server config parsing: name → pubkey
+    declare -A _name_to_pk
+    local _cn=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "#_Name = "* ]]; then
+            _cn="${line#\#_Name = }"
+            _cn="${_cn## }"; _cn="${_cn%% }"
+        elif [[ -n "$_cn" && "$line" == "PublicKey = "* ]]; then
+            local _pk="${line#PublicKey = }"
+            _pk="${_pk## }"; _pk="${_pk%% }"
+            [[ -n "$_pk" ]] && _name_to_pk["$_cn"]="$_pk"
+            _cn=""
+        fi
+    done < "$SERVER_CONF_FILE"
+
+    # Single-pass awg show dump parsing: pubkey → handshake timestamp
+    declare -A _pk_to_hs
+    local awg_dump
+    awg_dump=$(awg show awg0 dump 2>/dev/null) || awg_dump=""
+    if [[ -n "$awg_dump" ]]; then
+        # shellcheck disable=SC2034
+        while IFS=$'\t' read -r _dpk _dpsk _dep _daips _dhs _drx _dtx _dka; do
+            [[ -z "$_dpsk" ]] && continue
+            _pk_to_hs["$_dpk"]="$_dhs"
+        done <<< "$awg_dump"
+    fi
 
     if [[ $verbose -eq 1 ]]; then
         printf "%-20s | %-7s | %-7s | %-15s | %-15s | %s\n" "Client name" "Conf" "QR" "IP address" "Key (start)" "Status"
@@ -457,6 +501,9 @@ list_clients() {
         printf -- "-%.0s" {1..50}
         echo
     fi
+
+    local now
+    now=$(date +%s)
 
     while IFS= read -r name; do
         name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
@@ -473,48 +520,28 @@ list_clients() {
         if [[ "$cf" == "+" ]]; then
             ip=$(grep -oP 'Address = \K[0-9.]+' "$AWG_DIR/${name}.conf" 2>/dev/null) || ip="?"
 
-            # Extract public key from server config
-            local current_pk=""
-            local peer_block_started=0
-            while IFS= read -r line || [[ -n "$line" ]]; do
-                if [[ "$line" == "[Peer]"* && "$peer_block_started" -eq 1 ]]; then break; fi
-                if [[ "$line" == "#_Name = ${name}" ]]; then peer_block_started=1; fi
-                if [[ "$peer_block_started" -eq 1 && "$line" == "PublicKey = "* ]]; then
-                    current_pk="${line#PublicKey = }"
-                    break
-                fi
-            done < "$SERVER_CONF_FILE"
+            local current_pk="${_name_to_pk[$name]:-}"
 
             if [[ -n "$current_pk" ]]; then
-                pk=$(echo "$current_pk" | head -c 10)"..."
-                if echo "$awg_stat" | grep -qF "$current_pk"; then
-                    local handshake_line
-                    handshake_line=$(echo "$awg_stat" | grep -A 3 -F "$current_pk" | grep 'latest handshake:')
-                    if [[ -n "$handshake_line" && ! "$handshake_line" =~ "never" ]]; then
-                        if echo "$handshake_line" | grep -q "seconds ago"; then
-                            local sec
-                            sec=$(echo "$handshake_line" | grep -oP '\d+(?= seconds ago)')
-                            if [[ -n "$sec" && "$sec" =~ ^[0-9]+$ ]] && [[ "$sec" -lt 180 ]]; then
-                                st="Active"
-                                color_start="\033[0;32m"
-                                ((act++))
-                            else
-                                st="Recent"
-                                color_start="\033[0;33m"
-                                ((act++))
-                            fi
-                        else
-                            st="Recent"
-                            color_start="\033[0;33m"
-                            ((act++))
-                        fi
+                pk="${current_pk:0:10}..."
+                local handshake="${_pk_to_hs[$current_pk]:-0}"
+                if [[ "$handshake" =~ ^[0-9]+$ && "$handshake" -gt 0 ]]; then
+                    local diff=$((now - handshake))
+                    if [[ $diff -lt 180 ]]; then
+                        st="Active"
+                        color_start="\033[0;32m"
+                        ((act++))
+                    elif [[ $diff -lt 86400 ]]; then
+                        st="Recent"
+                        color_start="\033[0;33m"
+                        ((act++))
                     else
                         st="No handshake"
                         color_start="\033[0;37m"
                     fi
                 else
-                    st="Not found"
-                    color_start="\033[0;31m"
+                    st="No handshake"
+                    color_start="\033[0;37m"
                 fi
             else
                 pk="?"
@@ -719,12 +746,13 @@ case $COMMAND in
         [[ -z "$CLIENT_NAME" ]] && die "Client name not specified."
         validate_client_name "$CLIENT_NAME" || exit 1
 
-        if grep -q "^#_Name = ${CLIENT_NAME}$" "$SERVER_CONF_FILE"; then
+        if grep -qxF "#_Name = ${CLIENT_NAME}" "$SERVER_CONF_FILE"; then
             die "Client '$CLIENT_NAME' already exists."
         fi
 
         log "Adding '$CLIENT_NAME'..."
         if generate_client "$CLIENT_NAME"; then
+            log_debug "Peer '$CLIENT_NAME' added to server config."
             log "Client '$CLIENT_NAME' added."
             log "Files: $AWG_DIR/${CLIENT_NAME}.conf, $AWG_DIR/${CLIENT_NAME}.png"
             if [[ -f "$AWG_DIR/${CLIENT_NAME}.vpnuri" ]]; then
@@ -746,13 +774,14 @@ case $COMMAND in
     remove)
         [[ -z "$CLIENT_NAME" ]] && die "Client name not specified."
         validate_client_name "$CLIENT_NAME" || exit 1
-        if ! grep -q "^#_Name = ${CLIENT_NAME}$" "$SERVER_CONF_FILE"; then
+        if ! grep -qxF "#_Name = ${CLIENT_NAME}" "$SERVER_CONF_FILE"; then
             die "Client '$CLIENT_NAME' not found."
         fi
         if ! confirm_action "remove" "client '$CLIENT_NAME'"; then exit 1; fi
 
         log "Removing '$CLIENT_NAME'..."
         if remove_peer_from_server "$CLIENT_NAME"; then
+            log_debug "Peer '$CLIENT_NAME' removed from server config."
             log "Client '$CLIENT_NAME' removed from server config."
             rm -f "$AWG_DIR/$CLIENT_NAME.conf" "$AWG_DIR/$CLIENT_NAME.png" "$AWG_DIR/$CLIENT_NAME.vpnuri"
             rm -f "$KEYS_DIR/${CLIENT_NAME}.private" "$KEYS_DIR/${CLIENT_NAME}.public"
@@ -778,7 +807,7 @@ case $COMMAND in
         if [[ -n "$CLIENT_NAME" ]]; then
             # Regenerate single client
             validate_client_name "$CLIENT_NAME" || exit 1
-            if ! grep -q "^#_Name = ${CLIENT_NAME}$" "$SERVER_CONF_FILE"; then
+            if ! grep -qxF "#_Name = ${CLIENT_NAME}" "$SERVER_CONF_FILE"; then
                 die "Client '$CLIENT_NAME' not found."
             fi
             regenerate_client "$CLIENT_NAME" || { log_error "Regeneration error '$CLIENT_NAME'."; _cmd_rc=1; }

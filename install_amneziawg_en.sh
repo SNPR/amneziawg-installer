@@ -23,15 +23,17 @@ STATE_FILE="$AWG_DIR/setup_state"
 LOG_FILE="$AWG_DIR/install_amneziawg.log"
 KEYS_DIR="$AWG_DIR/keys"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
-COMMON_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/main/awg_common_en.sh"
+AWG_BRANCH="${AWG_BRANCH:-v${SCRIPT_VERSION}}"
+COMMON_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/${AWG_BRANCH}/awg_common_en.sh"
 COMMON_SCRIPT_PATH="$AWG_DIR/awg_common.sh"
-MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/main/manage_amneziawg_en.sh"
+MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/${AWG_BRANCH}/manage_amneziawg_en.sh"
 MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 
 # CLI flags
 UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
+_APT_UPDATED=0
 CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"
-CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""
+CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
@@ -60,7 +62,7 @@ while [[ $# -gt 0 ]]; do
         --route-custom=*) CLI_ROUTING_MODE=3; CLI_CUSTOM_ROUTES="${1#*=}" ;;
         --endpoint=*)    CLI_ENDPOINT="${1#*=}" ;;
         --yes|-y)        AUTO_YES=1 ;;
-        --no-tweaks)     NO_TWEAKS=1 ;;
+        --no-tweaks)     NO_TWEAKS=1; CLI_NO_TWEAKS=1 ;;
         *) echo "Unknown argument: $1"; HELP=1 ;;
     esac
     shift
@@ -100,7 +102,7 @@ log_msg() {
         printf "${color_start}%s${color_end}\n" "$entry" >&2
     elif [[ "$type" == "INFO" ]]; then
         printf "${color_start}%s${color_end}\n" "$entry"
-    else
+    elif [[ "$type" != "DEBUG" ]]; then
         printf "${color_start}%s${color_end}\n" "$entry"
     fi
 }
@@ -293,7 +295,10 @@ install_packages() {
         return 0
     fi
     log "Installing: ${to_install[*]}..."
-    apt update -y || log_warn "Failed to update apt."
+    if [[ "${_APT_UPDATED:-0}" -eq 0 ]]; then
+        apt update -y || log_warn "Failed to update apt."
+        _APT_UPDATED=1
+    fi
     DEBIAN_FRONTEND=noninteractive apt install -y "${to_install[@]}" || die "Package installation error."
     log "Packages installed."
 }
@@ -322,6 +327,84 @@ configure_ipv6() {
     fi
     export DISABLE_IPV6
     log "IPv6 disable: $(if [ "$DISABLE_IPV6" -eq 1 ]; then echo 'Yes'; else echo 'No'; fi)"
+}
+
+# Safe configuration loader (whitelist parser, no source/eval)
+safe_load_config() {
+    local config_file="${1:-$CONFIG_FILE}"
+    if [[ ! -f "$config_file" ]]; then return 1; fi
+
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+        line="${line#export }"
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [[ "$value" == \'*\' ]]; then
+                value="${value#\'}"
+                value="${value%\'}"
+            fi
+            case "$key" in
+                OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
+                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
+                AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|NO_TWEAKS)
+                    export "$key=$value"
+                    ;;
+            esac
+        fi
+    done < "$config_file"
+}
+
+# Read a single key from config (for point queries)
+safe_read_config_key() {
+    local key="$1" config_file="${2:-$CONFIG_FILE}"
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#export }"
+        if [[ "$line" =~ ^${key}=(.*)$ ]]; then
+            local value="${BASH_REMATCH[1]}"
+            if [[ "$value" == \'*\' ]]; then
+                value="${value#\'}"
+                value="${value%\'}"
+            fi
+            echo "$value"
+            return 0
+        fi
+    done < "$config_file"
+    return 1
+}
+
+validate_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1024 ]] || [[ "$port" -gt 65535 ]]; then
+        die "Invalid port: '$port'. Allowed range: 1024-65535."
+    fi
+}
+
+validate_subnet() {
+    local subnet="$1"
+    if ! [[ "$subnet" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/24$ ]] \
+       || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
+       || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]]; then
+        die "Invalid subnet: '$subnet'. Only /24 is supported."
+    fi
+}
+
+validate_cidr_list() {
+    local input="$1" cidr
+    IFS=',' read -ra cidrs <<< "$input"
+    for cidr in "${cidrs[@]}"; do
+        cidr=$(echo "$cidr" | tr -d ' ')
+        if ! [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] \
+           || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
+           || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]] \
+           || [[ "${BASH_REMATCH[5]}" -gt 32 ]]; then
+            return 1
+        fi
+    done
 }
 
 configure_routing_mode() {
@@ -353,8 +436,8 @@ configure_routing_mode() {
            else
                ALLOWED_IPS=$CLI_CUSTOM_ROUTES
            fi
-           if ! echo "$ALLOWED_IPS" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}(,([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2})*$'; then
-               log_warn "Network format ('$ALLOWED_IPS') is invalid."
+           if ! validate_cidr_list "$ALLOWED_IPS"; then
+               log_warn "Invalid CIDR format: '$ALLOWED_IPS'. Expected: x.x.x.x/y[,x.x.x.x/y]"
            fi
            log "Selected mode: Custom ($ALLOWED_IPS)" ;;
         *) ALLOWED_IPS_MODE=2
@@ -794,7 +877,7 @@ check_service_status() {
     local port_check=${AWG_PORT:-0}
     if [[ "$port_check" -eq 0 ]] && [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck source=/dev/null
-        port_check=$(source "$CONFIG_FILE" && echo "$AWG_PORT")
+        port_check=$(safe_read_config_key "AWG_PORT" "$CONFIG_FILE")
         port_check=${port_check:-0}
     fi
     if [[ "$port_check" -ne 0 ]]; then
@@ -921,44 +1004,63 @@ step_uninstall() {
         chmod 600 "$bf" || log_warn "Backup chmod error"
         log "Backup created: $bf"
     fi
+    # Load --no-tweaks flag from saved configuration
+    local saved_no_tweaks=0
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        saved_no_tweaks=$(safe_read_config_key "NO_TWEAKS" "$CONFIG_FILE" 2>/dev/null) || saved_no_tweaks=0
+        saved_no_tweaks=${saved_no_tweaks:-0}
+    fi
     log "Stopping service..."
     systemctl stop awg-quick@awg0 2>/dev/null
     systemctl disable awg-quick@awg0 2>/dev/null
     modprobe -r amneziawg 2>/dev/null || true
-    log "Removing Fail2Ban bans..."
-    if command -v fail2ban-client &>/dev/null; then
-        fail2ban-client unban --all 2>/dev/null || true
-        systemctl stop fail2ban 2>/dev/null
-    fi
-    log "Removing UFW rules..."
-    if command -v ufw &>/dev/null; then
-        local port_to_del
-        if [[ -f "$CONFIG_FILE" ]]; then
-            # shellcheck source=/dev/null
-            port_to_del=$(source "$CONFIG_FILE" && echo "$AWG_PORT")
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        log "Removing Fail2Ban bans..."
+        if command -v fail2ban-client &>/dev/null; then
+            fail2ban-client unban --all 2>/dev/null || true
+            systemctl stop fail2ban 2>/dev/null
         fi
-        port_to_del=${port_to_del:-39743}
-        ufw delete allow "${port_to_del}/udp" 2>/dev/null
-        log "Disabling UFW..."
-        ufw --force disable 2>/dev/null
+        log "Removing UFW rules..."
+        if command -v ufw &>/dev/null; then
+            local port_to_del
+            if [[ -f "$CONFIG_FILE" ]]; then
+                # shellcheck source=/dev/null
+                port_to_del=$(safe_read_config_key "AWG_PORT" "$CONFIG_FILE")
+            fi
+            port_to_del=${port_to_del:-39743}
+            ufw delete allow "${port_to_del}/udp" 2>/dev/null
+            log "Disabling UFW..."
+            ufw --force disable 2>/dev/null
+        fi
+    else
+        log "Skipping UFW/Fail2Ban (installed with --no-tweaks)."
     fi
     log "Removing packages..."
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Purge error."
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Purge error."
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools qrencode 2>/dev/null || log_warn "Purge error."
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || log_warn "Autoremove error."
     log "Removing PPA and files..."
     rm -f /etc/apt/sources.list.d/amnezia-ppa.sources \
+        /etc/apt/sources.list.d/amnezia-ppa.list \
         /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.list \
         /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.sources \
         /etc/apt/keyrings/amnezia-ppa.gpg 2>/dev/null
     rm -rf /etc/amnezia \
         /etc/modules-load.d/amneziawg.conf \
         /etc/sysctl.d/99-amneziawg-security.conf \
+        /etc/sysctl.d/99-amneziawg-forwarding.conf \
         /etc/logrotate.d/amneziawg* || log_warn "File removal error."
-    # Remove only our fail2ban artifacts
-    rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
-    # Backward compatibility: remove jail.local if created by our installer
-    if [[ -f /etc/fail2ban/jail.local ]] && grep -q "banaction = ufw" /etc/fail2ban/jail.local 2>/dev/null; then
-        rm -f /etc/fail2ban/jail.local
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        # Remove only our fail2ban artifacts
+        rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
+        # Backward compatibility: remove jail.local if created by our installer
+        if [[ -f /etc/fail2ban/jail.local ]] && grep -q "banaction = ufw" /etc/fail2ban/jail.local 2>/dev/null; then
+            rm -f /etc/fail2ban/jail.local
+        fi
     fi
     log "Removing DKMS..."
     rm -rf /var/lib/dkms/amneziawg* || log_warn "DKMS removal error."
@@ -1013,7 +1115,7 @@ initialize_setup() {
         log "Configuration file found $CONFIG_FILE. Loading settings..."
         config_exists=1
         # shellcheck source=/dev/null
-        source "$CONFIG_FILE" || log_warn "Failed to fully load settings from $CONFIG_FILE."
+        safe_load_config "$CONFIG_FILE" || log_warn "Failed to fully load settings from $CONFIG_FILE."
         AWG_PORT=${AWG_PORT:-$default_port}
         AWG_TUNNEL_SUBNET=${AWG_TUNNEL_SUBNET:-$default_subnet}
         DISABLE_IPV6=${DISABLE_IPV6:-"default"}
@@ -1034,6 +1136,11 @@ initialize_setup() {
         if [[ "$CLI_ROUTING_MODE" -eq 3 ]]; then ALLOWED_IPS=$CLI_CUSTOM_ROUTES; fi
     fi
     if [[ -n "$CLI_ENDPOINT" ]]; then AWG_ENDPOINT=$CLI_ENDPOINT; fi
+    if [[ "$CLI_NO_TWEAKS" -eq 1 ]]; then NO_TWEAKS=1; fi
+
+    # Validate after CLI override
+    validate_port "$AWG_PORT"
+    validate_subnet "$AWG_TUNNEL_SUBNET"
 
     # Request settings from user only on first run
     if [[ "$config_exists" -eq 0 ]]; then
@@ -1042,18 +1149,12 @@ initialize_setup() {
             read -rp "Enter AmneziaWG UDP port (1024-65535) [${AWG_PORT}]: " input_port < /dev/tty
             if [[ -n "$input_port" ]]; then AWG_PORT=$input_port; fi
         fi
-        if ! [[ "$AWG_PORT" =~ ^[0-9]+$ ]] || [ "$AWG_PORT" -lt 1024 ] || [ "$AWG_PORT" -gt 65535 ]; then
-            die "Invalid port."
-        fi
+        validate_port "$AWG_PORT"
         if [[ "$AUTO_YES" -eq 0 ]]; then
             read -rp "Enter tunnel subnet [${AWG_TUNNEL_SUBNET}]: " input_subnet < /dev/tty
             if [[ -n "$input_subnet" ]]; then AWG_TUNNEL_SUBNET=$input_subnet; fi
         fi
-        if ! [[ "$AWG_TUNNEL_SUBNET" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/24$ ]] \
-           || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
-           || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]]; then
-            die "Invalid subnet: '$AWG_TUNNEL_SUBNET'. Only /24 mask is supported."
-        fi
+        validate_subnet "$AWG_TUNNEL_SUBNET"
         if [[ "$DISABLE_IPV6" == "default" ]]; then configure_ipv6; fi
         if [[ "$ALLOWED_IPS_MODE" == "default" ]]; then configure_routing_mode; fi
     else
@@ -1192,6 +1293,7 @@ step1_update_and_optimize() {
 step2_install_amnezia() {
     update_state 2
     log "### STEP 2: Installing AmneziaWG and dependencies ###"
+    _APT_UPDATED=0  # Reset: new sources will be added in this step
 
     # Enabling deb-src (Ubuntu only — Ubuntu uses ubuntu.sources)
     local sources_file="/etc/apt/sources.list.d/ubuntu.sources"
@@ -1466,7 +1568,7 @@ step6_generate_configs() {
     log "Creating default clients..."
     local client_name
     for client_name in my_phone my_laptop; do
-        if grep -q "^#_Name = ${client_name}$" "$SERVER_CONF_FILE" 2>/dev/null; then
+        if grep -qxF "#_Name = ${client_name}" "$SERVER_CONF_FILE" 2>/dev/null; then
             log "Client '$client_name' already exists."
         else
             log "Creating client '$client_name'..."
@@ -1572,10 +1674,6 @@ if [[ "$DIAGNOSTIC" -eq 1 ]]; then create_diagnostic_report; exit 0; fi
 if [[ "$VERBOSE" -eq 1 ]]; then set -x; fi
 
 initialize_setup
-
-current_step=0
-if [[ -f "$STATE_FILE" ]]; then current_step=$(cat "$STATE_FILE"); fi
-if ! [[ "$current_step" =~ ^[0-9]+$ ]]; then current_step=1; fi
 
 while (( current_step < 99 )); do
     log "Executing step $current_step..."
