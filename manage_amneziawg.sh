@@ -463,8 +463,34 @@ list_clients() {
     fi
 
     local verbose=$VERBOSE_LIST
-    local awg_stat act=0 tot=0
-    awg_stat=$(awg show 2>/dev/null) || awg_stat=""
+    local act=0 tot=0
+
+    # Однопроходный парсинг серверного конфига: name → pubkey
+    declare -A _name_to_pk
+    local _cn=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "#_Name = "* ]]; then
+            _cn="${line#\#_Name = }"
+            _cn="${_cn## }"; _cn="${_cn%% }"
+        elif [[ -n "$_cn" && "$line" == "PublicKey = "* ]]; then
+            local _pk="${line#PublicKey = }"
+            _pk="${_pk## }"; _pk="${_pk%% }"
+            [[ -n "$_pk" ]] && _name_to_pk["$_cn"]="$_pk"
+            _cn=""
+        fi
+    done < "$SERVER_CONF_FILE"
+
+    # Однопроходный парсинг awg show dump: pubkey → handshake timestamp
+    declare -A _pk_to_hs
+    local awg_dump
+    awg_dump=$(awg show awg0 dump 2>/dev/null) || awg_dump=""
+    if [[ -n "$awg_dump" ]]; then
+        # shellcheck disable=SC2034
+        while IFS=$'\t' read -r _dpk _dpsk _dep _daips _dhs _drx _dtx _dka; do
+            [[ -z "$_dpsk" ]] && continue
+            _pk_to_hs["$_dpk"]="$_dhs"
+        done <<< "$awg_dump"
+    fi
 
     if [[ $verbose -eq 1 ]]; then
         printf "%-20s | %-7s | %-7s | %-15s | %-15s | %s\n" "Имя клиента" "Conf" "QR" "IP-адрес" "Ключ (нач.)" "Статус"
@@ -475,6 +501,9 @@ list_clients() {
         printf -- "-%.0s" {1..50}
         echo
     fi
+
+    local now
+    now=$(date +%s)
 
     while IFS= read -r name; do
         name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
@@ -491,48 +520,28 @@ list_clients() {
         if [[ "$cf" == "+" ]]; then
             ip=$(grep -oP 'Address = \K[0-9.]+' "$AWG_DIR/${name}.conf" 2>/dev/null) || ip="?"
 
-            # Извлекаем публичный ключ из серверного конфига
-            local current_pk=""
-            local peer_block_started=0
-            while IFS= read -r line || [[ -n "$line" ]]; do
-                if [[ "$line" == "[Peer]"* && "$peer_block_started" -eq 1 ]]; then break; fi
-                if [[ "$line" == "#_Name = ${name}" ]]; then peer_block_started=1; fi
-                if [[ "$peer_block_started" -eq 1 && "$line" == "PublicKey = "* ]]; then
-                    current_pk="${line#PublicKey = }"
-                    break
-                fi
-            done < "$SERVER_CONF_FILE"
+            local current_pk="${_name_to_pk[$name]:-}"
 
             if [[ -n "$current_pk" ]]; then
-                pk=$(echo "$current_pk" | head -c 10)"..."
-                if echo "$awg_stat" | grep -qF "$current_pk"; then
-                    local handshake_line
-                    handshake_line=$(echo "$awg_stat" | grep -A 3 -F "$current_pk" | grep 'latest handshake:')
-                    if [[ -n "$handshake_line" && ! "$handshake_line" =~ "never" ]]; then
-                        if echo "$handshake_line" | grep -q "seconds ago"; then
-                            local sec
-                            sec=$(echo "$handshake_line" | grep -oP '\d+(?= seconds ago)')
-                            if [[ -n "$sec" && "$sec" =~ ^[0-9]+$ ]] && [[ "$sec" -lt 180 ]]; then
-                                st="Активен"
-                                color_start="\033[0;32m"
-                                ((act++))
-                            else
-                                st="Недавно"
-                                color_start="\033[0;33m"
-                                ((act++))
-                            fi
-                        else
-                            st="Недавно"
-                            color_start="\033[0;33m"
-                            ((act++))
-                        fi
+                pk="${current_pk:0:10}..."
+                local handshake="${_pk_to_hs[$current_pk]:-0}"
+                if [[ "$handshake" =~ ^[0-9]+$ && "$handshake" -gt 0 ]]; then
+                    local diff=$((now - handshake))
+                    if [[ $diff -lt 180 ]]; then
+                        st="Активен"
+                        color_start="\033[0;32m"
+                        ((act++))
+                    elif [[ $diff -lt 86400 ]]; then
+                        st="Недавно"
+                        color_start="\033[0;33m"
+                        ((act++))
                     else
                         st="Нет handshake"
                         color_start="\033[0;37m"
                     fi
                 else
-                    st="Не найден"
-                    color_start="\033[0;31m"
+                    st="Нет handshake"
+                    color_start="\033[0;37m"
                 fi
             else
                 pk="?"
