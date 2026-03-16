@@ -324,6 +324,36 @@ configure_ipv6() {
     log "Отключение IPv6: $(if [ "$DISABLE_IPV6" -eq 1 ]; then echo 'Да'; else echo 'Нет'; fi)"
 }
 
+validate_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1024 ]] || [[ "$port" -gt 65535 ]]; then
+        die "Некорректный порт: '$port'. Допустимый диапазон: 1024-65535."
+    fi
+}
+
+validate_subnet() {
+    local subnet="$1"
+    if ! [[ "$subnet" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/24$ ]] \
+       || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
+       || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]]; then
+        die "Некорректная подсеть: '$subnet'. Поддерживается только /24."
+    fi
+}
+
+validate_cidr_list() {
+    local input="$1" cidr
+    IFS=',' read -ra cidrs <<< "$input"
+    for cidr in "${cidrs[@]}"; do
+        cidr=$(echo "$cidr" | tr -d ' ')
+        if ! [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] \
+           || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
+           || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]] \
+           || [[ "${BASH_REMATCH[5]}" -gt 32 ]]; then
+            return 1
+        fi
+    done
+}
+
 configure_routing_mode() {
     if [[ "$CLI_ROUTING_MODE" != "default" ]]; then
         ALLOWED_IPS_MODE=$CLI_ROUTING_MODE
@@ -353,8 +383,8 @@ configure_routing_mode() {
            else
                ALLOWED_IPS=$CLI_CUSTOM_ROUTES
            fi
-           if ! echo "$ALLOWED_IPS" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}(,([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2})*$'; then
-               log_warn "Формат сетей ('$ALLOWED_IPS') некорректен."
+           if ! validate_cidr_list "$ALLOWED_IPS"; then
+               log_warn "Некорректный формат CIDR: '$ALLOWED_IPS'. Ожидается: x.x.x.x/y[,x.x.x.x/y]"
            fi
            log "Выбран режим: Пользовательский ($ALLOWED_IPS)" ;;
         *) ALLOWED_IPS_MODE=2
@@ -1055,6 +1085,10 @@ initialize_setup() {
     if [[ -n "$CLI_ENDPOINT" ]]; then AWG_ENDPOINT=$CLI_ENDPOINT; fi
     if [[ "$CLI_NO_TWEAKS" -eq 1 ]]; then NO_TWEAKS=1; fi
 
+    # Валидация после CLI override
+    validate_port "$AWG_PORT"
+    validate_subnet "$AWG_TUNNEL_SUBNET"
+
     # Запрос у пользователя только на первом запуске
     if [[ "$config_exists" -eq 0 ]]; then
         log "Запрос настроек у пользователя (первый запуск)."
@@ -1062,18 +1096,12 @@ initialize_setup() {
             read -rp "Введите UDP порт AmneziaWG (1024-65535) [${AWG_PORT}]: " input_port < /dev/tty
             if [[ -n "$input_port" ]]; then AWG_PORT=$input_port; fi
         fi
-        if ! [[ "$AWG_PORT" =~ ^[0-9]+$ ]] || [ "$AWG_PORT" -lt 1024 ] || [ "$AWG_PORT" -gt 65535 ]; then
-            die "Некорректный порт."
-        fi
+        validate_port "$AWG_PORT"
         if [[ "$AUTO_YES" -eq 0 ]]; then
             read -rp "Введите подсеть туннеля [${AWG_TUNNEL_SUBNET}]: " input_subnet < /dev/tty
             if [[ -n "$input_subnet" ]]; then AWG_TUNNEL_SUBNET=$input_subnet; fi
         fi
-        if ! [[ "$AWG_TUNNEL_SUBNET" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/24$ ]] \
-           || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
-           || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]]; then
-            die "Некорректная подсеть: '$AWG_TUNNEL_SUBNET'. Поддерживается только маска /24."
-        fi
+        validate_subnet "$AWG_TUNNEL_SUBNET"
         if [[ "$DISABLE_IPV6" == "default" ]]; then configure_ipv6; fi
         if [[ "$ALLOWED_IPS_MODE" == "default" ]]; then configure_routing_mode; fi
     else
