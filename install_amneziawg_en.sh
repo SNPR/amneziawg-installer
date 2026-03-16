@@ -921,44 +921,63 @@ step_uninstall() {
         chmod 600 "$bf" || log_warn "Backup chmod error"
         log "Backup created: $bf"
     fi
+    # Load --no-tweaks flag from saved configuration
+    local saved_no_tweaks=0
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        saved_no_tweaks=$(source "$CONFIG_FILE" 2>/dev/null && echo "${NO_TWEAKS:-0}") || true
+        saved_no_tweaks=${saved_no_tweaks:-0}
+    fi
     log "Stopping service..."
     systemctl stop awg-quick@awg0 2>/dev/null
     systemctl disable awg-quick@awg0 2>/dev/null
     modprobe -r amneziawg 2>/dev/null || true
-    log "Removing Fail2Ban bans..."
-    if command -v fail2ban-client &>/dev/null; then
-        fail2ban-client unban --all 2>/dev/null || true
-        systemctl stop fail2ban 2>/dev/null
-    fi
-    log "Removing UFW rules..."
-    if command -v ufw &>/dev/null; then
-        local port_to_del
-        if [[ -f "$CONFIG_FILE" ]]; then
-            # shellcheck source=/dev/null
-            port_to_del=$(source "$CONFIG_FILE" && echo "$AWG_PORT")
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        log "Removing Fail2Ban bans..."
+        if command -v fail2ban-client &>/dev/null; then
+            fail2ban-client unban --all 2>/dev/null || true
+            systemctl stop fail2ban 2>/dev/null
         fi
-        port_to_del=${port_to_del:-39743}
-        ufw delete allow "${port_to_del}/udp" 2>/dev/null
-        log "Disabling UFW..."
-        ufw --force disable 2>/dev/null
+        log "Removing UFW rules..."
+        if command -v ufw &>/dev/null; then
+            local port_to_del
+            if [[ -f "$CONFIG_FILE" ]]; then
+                # shellcheck source=/dev/null
+                port_to_del=$(source "$CONFIG_FILE" && echo "$AWG_PORT")
+            fi
+            port_to_del=${port_to_del:-39743}
+            ufw delete allow "${port_to_del}/udp" 2>/dev/null
+            log "Disabling UFW..."
+            ufw --force disable 2>/dev/null
+        fi
+    else
+        log "Skipping UFW/Fail2Ban (installed with --no-tweaks)."
     fi
     log "Removing packages..."
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Purge error."
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Purge error."
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools qrencode 2>/dev/null || log_warn "Purge error."
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || log_warn "Autoremove error."
     log "Removing PPA and files..."
     rm -f /etc/apt/sources.list.d/amnezia-ppa.sources \
+        /etc/apt/sources.list.d/amnezia-ppa.list \
         /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.list \
         /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.sources \
         /etc/apt/keyrings/amnezia-ppa.gpg 2>/dev/null
     rm -rf /etc/amnezia \
         /etc/modules-load.d/amneziawg.conf \
         /etc/sysctl.d/99-amneziawg-security.conf \
+        /etc/sysctl.d/99-amneziawg-forwarding.conf \
         /etc/logrotate.d/amneziawg* || log_warn "File removal error."
-    # Remove only our fail2ban artifacts
-    rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
-    # Backward compatibility: remove jail.local if created by our installer
-    if [[ -f /etc/fail2ban/jail.local ]] && grep -q "banaction = ufw" /etc/fail2ban/jail.local 2>/dev/null; then
-        rm -f /etc/fail2ban/jail.local
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        # Remove only our fail2ban artifacts
+        rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
+        # Backward compatibility: remove jail.local if created by our installer
+        if [[ -f /etc/fail2ban/jail.local ]] && grep -q "banaction = ufw" /etc/fail2ban/jail.local 2>/dev/null; then
+            rm -f /etc/fail2ban/jail.local
+        fi
     fi
     log "Removing DKMS..."
     rm -rf /var/lib/dkms/amneziawg* || log_warn "DKMS removal error."

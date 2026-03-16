@@ -921,44 +921,63 @@ step_uninstall() {
         chmod 600 "$bf" || log_warn "Ошибка chmod бэкапа"
         log "Бэкап создан: $bf"
     fi
+    # Загружаем флаг --no-tweaks из сохранённой конфигурации
+    local saved_no_tweaks=0
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        saved_no_tweaks=$(source "$CONFIG_FILE" 2>/dev/null && echo "${NO_TWEAKS:-0}") || true
+        saved_no_tweaks=${saved_no_tweaks:-0}
+    fi
     log "Остановка сервиса..."
     systemctl stop awg-quick@awg0 2>/dev/null
     systemctl disable awg-quick@awg0 2>/dev/null
     modprobe -r amneziawg 2>/dev/null || true
-    log "Снятие блокировок Fail2Ban..."
-    if command -v fail2ban-client &>/dev/null; then
-        fail2ban-client unban --all 2>/dev/null || true
-        systemctl stop fail2ban 2>/dev/null
-    fi
-    log "Удаление правил UFW..."
-    if command -v ufw &>/dev/null; then
-        local port_to_del
-        if [[ -f "$CONFIG_FILE" ]]; then
-            # shellcheck source=/dev/null
-            port_to_del=$(source "$CONFIG_FILE" && echo "$AWG_PORT")
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        log "Снятие блокировок Fail2Ban..."
+        if command -v fail2ban-client &>/dev/null; then
+            fail2ban-client unban --all 2>/dev/null || true
+            systemctl stop fail2ban 2>/dev/null
         fi
-        port_to_del=${port_to_del:-39743}
-        ufw delete allow "${port_to_del}/udp" 2>/dev/null
-        log "Отключение UFW..."
-        ufw --force disable 2>/dev/null
+        log "Удаление правил UFW..."
+        if command -v ufw &>/dev/null; then
+            local port_to_del
+            if [[ -f "$CONFIG_FILE" ]]; then
+                # shellcheck source=/dev/null
+                port_to_del=$(source "$CONFIG_FILE" && echo "$AWG_PORT")
+            fi
+            port_to_del=${port_to_del:-39743}
+            ufw delete allow "${port_to_del}/udp" 2>/dev/null
+            log "Отключение UFW..."
+            ufw --force disable 2>/dev/null
+        fi
+    else
+        log "Пропуск UFW/Fail2Ban (установка с --no-tweaks)."
     fi
     log "Удаление пакетов..."
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Ошибка purge."
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Ошибка purge."
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools qrencode 2>/dev/null || log_warn "Ошибка purge."
+    fi
     DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || log_warn "Ошибка autoremove."
     log "Удаление PPA и файлов..."
     rm -f /etc/apt/sources.list.d/amnezia-ppa.sources \
+        /etc/apt/sources.list.d/amnezia-ppa.list \
         /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.list \
         /etc/apt/sources.list.d/amnezia-ubuntu-ppa-*.sources \
         /etc/apt/keyrings/amnezia-ppa.gpg 2>/dev/null
     rm -rf /etc/amnezia \
         /etc/modules-load.d/amneziawg.conf \
         /etc/sysctl.d/99-amneziawg-security.conf \
+        /etc/sysctl.d/99-amneziawg-forwarding.conf \
         /etc/logrotate.d/amneziawg* || log_warn "Ошибка удаления файлов."
-    # Удаляем только свои артефакты fail2ban
-    rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
-    # Обратная совместимость: удаляем jail.local если он создан нашим инсталлятором
-    if [[ -f /etc/fail2ban/jail.local ]] && grep -q "banaction = ufw" /etc/fail2ban/jail.local 2>/dev/null; then
-        rm -f /etc/fail2ban/jail.local
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
+        # Удаляем только свои артефакты fail2ban
+        rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
+        # Обратная совместимость: удаляем jail.local если он создан нашим инсталлятором
+        if [[ -f /etc/fail2ban/jail.local ]] && grep -q "banaction = ufw" /etc/fail2ban/jail.local 2>/dev/null; then
+            rm -f /etc/fail2ban/jail.local
+        fi
     fi
     log "Удаление DKMS..."
     rm -rf /var/lib/dkms/amneziawg* || log_warn "Ошибка удаления DKMS."
