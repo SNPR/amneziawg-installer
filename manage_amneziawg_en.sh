@@ -359,8 +359,13 @@ modify_client() {
 
     local escaped_value
     escaped_value=$(escape_sed "$value")
-    if ! sed -i "s#^${param} = .*#${param} = ${escaped_value}#" "$cf"; then
+    if ! sed -i "s#^${param}[[:space:]]*=[[:space:]]*.*#${param} = ${escaped_value}#" "$cf"; then
         log_error "sed error. Restoring..."
+        cp "$bak" "$cf" || log_warn "Restore error."
+        return 1
+    fi
+    if ! grep -q -E "^${param} = " "$cf"; then
+        log_error "Replacement failed for '$param'. Restoring..."
         cp "$bak" "$cf" || log_warn "Restore error."
         return 1
     fi
@@ -511,8 +516,11 @@ list_clients() {
         ((tot++))
 
         local cf="?" png="?" pk="-" ip="-" st="No data"
-        local color_start="\033[0m" color_end="\033[0m"
-        if [[ "$NO_COLOR" -eq 0 ]]; then color_start="\033[0;37m"; fi
+        local color_start="" color_end=""
+        if [[ "$NO_COLOR" -eq 0 ]]; then
+            color_end="\033[0m"
+            color_start="\033[0;37m"
+        fi
 
         [[ -f "$AWG_DIR/${name}.conf" ]] && cf="+"
         [[ -f "$AWG_DIR/${name}.png" ]] && png="+"
@@ -529,24 +537,24 @@ list_clients() {
                     local diff=$((now - handshake))
                     if [[ $diff -lt 180 ]]; then
                         st="Active"
-                        color_start="\033[0;32m"
+                        [[ "$NO_COLOR" -eq 0 ]] && color_start="\033[0;32m"
                         ((act++))
                     elif [[ $diff -lt 86400 ]]; then
                         st="Recent"
-                        color_start="\033[0;33m"
+                        [[ "$NO_COLOR" -eq 0 ]] && color_start="\033[0;33m"
                         ((act++))
                     else
                         st="No handshake"
-                        color_start="\033[0;37m"
+                        [[ "$NO_COLOR" -eq 0 ]] && color_start="\033[0;37m"
                     fi
                 else
                     st="No handshake"
-                    color_start="\033[0;37m"
+                    [[ "$NO_COLOR" -eq 0 ]] && color_start="\033[0;37m"
                 fi
             else
                 pk="?"
                 st="Key error"
-                color_start="\033[0;31m"
+                [[ "$NO_COLOR" -eq 0 ]] && color_start="\033[0;31m"
             fi
         fi
 

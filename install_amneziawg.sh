@@ -391,6 +391,9 @@ validate_subnet() {
        || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]]; then
         die "Некорректная подсеть: '$subnet'. Поддерживается только /24."
     fi
+    if [[ "${BASH_REMATCH[4]}" -eq 0 ]] || [[ "${BASH_REMATCH[4]}" -eq 255 ]]; then
+        die "Некорректная подсеть: '$subnet'. Последний октет не может быть 0 (сетевой адрес) или 255 (broadcast)."
+    fi
 }
 
 validate_cidr_list() {
@@ -431,13 +434,16 @@ configure_routing_mode() {
         1) ALLOWED_IPS="0.0.0.0/0"
            log "Выбран режим: Весь трафик." ;;
         3) if [[ -z "$CLI_CUSTOM_ROUTES" ]]; then
-               read -rp "Введите сети (a.b.c.d/xx,...): " custom < /dev/tty
-               ALLOWED_IPS=$custom
+               read -rp "Введите сети (a.b.c.d/xx,...): " ALLOWED_IPS < /dev/tty
+               while ! validate_cidr_list "$ALLOWED_IPS"; do
+                   log_warn "Некорректный формат CIDR: '$ALLOWED_IPS'. Ожидается: x.x.x.x/y[,x.x.x.x/y]"
+                   read -rp "Повторите ввод: " ALLOWED_IPS < /dev/tty
+               done
            else
                ALLOWED_IPS=$CLI_CUSTOM_ROUTES
-           fi
-           if ! validate_cidr_list "$ALLOWED_IPS"; then
-               log_warn "Некорректный формат CIDR: '$ALLOWED_IPS'. Ожидается: x.x.x.x/y[,x.x.x.x/y]"
+               if ! validate_cidr_list "$ALLOWED_IPS"; then
+                   die "Некорректный формат CIDR: '$ALLOWED_IPS'. Ожидается: x.x.x.x/y[,x.x.x.x/y]"
+               fi
            fi
            log "Выбран режим: Пользовательский ($ALLOWED_IPS)" ;;
         *) ALLOWED_IPS_MODE=2
@@ -1070,7 +1076,7 @@ step_uninstall() {
     sysctl -p --system 2>/dev/null
     rm -f /etc/apt/sources.list.d/*.bak-* "$AWG_DIR"/ubuntu.sources.bak-* 2>/dev/null || true
     log "Удаление cron и скриптов..."
-    rm -f /etc/cron.d/*amneziawg* /etc/cron.d/awg-expiry /usr/local/bin/*amneziawg*.sh 2>/dev/null
+    rm -f /etc/cron.d/awg-expiry 2>/dev/null
     log "=== ДЕИНСТАЛЛЯЦИЯ ЗАВЕРШЕНА ==="
     # Копируем лог и удаляем рабочую директорию
     cp "$LOG_FILE" "$HOME/awg_uninstall.log" 2>/dev/null || true
@@ -1158,6 +1164,11 @@ initialize_setup() {
         if [[ "$ALLOWED_IPS_MODE" == "default" ]]; then configure_routing_mode; fi
     else
         log "Используются настройки из $CONFIG_FILE."
+        if [[ "$ALLOWED_IPS_MODE" == "3" ]] && [[ -n "$ALLOWED_IPS" ]]; then
+            if ! validate_cidr_list "$ALLOWED_IPS"; then
+                die "Некорректный ALLOWED_IPS в конфиге: '$ALLOWED_IPS'. Удалите $CONFIG_FILE и запустите установку заново."
+            fi
+        fi
     fi
 
     # Значения по умолчанию
