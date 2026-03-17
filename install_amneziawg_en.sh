@@ -1016,13 +1016,9 @@ step_uninstall() {
     systemctl disable awg-quick@awg0 2>/dev/null
     modprobe -r amneziawg 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
-        log "Removing Fail2Ban bans..."
-        if command -v fail2ban-client &>/dev/null; then
-            fail2ban-client unban --all 2>/dev/null || true
-            systemctl stop fail2ban 2>/dev/null
-        fi
-        log "Removing UFW rules..."
+        log "Disabling UFW (priority — preserve SSH access)..."
         if command -v ufw &>/dev/null; then
+            ufw --force disable 2>/dev/null
             local port_to_del
             if [[ -f "$CONFIG_FILE" ]]; then
                 # shellcheck source=/dev/null
@@ -1030,8 +1026,11 @@ step_uninstall() {
             fi
             port_to_del=${port_to_del:-39743}
             ufw delete allow "${port_to_del}/udp" 2>/dev/null
-            log "Disabling UFW..."
-            ufw --force disable 2>/dev/null
+        fi
+        log "Removing Fail2Ban bans..."
+        if command -v fail2ban-client &>/dev/null; then
+            fail2ban-client unban --all 2>/dev/null || true
+            systemctl stop fail2ban 2>/dev/null
         fi
     else
         log "Skipping UFW/Fail2Ban (installed with --no-tweaks)."
