@@ -21,3 +21,5 @@
 - [ ] Documentation updated (if applicable)
 - [ ] Security-sensitive changes reviewed (no eval/source on user data, strict permissions)
 - [ ] English script versions (`_en.sh`) synchronized (if Russian scripts modified)
+- [ ] Rollback tested: `--uninstall` + fresh install (if installer changes)
+- [ ] vpn:// URI generation verified (if `awg_common` changes)
