@@ -14,6 +14,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [5.7.3] — 2026-03-18
+
+### Fixed
+
+- **Uninstall SSH lockout:** UFW is now disabled BEFORE fail2ban unban — prevents SSH lockout if the connection drops during uninstall.
+- **CIDR validation (strict):** Invalid CIDR in `--route-custom` now calls `die()` in CLI mode. In interactive mode — retry prompt. Previously, installation continued with invalid AllowedIPs.
+- **validate_subnet .0/.255:** Subnets with last octet 0 (network address) or 255 (broadcast) are now rejected.
+- **ALLOWED_IPS resume:** Custom CIDR values (mode=3) are now validated when resuming installation from saved config.
+- **modify sed mismatch:** Synchronized sed pattern with grep in `modify_client()` — handles .conf files with any whitespace formatting around `=`. Added post-replacement verification.
+- **--no-color ANSI leak:** Fixed ESC code `\033[0m` leaking into `list --no-color` output.
+- **Uninstall wildcard cleanup:** Removed meaningless wildcard patterns from uninstall — `*amneziawg*` files in `/etc/cron.d/` and `/usr/local/bin/` were never created.
+
+### Documentation
+
+- Added AmneziaWG for Windows 2.0.0 as a supported client.
+- Removed misleading note about curl requirement on Debian.
+
+---
+
 ## [5.7.2] — 2026-03-16
 
 ### Security
@@ -263,7 +282,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Diagnostic report (`--diagnostic`).
 - Full uninstall (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.2...HEAD
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.3...HEAD
+[5.7.3]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.2...v5.7.3
 [5.7.2]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.1...v5.7.2
 [5.7.1]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.0...v5.7.1
 [5.7.0]: https://github.com/bivlked/amneziawg-installer/compare/v5.6.0...v5.7.0

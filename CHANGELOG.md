@@ -14,6 +14,25 @@
 
 ---
 
+## [5.7.3] — 2026-03-18
+
+### Исправлено
+
+- **Uninstall SSH lockout:** UFW отключается ДО unban fail2ban — предотвращает блокировку SSH при обрыве соединения во время деинсталляции.
+- **CIDR валидация (strict):** Невалидный CIDR в `--route-custom` вызывает `die()` в CLI-режиме. В интерактивном — повторный запрос ввода. Ранее установка продолжалась с некорректными AllowedIPs.
+- **validate_subnet .0/.255:** Подсети с последним октетом 0 (network address) или 255 (broadcast) отклоняются — ранее принимались.
+- **ALLOWED_IPS resume:** При возобновлении установки из конфига валидируются пользовательские CIDR (mode=3) — ранее загружались без проверки.
+- **modify sed mismatch:** Синхронизирован паттерн sed с grep в `modify_client()` — обрабатывает .conf с любым форматированием пробелов вокруг `=`. Добавлена постпроверка замены.
+- **--no-color ANSI leak:** Устранена утечка ESC-кодов `\033[0m` в вывод `list --no-color`.
+- **Uninstall wildcard cleanup:** Удалены бессмысленные wildcard-паттерны из uninstall — файлы `*amneziawg*` в `/etc/cron.d/` и `/usr/local/bin/` никогда не создавались.
+
+### Документация
+
+- Добавлен AmneziaWG for Windows 2.0.0 как поддерживаемый клиент.
+- Удалено ошибочное примечание о необходимости curl на Debian.
+
+---
+
 ## [5.7.2] — 2026-03-16
 
 ### Безопасность
@@ -263,7 +282,8 @@
 - Диагностический отчет (`--diagnostic`).
 - Полная деинсталляция (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.2...HEAD
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.3...HEAD
+[5.7.3]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.2...v5.7.3
 [5.7.2]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.1...v5.7.2
 [5.7.1]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.0...v5.7.1
 [5.7.0]: https://github.com/bivlked/amneziawg-installer/compare/v5.6.0...v5.7.0
