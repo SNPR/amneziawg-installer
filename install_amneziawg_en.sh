@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.7.5
+# Version: 5.7.6
 # Date: 2026-03-20
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.7.5"
+SCRIPT_VERSION="5.7.6"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -780,12 +780,23 @@ setup_improved_firewall() {
     log "Configuring UFW..."
     if ! command -v ufw &>/dev/null; then install_packages ufw; fi
 
+    # Detect main network interface for route rule
+    local main_nic
+    main_nic=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    if [[ -z "$main_nic" ]]; then
+        log_warn "Could not detect network interface for UFW route."
+    fi
+
     if ufw status | grep -q inactive; then
         log "UFW is inactive. Configuring..."
         ufw default deny incoming
         ufw default allow outgoing
         ufw limit 22/tcp comment "SSH Rate Limit"
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN"
+        if [[ -n "$main_nic" ]]; then
+            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing"
+            log "VPN routing rule added (awg0 → ${main_nic})."
+        fi
         log "UFW rules added."
         log_warn "--- ENABLING UFW ---"
         log_warn "Verify SSH access!"
@@ -806,6 +817,9 @@ setup_improved_firewall() {
         log "UFW is active. Updating rules..."
         ufw limit 22/tcp comment "SSH Rate Limit"
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN"
+        if [[ -n "$main_nic" ]]; then
+            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing"
+        fi
         ufw reload || log_warn "UFW reload error."
         log "Rules updated."
     fi
@@ -1035,6 +1049,7 @@ step_uninstall() {
             fi
             port_to_del=${port_to_del:-39743}
             ufw delete allow "${port_to_del}/udp" 2>/dev/null
+            ufw route delete allow in on awg0 2>/dev/null
         fi
         log "Removing Fail2Ban bans..."
         if command -v fail2ban-client &>/dev/null; then

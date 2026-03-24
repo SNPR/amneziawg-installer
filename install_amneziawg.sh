@@ -8,7 +8,7 @@ fi
 # ==============================================================================
 # Скрипт для установки и настройки AmneziaWG 2.0 на Ubuntu/Debian серверах
 # Автор: @bivlked
-# Версия: 5.7.5
+# Версия: 5.7.6
 # Дата: 2026-03-20
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
@@ -16,7 +16,7 @@ fi
 # --- Безопасный режим и Константы ---
 set -o pipefail
 
-SCRIPT_VERSION="5.7.5"
+SCRIPT_VERSION="5.7.6"
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
 STATE_FILE="$AWG_DIR/setup_state"
@@ -780,12 +780,23 @@ setup_improved_firewall() {
     log "Настройка UFW..."
     if ! command -v ufw &>/dev/null; then install_packages ufw; fi
 
+    # Определяем основной сетевой интерфейс для правила маршрутизации
+    local main_nic
+    main_nic=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    if [[ -z "$main_nic" ]]; then
+        log_warn "Не удалось определить сетевой интерфейс для UFW route."
+    fi
+
     if ufw status | grep -q inactive; then
         log "UFW неактивен. Настройка..."
         ufw default deny incoming
         ufw default allow outgoing
         ufw limit 22/tcp comment "SSH Rate Limit"
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN"
+        if [[ -n "$main_nic" ]]; then
+            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing"
+            log "Правило маршрутизации VPN добавлено (awg0 → ${main_nic})."
+        fi
         log "Правила UFW добавлены."
         log_warn "--- ВКЛЮЧЕНИЕ UFW ---"
         log_warn "Проверьте SSH доступ!"
@@ -806,6 +817,9 @@ setup_improved_firewall() {
         log "UFW активен. Обновление правил..."
         ufw limit 22/tcp comment "SSH Rate Limit"
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN"
+        if [[ -n "$main_nic" ]]; then
+            ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing"
+        fi
         ufw reload || log_warn "Ошибка перезагрузки UFW."
         log "Правила обновлены."
     fi
@@ -1035,6 +1049,7 @@ step_uninstall() {
             fi
             port_to_del=${port_to_del:-39743}
             ufw delete allow "${port_to_del}/udp" 2>/dev/null
+            ufw route delete allow in on awg0 2>/dev/null
         fi
         log "Снятие блокировок Fail2Ban..."
         if command -v fail2ban-client &>/dev/null; then

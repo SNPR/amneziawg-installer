@@ -37,7 +37,7 @@ body:
     attributes:
       label: Script Version
       description: Version of the script (shown at the top of each script or in `--version` output).
-      placeholder: "e.g., 5.7.5"
+      placeholder: "e.g., 5.7.6"
     validations:
       required: true
 

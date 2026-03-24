@@ -14,6 +14,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [5.7.6] — 2026-03-24
+
+### Fixed
+
+- **UFW blocks VPN traffic (Discussion #28):** Added `ufw route allow in on awg0 out on <nic>` rule during firewall setup. Previously, the default `deny (routed)` policy blocked forwarded packets from awg0 to the main interface, despite PostUp iptables rules. The rule is automatically removed on uninstall.
+- **PostUp FORWARD ordering:** Changed `iptables -A FORWARD` to `iptables -I FORWARD` to insert the rule at the top of the chain. Ensures correct routing when UFW is absent (`--no-tweaks`).
+
+---
+
 ## [5.7.5] — 2026-03-20
 
 ### Fixed
