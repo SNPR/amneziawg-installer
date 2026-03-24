@@ -358,7 +358,7 @@ EOF
 # Использует awg syncconf для zero-downtime обновления пиров
 # Fallback на полный перезапуск при ошибке
 apply_config() {
-    local strip_out rc
+    local strip_out rc=0
     strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || {
         log_warn "awg-quick strip не удался или timeout, использую полный перезапуск."
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?

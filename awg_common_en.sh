@@ -358,7 +358,7 @@ EOF
 # Uses awg syncconf for zero-downtime peer updates
 # Falls back to full restart on error
 apply_config() {
-    local strip_out rc
+    local strip_out rc=0
     strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || {
         log_warn "awg-quick strip failed or timed out, falling back to full restart."
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?

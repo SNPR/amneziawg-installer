@@ -471,7 +471,7 @@ list_clients() {
     local act=0 tot=0
 
     # Однопроходный парсинг серверного конфига: name → pubkey
-    declare -A _name_to_pk
+    local -A _name_to_pk
     local _cn=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" == "#_Name = "* ]]; then
@@ -486,7 +486,7 @@ list_clients() {
     done < "$SERVER_CONF_FILE"
 
     # Однопроходный парсинг awg show dump: pubkey → handshake timestamp
-    declare -A _pk_to_hs
+    local -A _pk_to_hs
     local awg_dump
     awg_dump=$(awg show awg0 dump 2>/dev/null) || awg_dump=""
     if [[ -n "$awg_dump" ]]; then
@@ -625,7 +625,7 @@ stats_clients() {
     }
 
     # Маппинг: публичный ключ → имя клиента (single-pass)
-    declare -A pk_to_name
+    local -A pk_to_name
     local _current_name=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" == "#_Name = "* ]]; then
