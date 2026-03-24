@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.7.6
+# Version: 5.7.7
 # Date: 2026-03-20
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.7.6"
+SCRIPT_VERSION="5.7.7"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -345,6 +345,9 @@ safe_load_config() {
             if [[ "$value" == \'*\' ]]; then
                 value="${value#\'}"
                 value="${value%\'}"
+            elif [[ "$value" == \"*\" ]]; then
+                value="${value#\"}"
+                value="${value%\"}"
             fi
             case "$key" in
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
@@ -369,6 +372,9 @@ safe_read_config_key() {
             if [[ "$value" == \'*\' ]]; then
                 value="${value#\'}"
                 value="${value%\'}"
+            elif [[ "$value" == \"*\" ]]; then
+                value="${value#\"}"
+                value="${value%\"}"
             fi
             echo "$value"
             return 0
@@ -1591,6 +1597,21 @@ step6_generate_configs() {
     # Create AWG 2.0 server config
     log "Creating server config..."
     render_server_config || die "Server config creation error."
+
+    # Restore existing [Peer] blocks from backup (excluding defaults)
+    if [[ -n "${s_bak:-}" && -f "$s_bak" ]]; then
+        local restored_peers
+        restored_peers=$(awk '
+            /^\[Peer\]/ { buf=$0"\n"; in_peer=1; skip=0; next }
+            in_peer && /^\[/ { if (!skip) printf "%s\n", buf; buf=""; in_peer=0; next }
+            in_peer { buf=buf $0"\n"; if ($0 ~ /^#_Name = (my_phone|my_laptop)$/) skip=1; next }
+            END { if (in_peer && !skip) printf "%s", buf }
+        ' "$s_bak")
+        if [[ -n "$restored_peers" ]]; then
+            printf '\n%s' "$restored_peers" >> "$SERVER_CONF_FILE"
+            log "Existing peers restored from backup."
+        fi
+    fi
 
     # Generate default clients
     log "Creating default clients..."

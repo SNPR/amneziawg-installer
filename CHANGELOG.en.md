@@ -14,6 +14,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [5.7.7] — 2026-03-24
+
+### Fixed
+
+- **Peer loss on reinstall:** `render_server_config` overwrote `awg0.conf` from scratch. Existing `[Peer]` blocks are now automatically restored from backup when step 6 re-runs.
+- **Race condition when adding clients (TOCTOU):** `get_next_client_ip` and `add_peer_to_server` now execute in a single critical section (`flock` in `generate_client`). Two parallel `add` operations can no longer pick the same IP.
+- **Silent restore success on failure:** `restore_backup` now returns non-zero exit code when file copy errors occur, instead of silently reporting success.
+- **Config parser double quote support:** `safe_load_config` now correctly handles double-quoted values (`"value"`) in addition to single quotes.
+
+---
+
 ## [5.7.6] — 2026-03-24
 
 ### Fixed

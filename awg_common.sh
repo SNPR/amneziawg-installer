@@ -3,7 +3,7 @@
 # ==============================================================================
 # Общая библиотека функций для AmneziaWG 2.0
 # Автор: @bivlked
-# Версия: 5.7.6
+# Версия: 5.7.7
 # Дата: 2026-03-20
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
@@ -19,7 +19,7 @@ CONFIG_FILE="${CONFIG_FILE:-$AWG_DIR/awgsetup_cfg.init}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
 KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # shellcheck disable=SC2034
-AWG_COMMON_VERSION="5.7.6"
+AWG_COMMON_VERSION="5.7.7"
 
 # --- Автоочистка временных файлов ---
 # ВАЖНО: trap НЕ устанавливается здесь, чтобы не перезаписать trap вызывающего скрипта.
@@ -99,6 +99,9 @@ safe_load_config() {
             if [[ "$value" == \'*\' ]]; then
                 value="${value#\'}"
                 value="${value%\'}"
+            elif [[ "$value" == \"*\" ]]; then
+                value="${value#\"}"
+                value="${value%\"}"
             fi
             case "$key" in
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
@@ -405,7 +408,8 @@ get_next_client_ip() {
     return 1
 }
 
-# Атомарное добавление [Peer] в серверный конфиг (с блокировкой)
+# Добавление [Peer] в серверный конфиг (атомарно через tmpfile + mv)
+# ВАЖНО: вызывающий код должен держать flock на ${AWG_DIR}/.awg_config.lock
 # add_peer_to_server <name> <pubkey> <client_ip>
 add_peer_to_server() {
     local name="$1"
@@ -417,30 +421,18 @@ add_peer_to_server() {
         return 1
     fi
 
-    # Межпроцессная блокировка (защита от гонки cron expiry + manual operation)
-    local lockfile="${AWG_DIR}/.awg_config.lock"
-    local lock_fd
-    exec {lock_fd}>"$lockfile"
-    if ! flock -x -w 10 "$lock_fd"; then
-        log_error "Не удалось получить блокировку конфига"
-        exec {lock_fd}>&-
-        return 1
-    fi
-
     if grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Пир '$name' уже существует в конфиге"
-        exec {lock_fd}>&-
         return 1
     fi
 
     # Добавляем пир через временный файл (атомарно)
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; exec {lock_fd}>&-; return 1; }
+    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
         log_error "Ошибка копирования серверного конфига"
-        exec {lock_fd}>&-
         return 1
     }
 
@@ -455,11 +447,9 @@ EOF
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Ошибка обновления серверного конфига"
-        exec {lock_fd}>&-
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
-    exec {lock_fd}>&-
     log "Пир '$name' добавлен в серверный конфиг."
     return 0
 }
@@ -703,23 +693,34 @@ generate_client() {
     # Загружаем параметры
     load_awg_params || return 1
 
+    # Межпроцессная блокировка: атомарность IP-аллокации + добавления пира
+    local lockfile="${AWG_DIR}/.awg_config.lock"
+    local lock_fd
+    exec {lock_fd}>"$lockfile"
+    if ! flock -x -w 30 "$lock_fd"; then
+        log_error "Не удалось получить блокировку конфига"
+        exec {lock_fd}>&-
+        return 1
+    fi
+
     # Генерация ключей
-    generate_keypair "$name" || return 1
+    generate_keypair "$name" || { exec {lock_fd}>&-; return 1; }
 
     # Следующий свободный IP
     local client_ip
-    client_ip=$(get_next_client_ip) || return 1
+    client_ip=$(get_next_client_ip) || { exec {lock_fd}>&-; return 1; }
 
     # Читаем ключи
     local client_privkey client_pubkey server_pubkey
-    client_privkey=$(cat "$KEYS_DIR/${name}.private") || return 1
-    client_pubkey=$(cat "$KEYS_DIR/${name}.public") || return 1
+    client_privkey=$(cat "$KEYS_DIR/${name}.private") || { exec {lock_fd}>&-; return 1; }
+    client_pubkey=$(cat "$KEYS_DIR/${name}.public") || { exec {lock_fd}>&-; return 1; }
 
     if [[ ! -f "$AWG_DIR/server_public.key" ]]; then
         log_error "Публичный ключ сервера не найден"
+        exec {lock_fd}>&-
         return 1
     fi
-    server_pubkey=$(cat "$AWG_DIR/server_public.key") || return 1
+    server_pubkey=$(cat "$AWG_DIR/server_public.key") || { exec {lock_fd}>&-; return 1; }
 
     # Endpoint: из аргумента, из конфига или автоопределение
     if [[ -z "$endpoint" ]]; then
@@ -730,6 +731,7 @@ generate_client() {
     fi
     if [[ -z "$endpoint" ]]; then
         log_error "Не удалось определить внешний IP сервера. Используйте --endpoint=IP"
+        exec {lock_fd}>&-
         return 1
     fi
 
@@ -737,6 +739,7 @@ generate_client() {
     render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" || {
         log_error "Откат: удаление ключей '$name'"
         rm -f "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+        exec {lock_fd}>&-
         return 1
     }
 
@@ -744,8 +747,12 @@ generate_client() {
     if ! add_peer_to_server "$name" "$client_pubkey" "$client_ip"; then
         log_error "Откат: удаление файлов '$name'"
         rm -f "$AWG_DIR/${name}.conf" "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+        exec {lock_fd}>&-
         return 1
     fi
+
+    # Освобождаем блокировку — пир записан, дальше некритичные операции
+    exec {lock_fd}>&-
 
     # QR-код (необязательный, ошибка не фатальна)
     if ! generate_qr "$name"; then

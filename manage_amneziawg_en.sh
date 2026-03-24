@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 peer management script
 # Author: @bivlked
-# Version: 5.7.6
+# Version: 5.7.7
 # Date: 2026-03-20
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="5.7.6"
+SCRIPT_VERSION="5.7.7"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
@@ -253,7 +253,7 @@ restore_backup() {
     log "Backing up current config..."
     backup_configs
 
-    local td
+    local td restore_errors=0
     td=$(mktemp -d)
     if ! tar -xzf "$bf" -C "$td"; then
         log_error "tar error $bf"
@@ -269,7 +269,7 @@ restore_backup() {
         local server_conf_dir
         server_conf_dir=$(dirname "$SERVER_CONF_FILE")
         mkdir -p "$server_conf_dir"
-        cp -a "$td/server/"* "$server_conf_dir/" || log_error "Error copying server"
+        cp -a "$td/server/"* "$server_conf_dir/" || { log_error "Error copying server"; restore_errors=1; }
         chmod 600 "$server_conf_dir"/*.conf 2>/dev/null
         chmod 700 "$server_conf_dir"
         log_debug "Server config restored to $server_conf_dir"
@@ -277,7 +277,7 @@ restore_backup() {
 
     if [[ -d "$td/clients" ]]; then
         log "Restoring client files..."
-        cp -a "$td/clients/"* "$AWG_DIR/" || log_error "Error copying clients"
+        cp -a "$td/clients/"* "$AWG_DIR/" || { log_error "Error copying clients"; restore_errors=1; }
         chmod 600 "$AWG_DIR"/*.conf 2>/dev/null
         chmod 600 "$CONFIG_FILE" 2>/dev/null
         log_debug "Client files restored to $AWG_DIR"
@@ -286,7 +286,7 @@ restore_backup() {
     if [[ -d "$td/keys" ]]; then
         log "Restoring keys..."
         mkdir -p "$KEYS_DIR"
-        cp -a "$td/keys/"* "$KEYS_DIR/" || log_error "Error copying keys"
+        cp -a "$td/keys/"* "$KEYS_DIR/" || { log_error "Error copying keys"; restore_errors=1; }
         chmod 600 "$KEYS_DIR"/* 2>/dev/null
         log_debug "Keys restored to $KEYS_DIR"
     fi
@@ -314,6 +314,10 @@ restore_backup() {
         local status_out
         status_out=$(systemctl status awg-quick@awg0 --no-pager 2>&1) || true
         while IFS= read -r line; do log_error "  $line"; done <<< "$status_out"
+        return 1
+    fi
+    if [[ "$restore_errors" -ne 0 ]]; then
+        log_warn "Restore completed with errors. Please verify configuration."
         return 1
     fi
     log "Restore completed."
