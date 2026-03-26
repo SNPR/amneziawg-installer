@@ -3,6 +3,8 @@
   <b>RU</b> Русский | <b>EN</b> <a href="README.en.md">English</a>
 </p>
 
+<p align="center"><em>One-command AmneziaWG 2.0 VPN setup for Ubuntu & Debian — DPI-resistant, self-hosted, open source</em></p>
+
 <p align="center">
   <img src="logo.jpg" alt="AmneziaWG 2.0 Installer" width="600">
 </p>
