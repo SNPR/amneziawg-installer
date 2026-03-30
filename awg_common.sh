@@ -3,7 +3,7 @@
 # ==============================================================================
 # Общая библиотека функций для AmneziaWG 2.0
 # Автор: @bivlked
-# Версия: 5.7.9
+# Версия: 5.7.10
 # Дата: 2026-03-25
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
@@ -19,7 +19,7 @@ CONFIG_FILE="${CONFIG_FILE:-$AWG_DIR/awgsetup_cfg.init}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
 KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # shellcheck disable=SC2034
-AWG_COMMON_VERSION="5.7.9"
+AWG_COMMON_VERSION="5.7.10"
 
 # --- Автоочистка временных файлов ---
 # ВАЖНО: trap НЕ устанавливается здесь, чтобы не перезаписать trap вызывающего скрипта.
@@ -358,32 +358,53 @@ EOF
 # ==============================================================================
 
 # Применение изменений конфигурации
-# Режим syncconf (по умолчанию): zero-downtime обновление пиров
-# Режим restart: полный перезапуск (обход upstream deadlock amneziawg-linux-kernel-module#146)
-# Управление: AWG_APPLY_MODE=syncconf|restart (конфиг или --apply-mode CLI)
+# AWG_SKIP_APPLY=1: пропустить apply (для batch-автоматизации)
+# AWG_APPLY_MODE=syncconf|restart: режим применения (конфиг или --apply-mode CLI)
+# flock на .awg_apply.lock: защита от параллельных вызовов
 apply_config() {
+    # Пропуск apply (AWG_SKIP_APPLY=1 manage add/remove ...)
+    if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
+        log_debug "apply_config пропущен (AWG_SKIP_APPLY=1)."
+        return 0
+    fi
+
+    # Межпроцессная блокировка apply_config
+    local apply_lockfile="${AWG_DIR}/.awg_apply.lock"
+    local apply_fd
+    exec {apply_fd}>"$apply_lockfile"
+    if ! flock -x -w 120 "$apply_fd"; then
+        log_warn "Не удалось получить блокировку apply_config."
+        exec {apply_fd}>&-
+        return 1
+    fi
+
+    local rc=0
+
     if [[ "${AWG_APPLY_MODE:-syncconf}" == "restart" ]]; then
         log "Перезапуск сервиса (apply-mode=restart)..."
-        local rc=0
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
         [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска."
+        exec {apply_fd}>&-
         return $rc
     fi
 
-    local strip_out rc=0
+    local strip_out
     strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || {
         log_warn "awg-quick strip не удался или timeout, использую полный перезапуск."
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
         [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска."
+        exec {apply_fd}>&-
         return $rc
     }
     echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null || {
         log_warn "awg syncconf не удался или timeout, использую полный перезапуск."
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
         [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска."
+        exec {apply_fd}>&-
         return $rc
     }
     log_debug "Конфигурация применена (syncconf)."
+    exec {apply_fd}>&-
 }
 
 # ==============================================================================

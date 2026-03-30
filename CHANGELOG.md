@@ -14,6 +14,16 @@
 
 ---
 
+## [5.7.10] — 2026-03-30
+
+### Добавлено
+
+- **Batch remove клиентов (#30):** `manage remove client1 client2 client3` — удаление нескольких клиентов одной командой с одним apply_config в конце.
+- **AWG_SKIP_APPLY=1 (#30):** Переменная среды для пропуска apply_config. Позволяет накопить изменения и применить одной командой — для автоматизации и API-интеграций.
+- **flock в apply_config (#30):** Межпроцессная блокировка (`${AWG_DIR}/.awg_apply.lock`) предотвращает параллельные restart/syncconf вызовы.
+
+---
+
 ## [5.7.9] — 2026-03-25
 
 ### Добавлено
@@ -359,7 +369,8 @@
 - Диагностический отчет (`--diagnostic`).
 - Полная деинсталляция (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.9...HEAD
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.10...HEAD
+[5.7.10]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.9...v5.7.10
 [5.7.9]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.8...v5.7.9
 [5.7.8]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.7...v5.7.8
 [5.7.7]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.6...v5.7.7

@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 peer management script
 # Author: @bivlked
-# Version: 5.7.9
+# Version: 5.7.10
 # Date: 2026-03-25
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="5.7.9"
+SCRIPT_VERSION="5.7.10"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
@@ -725,7 +725,7 @@ usage() {
     echo ""
     echo "Commands:"
     echo "  add <name> [name2 ...]       Add client(s). --expires applies to all"
-    echo "  remove <name>         Remove a client"
+    echo "  remove <name> [name2 ...]    Remove client(s)"
     echo "  list [-v]             List clients"
     echo "  stats [--json]        Client traffic statistics"
     echo "  regen [name]          Regenerate client file(s)"
@@ -794,26 +794,50 @@ case $COMMAND in
         ;;
 
     remove)
-        [[ -z "$CLIENT_NAME" ]] && die "Client name not specified."
-        validate_client_name "$CLIENT_NAME" || exit 1
-        if ! grep -qxF "#_Name = ${CLIENT_NAME}" "$SERVER_CONF_FILE"; then
-            die "Client '$CLIENT_NAME' not found."
-        fi
-        if ! confirm_action "remove" "client '$CLIENT_NAME'"; then exit 1; fi
+        [[ ${#ARGS[@]} -eq 0 ]] && die "Client name not specified."
 
-        log "Removing '$CLIENT_NAME'..."
-        if remove_peer_from_server "$CLIENT_NAME"; then
-            log_debug "Peer '$CLIENT_NAME' removed from server config."
-            log "Client '$CLIENT_NAME' removed from server config."
-            rm -f "$AWG_DIR/$CLIENT_NAME.conf" "$AWG_DIR/$CLIENT_NAME.png" "$AWG_DIR/$CLIENT_NAME.vpnuri"
-            rm -f "$KEYS_DIR/${CLIENT_NAME}.private" "$KEYS_DIR/${CLIENT_NAME}.public"
-            remove_client_expiry "$CLIENT_NAME"
-            log "Client files deleted."
-            [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
-            apply_config
-        else
-            log_error "Error removing client '$CLIENT_NAME'."
+        # Validate all names before removing
+        _valid_names=()
+        for _rname in "${ARGS[@]}"; do
+            validate_client_name "$_rname" || { _cmd_rc=1; continue; }
+            if ! grep -qxF "#_Name = ${_rname}" "$SERVER_CONF_FILE"; then
+                log_warn "Client '$_rname' not found, skipping."
+                continue
+            fi
+            _valid_names+=("$_rname")
+        done
+
+        if [[ ${#_valid_names[@]} -eq 0 ]]; then
+            log_error "No clients to remove."
             _cmd_rc=1
+        else
+            # Confirmation
+            if [[ ${#_valid_names[@]} -eq 1 ]]; then
+                if ! confirm_action "remove" "client '${_valid_names[0]}'"; then exit 1; fi
+            else
+                if ! confirm_action "remove" "${#_valid_names[@]} clients"; then exit 1; fi
+            fi
+
+            _removed=0
+            for _rname in "${_valid_names[@]}"; do
+                log "Removing '$_rname'..."
+                if remove_peer_from_server "$_rname"; then
+                    rm -f "$AWG_DIR/$_rname.conf" "$AWG_DIR/$_rname.png" "$AWG_DIR/$_rname.vpnuri"
+                    rm -f "$KEYS_DIR/${_rname}.private" "$KEYS_DIR/${_rname}.public"
+                    remove_client_expiry "$_rname"
+                    log "Client '$_rname' removed."
+                    ((_removed++))
+                else
+                    log_error "Error removing '$_rname'."
+                    _cmd_rc=1
+                fi
+            done
+
+            if [[ $_removed -gt 0 ]]; then
+                [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
+                apply_config
+                log "Clients removed: $_removed. Configuration applied."
+            fi
         fi
         ;;
 

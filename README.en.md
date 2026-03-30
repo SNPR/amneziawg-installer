@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/Debian-12_|_13-A81D33" alt="Debian 12 | 13">
   <a href="https://github.com/bivlked/amneziawg-installer/blob/main/LICENSE"><img src="https://img.shields.io/github/license/bivlked/amneziawg-installer" alt="License"></a>
   <img src="https://img.shields.io/badge/Status-Stable-success" alt="Status">
-  <a href="https://github.com/bivlked/amneziawg-installer/releases"><img src="https://img.shields.io/badge/Installer_Version-5.7.9-blue" alt="Version"></a>
+  <a href="https://github.com/bivlked/amneziawg-installer/releases"><img src="https://img.shields.io/badge/Installer_Version-5.7.10-blue" alt="Version"></a>
   <img src="https://img.shields.io/badge/AmneziaWG-2.0-blueviolet" alt="AWG 2.0">
   <a href="https://github.com/bivlked/amneziawg-installer/actions/workflows/shellcheck.yml"><img src="https://github.com/bivlked/amneziawg-installer/actions/workflows/shellcheck.yml/badge.svg" alt="ShellCheck"></a>
   <a href="https://github.com/bivlked/amneziawg-installer/stargazers"><img src="https://img.shields.io/github/stars/bivlked/amneziawg-installer?style=flat" alt="Stars"></a>
@@ -264,7 +264,7 @@ sudo bash /root/awg/manage_amneziawg.sh <command> [arguments]
 | Command   | Arguments              | Description                    | Restart? |
 | :-------- | :--------------------- | :----------------------------- | :------: |
 | `add`     | `<name> [name2 ...] [--expires=DUR]`  | Add client(s) (opt. with expiry) | No (auto) |
-| `remove`  | `<client_name>`        | Remove a client                | No (auto) |
+| `remove`  | `<name> [name2 ...]`   | Remove client(s)               | No (auto) |
 | `list`    | `[-v]`                 | List clients (`-v` for details)|    No     |
 | `regen`   | `[client_name]`        | Regenerate files (all/one)     |    No     |
 | `modify`  | `<name> <param> <val>` | Modify a client parameter      |    No     |

@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # Скрипт для управления пользователями (пирами) AmneziaWG 2.0
 # Автор: @bivlked
-# Версия: 5.7.9
+# Версия: 5.7.10
 # Дата: 2026-03-25
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Безопасный режим и Константы ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="5.7.9"
+SCRIPT_VERSION="5.7.10"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
@@ -725,7 +725,7 @@ usage() {
     echo ""
     echo "Команды:"
     echo "  add <имя> [имя2 ...]        Добавить клиента(ов). --expires применяется ко всем"
-    echo "  remove <имя>          Удалить клиента"
+    echo "  remove <имя> [имя2 ...]     Удалить клиента(ов)"
     echo "  list [-v]             Показать список клиентов"
     echo "  stats [--json]        Статистика трафика по клиентам"
     echo "  regen [имя]           Перегенерировать файлы клиента(ов)"
@@ -794,26 +794,50 @@ case $COMMAND in
         ;;
 
     remove)
-        [[ -z "$CLIENT_NAME" ]] && die "Не указано имя клиента."
-        validate_client_name "$CLIENT_NAME" || exit 1
-        if ! grep -qxF "#_Name = ${CLIENT_NAME}" "$SERVER_CONF_FILE"; then
-            die "Клиент '$CLIENT_NAME' не найден."
-        fi
-        if ! confirm_action "удалить" "клиента '$CLIENT_NAME'"; then exit 1; fi
+        [[ ${#ARGS[@]} -eq 0 ]] && die "Не указано имя клиента."
 
-        log "Удаление '$CLIENT_NAME'..."
-        if remove_peer_from_server "$CLIENT_NAME"; then
-            log_debug "Пир '$CLIENT_NAME' удалён из серверного конфига."
-            log "Клиент '$CLIENT_NAME' удалён из серверного конфига."
-            rm -f "$AWG_DIR/$CLIENT_NAME.conf" "$AWG_DIR/$CLIENT_NAME.png" "$AWG_DIR/$CLIENT_NAME.vpnuri"
-            rm -f "$KEYS_DIR/${CLIENT_NAME}.private" "$KEYS_DIR/${CLIENT_NAME}.public"
-            remove_client_expiry "$CLIENT_NAME"
-            log "Файлы клиента удалены."
-            [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
-            apply_config
-        else
-            log_error "Ошибка удаления клиента '$CLIENT_NAME'."
+        # Валидация всех имён перед удалением
+        _valid_names=()
+        for _rname in "${ARGS[@]}"; do
+            validate_client_name "$_rname" || { _cmd_rc=1; continue; }
+            if ! grep -qxF "#_Name = ${_rname}" "$SERVER_CONF_FILE"; then
+                log_warn "Клиент '$_rname' не найден, пропуск."
+                continue
+            fi
+            _valid_names+=("$_rname")
+        done
+
+        if [[ ${#_valid_names[@]} -eq 0 ]]; then
+            log_error "Нет клиентов для удаления."
             _cmd_rc=1
+        else
+            # Подтверждение
+            if [[ ${#_valid_names[@]} -eq 1 ]]; then
+                if ! confirm_action "удалить" "клиента '${_valid_names[0]}'"; then exit 1; fi
+            else
+                if ! confirm_action "удалить" "${#_valid_names[@]} клиентов"; then exit 1; fi
+            fi
+
+            _removed=0
+            for _rname in "${_valid_names[@]}"; do
+                log "Удаление '$_rname'..."
+                if remove_peer_from_server "$_rname"; then
+                    rm -f "$AWG_DIR/$_rname.conf" "$AWG_DIR/$_rname.png" "$AWG_DIR/$_rname.vpnuri"
+                    rm -f "$KEYS_DIR/${_rname}.private" "$KEYS_DIR/${_rname}.public"
+                    remove_client_expiry "$_rname"
+                    log "Клиент '$_rname' удалён."
+                    ((_removed++))
+                else
+                    log_error "Ошибка удаления '$_rname'."
+                    _cmd_rc=1
+                fi
+            done
+
+            if [[ $_removed -gt 0 ]]; then
+                [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
+                apply_config
+                log "Удалено клиентов: $_removed. Конфигурация применена."
+            fi
         fi
         ;;
 

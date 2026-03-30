@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/Debian-12_|_13-A81D33" alt="Debian 12 | 13">
   <a href="https://github.com/bivlked/amneziawg-installer/blob/main/LICENSE"><img src="https://img.shields.io/github/license/bivlked/amneziawg-installer" alt="License"></a>
   <img src="https://img.shields.io/badge/Status-Stable-success" alt="Status">
-  <a href="https://github.com/bivlked/amneziawg-installer/releases"><img src="https://img.shields.io/badge/Installer_Version-5.7.9-blue" alt="Version"></a>
+  <a href="https://github.com/bivlked/amneziawg-installer/releases"><img src="https://img.shields.io/badge/Installer_Version-5.7.10-blue" alt="Version"></a>
   <img src="https://img.shields.io/badge/AmneziaWG-2.0-blueviolet" alt="AWG 2.0">
   <a href="https://github.com/bivlked/amneziawg-installer/actions/workflows/shellcheck.yml"><img src="https://github.com/bivlked/amneziawg-installer/actions/workflows/shellcheck.yml/badge.svg" alt="ShellCheck"></a>
   <a href="https://github.com/bivlked/amneziawg-installer/stargazers"><img src="https://img.shields.io/github/stars/bivlked/amneziawg-installer?style=flat" alt="Stars"></a>
@@ -266,7 +266,7 @@ sudo bash /root/awg/manage_amneziawg.sh <команда> [аргументы]
 | Команда   | Аргументы              | Описание                     | Перезапуск? |
 | :-------- | :--------------------- | :--------------------------- | :-----------: |
 | `add`     | `<имя> [имя2 ...] [--expires=ВРЕМЯ]` | Добавить клиента(ов) (опц. с истечением) | Нет (авто) |
-| `remove`  | `<имя_клиента>`        | Удалить клиента              |  Нет (авто) |
+| `remove`  | `<имя> [имя2 ...]`     | Удалить клиента(ов)          |  Нет (авто) |
 | `list`    | `[-v]`                 | Список клиентов (`-v` детали) |       Нет     |
 | `regen`   | `[имя_клиента]`        | Переген. файлы (всех/одного) |       Нет     |
 | `modify`  | `<имя> <пар> <зн>`     | Изменить параметр клиента    |       Нет     |

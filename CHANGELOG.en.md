@@ -14,6 +14,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [5.7.10] — 2026-03-30
+
+### Added
+
+- **Batch remove clients (#30):** `manage remove client1 client2 client3` — remove multiple clients in one command with a single apply_config at the end.
+- **AWG_SKIP_APPLY=1 (#30):** Environment variable to skip apply_config entirely. Allows accumulating changes and applying once — for automation and API integrations.
+- **flock in apply_config (#30):** Inter-process lock (`${AWG_DIR}/.awg_apply.lock`) prevents concurrent restart/syncconf calls.
+
+---
+
 ## [5.7.9] — 2026-03-25
 
 ### Added
@@ -359,7 +369,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Diagnostic report (`--diagnostic`).
 - Full uninstall (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.9...HEAD
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.10...HEAD
+[5.7.10]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.9...v5.7.10
 [5.7.9]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.8...v5.7.9
 [5.7.8]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.7...v5.7.8
 [5.7.7]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.6...v5.7.7

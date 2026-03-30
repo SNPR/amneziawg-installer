@@ -3,7 +3,7 @@
 # ==============================================================================
 # Shared function library for AmneziaWG 2.0
 # Author: @bivlked
-# Version: 5.7.9
+# Version: 5.7.10
 # Date: 2026-03-25
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
@@ -19,7 +19,7 @@ CONFIG_FILE="${CONFIG_FILE:-$AWG_DIR/awgsetup_cfg.init}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
 KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # shellcheck disable=SC2034
-AWG_COMMON_VERSION="5.7.9"
+AWG_COMMON_VERSION="5.7.10"
 
 # --- Auto-cleanup of temporary files ---
 # NOTE: trap is NOT set here to avoid overwriting the caller's trap handler.
@@ -358,32 +358,53 @@ EOF
 # ==============================================================================
 
 # Apply configuration changes
-# syncconf mode (default): zero-downtime peer updates
-# restart mode: full service restart (bypasses upstream deadlock amneziawg-linux-kernel-module#146)
-# Control: AWG_APPLY_MODE=syncconf|restart (config or --apply-mode CLI)
+# AWG_SKIP_APPLY=1: skip apply (for batch automation)
+# AWG_APPLY_MODE=syncconf|restart: apply method (config or --apply-mode CLI)
+# flock on .awg_apply.lock: prevents concurrent apply calls
 apply_config() {
+    # Skip apply (AWG_SKIP_APPLY=1 manage add/remove ...)
+    if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
+        log_debug "apply_config skipped (AWG_SKIP_APPLY=1)."
+        return 0
+    fi
+
+    # Inter-process lock for apply_config
+    local apply_lockfile="${AWG_DIR}/.awg_apply.lock"
+    local apply_fd
+    exec {apply_fd}>"$apply_lockfile"
+    if ! flock -x -w 120 "$apply_fd"; then
+        log_warn "Failed to acquire apply_config lock."
+        exec {apply_fd}>&-
+        return 1
+    fi
+
+    local rc=0
+
     if [[ "${AWG_APPLY_MODE:-syncconf}" == "restart" ]]; then
         log "Restarting service (apply-mode=restart)..."
-        local rc=0
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
         [[ $rc -ne 0 ]] && log_warn "Service restart error."
+        exec {apply_fd}>&-
         return $rc
     fi
 
-    local strip_out rc=0
+    local strip_out
     strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || {
         log_warn "awg-quick strip failed or timed out, falling back to full restart."
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
         [[ $rc -ne 0 ]] && log_warn "Service restart error."
+        exec {apply_fd}>&-
         return $rc
     }
     echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null || {
         log_warn "awg syncconf failed or timed out, falling back to full restart."
         systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
         [[ $rc -ne 0 ]] && log_warn "Service restart error."
+        exec {apply_fd}>&-
         return $rc
     }
     log_debug "Config applied (syncconf)."
+    exec {apply_fd}>&-
 }
 
 # ==============================================================================
