@@ -438,12 +438,12 @@ Ensures automatic rebuilding of the `amneziawg` kernel module on kernel updates.
 
 Client keys are stored in `/root/awg/keys/` (permissions 600). Server keys are in `/root/awg/server_private.key` and `server_public.key`.
 
-#### Version-Pinned URLs (v5.7.10)
+#### Version-Pinned URLs (v5.7.11)
 
 The installer downloads `awg_common.sh` and `manage_amneziawg.sh` from URLs pinned to the specific version tag:
 
 ```
-https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.7.10/awg_common.sh
+https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.7.11/awg_common.sh
 ```
 
 This provides **supply chain pinning** — ensuring downloaded scripts match the installer version, even if `main` has already been updated.
@@ -493,7 +493,7 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 
 <details>
   <summary><strong>Q: How do I change the MTU?</strong></summary>
-  <b>A:</b> Starting with v5.7.10, <code>MTU = 1280</code> is set automatically. To change it: edit the <code>MTU = &lt;value&gt;</code> line in the <code>[Interface]</code> section of <code>/etc/amnezia/amneziawg/awg0.conf</code> and in client <code>.conf</code> files. Restart the service. See <a href="#mtu-mobile-adv">MTU and Mobile Clients</a> for details.
+  <b>A:</b> Starting with v5.7.11, <code>MTU = 1280</code> is set automatically. To change it: edit the <code>MTU = &lt;value&gt;</code> line in the <code>[Interface]</code> section of <code>/etc/amnezia/amneziawg/awg0.conf</code> and in client <code>.conf</code> files. Restart the service. See <a href="#mtu-mobile-adv">MTU and Mobile Clients</a> for details.
 </details>
 
 <details>
@@ -718,11 +718,11 @@ When a client is created, a `.vpnuri` file is automatically generated with a `vp
 <a id="mtu-mobile-adv"></a>
 ## 📱 MTU and Mobile Clients
 
-Starting with v5.7.10, `MTU = 1280` is set automatically in both server and client configs.
+Starting with v5.7.11, `MTU = 1280` is set automatically in both server and client configs.
 
 **Why:** Cellular networks (4G/LTE) often have an effective MTU below the default 1420, causing packet fragmentation or drops. iOS is strict about Path MTU Discovery and may fail to connect. 1280 is the minimum IPv6 MTU (RFC 8200), guaranteed to pass through any network. The speed impact is negligible.
 
-**For installations before v5.7.10:**
+**For installations before v5.7.11:**
 
 Add `MTU = 1280` to the `[Interface]` section of both server and client configs manually. Restart the service:
 
