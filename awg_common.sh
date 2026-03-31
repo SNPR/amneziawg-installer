@@ -823,7 +823,7 @@ regenerate_client() {
         client_privkey=$(cat "$KEYS_DIR/${name}.private")
     elif [[ -f "$AWG_DIR/${name}.conf" ]]; then
         # Пробуем извлечь из существующего конфига
-        client_privkey=$(grep -oP 'PrivateKey\s*=\s*\K\S+' "$AWG_DIR/${name}.conf")
+        client_privkey=$(sed -n 's/^PrivateKey[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
     fi
 
     if [[ -z "$client_privkey" ]]; then
@@ -836,7 +836,7 @@ regenerate_client() {
     client_ip=$(awk -v target="$name" '
     /^\[Peer\]/ { in_peer=1; found=0; next }
     in_peer && $0 == "#_Name = " target { found=1; next }
-    in_peer && found && /^AllowedIPs/ { gsub(/AllowedIPs\s*=\s*/, ""); gsub(/\/[0-9]+/, ""); print; exit }
+    in_peer && found && /^AllowedIPs/ { gsub(/AllowedIPs[ \t]*=[ \t]*/, ""); gsub(/\/[0-9]+/, ""); print; exit }
     /^\[/ && !/^\[Peer\]/ { in_peer=0; found=0 }
     ' "$SERVER_CONF_FILE")
 
@@ -862,8 +862,25 @@ regenerate_client() {
         return 1
     fi
 
+    # Сохраняем пользовательские настройки из текущего .conf (modify)
+    local current_dns="1.1.1.1" current_keepalive="33" current_allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
+    if [[ -f "$AWG_DIR/${name}.conf" ]]; then
+        local _v
+        _v=$(sed -n 's/^DNS[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        [[ -n "$_v" ]] && current_dns="$_v"
+        _v=$(sed -n 's/^PersistentKeepalive[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        [[ -n "$_v" ]] && current_keepalive="$_v"
+        _v=$(sed -n '/^\[Peer\]/,$ s/^AllowedIPs[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        [[ -n "$_v" ]] && current_allowed_ips="$_v"
+    fi
+
     # Перегенерация конфига
     render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" || return 1
+
+    # Восстанавливаем пользовательские настройки
+    sed -i "s/^DNS = .*/DNS = ${current_dns}/" "$AWG_DIR/${name}.conf"
+    sed -i "s/^PersistentKeepalive = .*/PersistentKeepalive = ${current_keepalive}/" "$AWG_DIR/${name}.conf"
+    sed -i "s|^AllowedIPs = .*|AllowedIPs = ${current_allowed_ips}|" "$AWG_DIR/${name}.conf"
 
     # QR-код
     generate_qr "$name"

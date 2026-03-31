@@ -270,7 +270,7 @@ check_port_availability() {
     local port=$1
     log "Проверка порта $port..."
     local proc
-    proc=$(ss -lunp | grep -P ":${port}\s")
+    proc=$(ss -lunp | grep ":${port} ")
     if [[ -n "$proc" ]]; then
         log_error "Порт ${port}/udp уже используется! Процесс: $proc"
         return 1
@@ -910,7 +910,7 @@ check_service_status() {
         port_check=${port_check:-0}
     fi
     if [[ "$port_check" -ne 0 ]]; then
-        if ! ss -lunp | grep -qP ":${port_check}\s"; then
+        if ! ss -lunp | grep -q ":${port_check} "; then
             log_error "Порт $port_check/udp не прослушивается!"
             ok=0
         fi

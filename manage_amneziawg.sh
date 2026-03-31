@@ -377,6 +377,7 @@ modify_client() {
     log_debug "sed: ${param} = ${value} в $cf"
 
     log "Параметр '$param' изменен."
+    rm -f "$bak"
 
     log "Перегенерация QR-кода и vpn:// URI..."
     generate_qr "$name" || log_warn "Не удалось обновить QR-код."
@@ -411,7 +412,7 @@ check_server() {
     if [[ "$port" -eq 0 ]]; then
         log_warn " - Не удалось определить порт."
     else
-        if ! ss -lunp | grep -qP ":${port}\s"; then
+        if ! ss -lunp | grep -q ":${port} "; then
             log_error " - Порт ${port}/udp НЕ прослушивается!"
             ok=0
         else
