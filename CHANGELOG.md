@@ -14,6 +14,14 @@
 
 ---
 
+## [5.7.12] — 2026-04-06
+
+### Исправлено
+
+- **Fail2Ban на Debian (Discussion #39):** На Debian 12/13 rsyslog не установлен — fail2ban падал без доступа к `/var/log/auth.log`. Добавлен `backend = systemd` и установка `python3-systemd` для Debian. Ubuntu продолжает использовать `backend = auto`.
+
+---
+
 ## [5.7.11] — 2026-03-31
 
 ### Исправлено
@@ -381,7 +389,8 @@
 - Диагностический отчет (`--diagnostic`).
 - Полная деинсталляция (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.11...HEAD
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.12...HEAD
+[5.7.12]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.11...v5.7.12
 [5.7.11]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.10...v5.7.11
 [5.7.10]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.9...v5.7.10
 [5.7.9]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.8...v5.7.9

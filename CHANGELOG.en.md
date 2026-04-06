@@ -14,6 +14,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [5.7.12] — 2026-04-06
+
+### Fixed
+
+- **Fail2Ban on Debian (Discussion #39):** On Debian 12/13 rsyslog is not installed — fail2ban crashed without `/var/log/auth.log`. Added `backend = systemd` and `python3-systemd` package for Debian. Ubuntu continues using `backend = auto`.
+
+---
+
 ## [5.7.11] — 2026-03-31
 
 ### Fixed
@@ -381,7 +389,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Diagnostic report (`--diagnostic`).
 - Full uninstall (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.11...HEAD
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.12...HEAD
+[5.7.12]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.11...v5.7.12
 [5.7.11]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.10...v5.7.11
 [5.7.10]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.9...v5.7.10
 [5.7.9]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.8...v5.7.9

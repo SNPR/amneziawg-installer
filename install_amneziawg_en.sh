@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.7.11
+# Version: 5.7.12
 # Date: 2026-03-31
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.7.11"
+SCRIPT_VERSION="5.7.12"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -861,16 +861,31 @@ setup_fail2ban() {
         log_warn "Fail2Ban not installed, skipping."
         return 1
     fi
+
+    # Debian: journald instead of rsyslog, needs python3-systemd
+    if [[ "${OS_ID:-}" == "debian" ]]; then
+        install_packages python3-systemd
+    fi
+
     mkdir -p /etc/fail2ban/jail.d 2>/dev/null
-    cat > /etc/fail2ban/jail.d/amneziawg.conf << 'EOF' || { log_warn "jail.d/amneziawg.conf write error"; return 1; }
+
+    # Backend: systemd for Debian (no rsyslog), auto for Ubuntu
+    local f2b_backend="auto"
+    if [[ "${OS_ID:-}" == "debian" ]]; then
+        f2b_backend="systemd"
+    fi
+
+    cat > /etc/fail2ban/jail.d/amneziawg.conf << JAILEOF || { log_warn "jail.d/amneziawg.conf write error"; return 1; }
 # AmneziaWG — SSH protection (managed by amneziawg-installer)
 [sshd]
 enabled = true
+backend = ${f2b_backend}
 maxretry = 5
 findtime = 10m
 bantime  = 1h
 banaction = ufw
-EOF
+JAILEOF
+
     if systemctl restart fail2ban; then
         log "Fail2Ban configured and restarted."
     else
