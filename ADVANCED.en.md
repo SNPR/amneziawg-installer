@@ -504,7 +504,14 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 
 <details>
   <summary><strong>Q: Can I change AWG 2.0 parameters after installation?</strong></summary>
-  <b>A:</b> Not recommended. Parameters must be identical on the server and all clients. If necessary: 1) Stop the service. 2) Change parameters in <code>awgsetup_cfg.init</code> and <code>awg0.conf</code>. 3) Regenerate all client configs (<code>manage regen</code>). 4) Start the service. 5) Distribute new configs to clients.
+  <b>A:</b> Yes. This is useful if your ISP started fingerprinting your server by static obfuscation parameters (e.g. Russian DPI blocked specific H1-H4 ranges). Workflow as of v5.7.13:
+  <ol>
+    <li>Edit parameters (Jc, S1-S4, H1-H4, I1) in the <code>[Interface]</code> section of <code>/etc/amnezia/amneziawg/awg0.conf</code>.</li>
+    <li>Restart the service: <code>sudo systemctl restart awg-quick@awg0</code>.</li>
+    <li>Regenerate every client config: <code>sudo bash /root/awg/manage_amneziawg.sh regen &lt;name&gt;</code>. As of v5.7.13, <code>regen</code> reads live values directly from <code>awg0.conf</code> (the source of truth) instead of the cached <code>awgsetup_cfg.init</code>.</li>
+    <li>Distribute the new <code>.conf</code> / QR codes / vpn:// URIs to clients.</li>
+  </ol>
+  <b>Important:</b> server and client parameters must match — otherwise the handshake fails. The easiest way to get a fresh set of randomized non-overlapping H1-H4 ranges is to reinstall the server (<code>--uninstall</code> followed by a fresh install) — every install generates a unique set.
 </details>
 
 <details>
