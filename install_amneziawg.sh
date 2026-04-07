@@ -8,15 +8,15 @@ fi
 # ==============================================================================
 # Скрипт для установки и настройки AmneziaWG 2.0 на Ubuntu/Debian серверах
 # Автор: @bivlked
-# Версия: 5.7.12
-# Дата: 2026-04-06
+# Версия: 5.7.13
+# Дата: 2026-04-07
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Безопасный режим и Константы ---
 set -o pipefail
 
-SCRIPT_VERSION="5.7.12"
+SCRIPT_VERSION="5.7.13"
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
 STATE_FILE="$AWG_DIR/setup_state"
@@ -480,6 +480,39 @@ rand_range() {
     echo $(( (random_val % range) + min ))
 }
 
+# Генерация 4 непересекающихся uint32 диапазонов для AWG H1-H4.
+# Алгоритм: 8 случайных uint32 значений → sort → 4 пары (low, high).
+# Сортировка гарантирует low ≤ high и непересечение между парами.
+# Минимальная ширина каждого диапазона = 1000 (для нормальной обфускации).
+# Печатает 4 строки формата "low-high" в stdout.
+# Возвращает 1 если за 20 попыток не удалось получить корректные диапазоны
+# (вероятность близка к нулю при равномерном uint32 распределении).
+generate_awg_h_ranges() {
+    local attempt=0 max_attempts=20
+    while (( attempt < max_attempts )); do
+        local p1 p2 p3 p4 p5 p6 p7 p8 sorted
+        p1=$(rand_range 0 4294967295); p2=$(rand_range 0 4294967295)
+        p3=$(rand_range 0 4294967295); p4=$(rand_range 0 4294967295)
+        p5=$(rand_range 0 4294967295); p6=$(rand_range 0 4294967295)
+        p7=$(rand_range 0 4294967295); p8=$(rand_range 0 4294967295)
+        sorted=$(printf '%s\n' "$p1" "$p2" "$p3" "$p4" "$p5" "$p6" "$p7" "$p8" | sort -n)
+        local arr=()
+        while IFS= read -r _line; do arr+=("$_line"); done <<< "$sorted"
+        if (( ${arr[1]} - ${arr[0]} >= 1000 )) && \
+           (( ${arr[3]} - ${arr[2]} >= 1000 )) && \
+           (( ${arr[5]} - ${arr[4]} >= 1000 )) && \
+           (( ${arr[7]} - ${arr[6]} >= 1000 )); then
+            printf '%s-%s\n' "${arr[0]}" "${arr[1]}"
+            printf '%s-%s\n' "${arr[2]}" "${arr[3]}"
+            printf '%s-%s\n' "${arr[4]}" "${arr[5]}"
+            printf '%s-%s\n' "${arr[6]}" "${arr[7]}"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 # Генерация CPS строки для I1
 # Формат: "<r N>" где N — количество случайных байт (32-256)
 generate_cps_i1() {
@@ -507,12 +540,16 @@ generate_awg_params() {
     AWG_S3=$(rand_range 8 55)
     AWG_S4=$(rand_range 4 27)
 
-    # H1-H4: непересекающиеся диапазоны (4 сектора в uint32)
-    # AWG сам выбирает случайное значение из range при каждом handshake
-    AWG_H1="100000-800000"
-    AWG_H2="1000000-8000000"
-    AWG_H3="10000000-80000000"
-    AWG_H4="100000000-800000000"
+    # H1-H4: 4 случайных непересекающихся uint32 диапазона.
+    # Рандомизация на каждую установку защищает от ТСПУ-фингерпринта
+    # по статическим H-значениям (Discussion #38, elvaleto/Klavishnik).
+    # Алгоритм: 8 случайных uint32 → sort → 4 непересекающиеся пары.
+    local _h_ranges
+    _h_ranges=$(generate_awg_h_ranges) || die "Не удалось сгенерировать H1-H4 диапазоны."
+    AWG_H1=$(echo "$_h_ranges" | sed -n '1p')
+    AWG_H2=$(echo "$_h_ranges" | sed -n '2p')
+    AWG_H3=$(echo "$_h_ranges" | sed -n '3p')
+    AWG_H4=$(echo "$_h_ranges" | sed -n '4p')
 
     # I1: CPS concealment
     AWG_I1=$(generate_cps_i1)

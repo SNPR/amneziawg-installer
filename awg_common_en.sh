@@ -3,8 +3,8 @@
 # ==============================================================================
 # Shared function library for AmneziaWG 2.0
 # Author: @bivlked
-# Version: 5.7.12
-# Date: 2026-04-06
+# Version: 5.7.13
+# Date: 2026-04-07
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 #
@@ -19,7 +19,7 @@ CONFIG_FILE="${CONFIG_FILE:-$AWG_DIR/awgsetup_cfg.init}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
 KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # shellcheck disable=SC2034
-AWG_COMMON_VERSION="5.7.12"
+AWG_COMMON_VERSION="5.7.13"
 
 # --- Auto-cleanup of temporary files ---
 # NOTE: trap is NOT set here to avoid overwriting the caller's trap handler.
@@ -79,6 +79,55 @@ get_server_public_ip() {
 }
 
 # ==============================================================================
+# AWG 2.0 parameter generation (used in tests + manage)
+# ==============================================================================
+
+# Random number [min, max] via /dev/urandom (uint32 support).
+# Mirrors install_amneziawg_en.sh:rand_range — needed here for tests and regen.
+rand_range() {
+    local min=$1 max=$2
+    local range=$((max - min + 1))
+    local random_val
+    random_val=$(od -An -tu4 -N4 /dev/urandom 2>/dev/null | tr -d ' ')
+    if [[ -z "$random_val" || ! "$random_val" =~ ^[0-9]+$ ]]; then
+        random_val=$(( (RANDOM << 15) | RANDOM ))
+    fi
+    echo $(( (random_val % range) + min ))
+}
+
+# Generate 4 non-overlapping uint32 ranges for AWG H1-H4.
+# Algorithm: 8 random uint32 → sort → 4 (low, high) pairs.
+# Sorting guarantees low ≤ high and non-overlap between pairs.
+# Minimum width per range = 1000.
+# Prints 4 "low-high" lines to stdout. Returns 1 on failure.
+# Mitigates Russian DPI fingerprinting of static H values (#38).
+generate_awg_h_ranges() {
+    local attempt=0 max_attempts=20
+    while (( attempt < max_attempts )); do
+        local p1 p2 p3 p4 p5 p6 p7 p8 sorted
+        p1=$(rand_range 0 4294967295); p2=$(rand_range 0 4294967295)
+        p3=$(rand_range 0 4294967295); p4=$(rand_range 0 4294967295)
+        p5=$(rand_range 0 4294967295); p6=$(rand_range 0 4294967295)
+        p7=$(rand_range 0 4294967295); p8=$(rand_range 0 4294967295)
+        sorted=$(printf '%s\n' "$p1" "$p2" "$p3" "$p4" "$p5" "$p6" "$p7" "$p8" | sort -n)
+        local arr=()
+        while IFS= read -r _line; do arr+=("$_line"); done <<< "$sorted"
+        if (( ${arr[1]} - ${arr[0]} >= 1000 )) && \
+           (( ${arr[3]} - ${arr[2]} >= 1000 )) && \
+           (( ${arr[5]} - ${arr[4]} >= 1000 )) && \
+           (( ${arr[7]} - ${arr[6]} >= 1000 )); then
+            printf '%s-%s\n' "${arr[0]}" "${arr[1]}"
+            printf '%s-%s\n' "${arr[2]}" "${arr[3]}"
+            printf '%s-%s\n' "${arr[4]}" "${arr[5]}"
+            printf '%s-%s\n' "${arr[6]}" "${arr[7]}"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+# ==============================================================================
 # Loading / saving parameters
 # ==============================================================================
 
@@ -115,22 +164,68 @@ safe_load_config() {
     done < "$config_file"
 }
 
-# Load AWG parameters from configuration file
+# Parser for the live AmneziaWG server config (source of truth for AWG_*).
+# Reads the [Interface] section of awg0.conf and exports AWG_* variables.
+# Returns 0 if at least Jc and H4 were found, otherwise 1.
+# Fixes #38: regen used stale values from the init file instead of the
+# actual awg0.conf after manual edits.
+# shellcheck disable=SC2120  # Optional argument is only used in tests
+load_awg_params_from_server_conf() {
+    local conf="${1:-$SERVER_CONF_FILE}"
+    [[ -f "$conf" ]] || return 1
+
+    local in_iface=0 line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^\[Interface\] ]]; then in_iface=1; continue; fi
+        if [[ "$line" =~ ^\[ ]]; then in_iface=0; continue; fi
+        (( in_iface )) || continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9]+)[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            value="${value%"${value##*[![:space:]]}"}"
+            case "$key" in
+                Jc)         export AWG_Jc="$value" ;;
+                Jmin)       export AWG_Jmin="$value" ;;
+                Jmax)       export AWG_Jmax="$value" ;;
+                S1)         export AWG_S1="$value" ;;
+                S2)         export AWG_S2="$value" ;;
+                S3)         export AWG_S3="$value" ;;
+                S4)         export AWG_S4="$value" ;;
+                H1)         export AWG_H1="$value" ;;
+                H2)         export AWG_H2="$value" ;;
+                H3)         export AWG_H3="$value" ;;
+                H4)         export AWG_H4="$value" ;;
+                I1)         export AWG_I1="$value" ;;
+                ListenPort) export AWG_PORT="$value" ;;
+            esac
+        fi
+    done < "$conf"
+    [[ -n "${AWG_Jc:-}" && -n "${AWG_H4:-}" ]]
+}
+
+# Load AWG parameters.
+# Priority: live server config (awg0.conf) > init file (awgsetup_cfg.init).
+# This ensures regen after manual awg0.conf edits works correctly (#38).
 load_awg_params() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        log_error "Configuration file $CONFIG_FILE not found."
-        return 1
+    # 1. Base parameters from init file (OS_ID, ALLOWED_IPS, AWG_PORT, AWG_ENDPOINT etc.)
+    if [[ -f "$CONFIG_FILE" ]]; then
+        safe_load_config "$CONFIG_FILE" || log_warn "Failed to load $CONFIG_FILE"
     fi
-    safe_load_config "$CONFIG_FILE" || {
-        log_error "Failed to load $CONFIG_FILE"
-        return 1
-    }
+    # 2. AWG protocol parameters — live awg0.conf takes priority (source of truth)
+    if load_awg_params_from_server_conf; then
+        log_debug "AWG parameters loaded from $SERVER_CONF_FILE (live config)"
+    else
+        log_debug "AWG parameters loaded from $CONFIG_FILE (init fallback)"
+    fi
     # Check required AWG 2.0 parameters
     local missing=0
     local param
     for param in AWG_Jc AWG_Jmin AWG_Jmax AWG_S1 AWG_S2 AWG_S3 AWG_S4 AWG_H1 AWG_H2 AWG_H3 AWG_H4; do
-        if [[ -z "${!param}" ]]; then
-            log_error "Parameter $param not found in $CONFIG_FILE"
+        if [[ -z "${!param:-}" ]]; then
+            log_error "Parameter $param not found in $SERVER_CONF_FILE or $CONFIG_FILE"
             missing=1
         fi
     done

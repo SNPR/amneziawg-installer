@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.7.12
-# Date: 2026-04-06
+# Version: 5.7.13
+# Date: 2026-04-07
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.7.12"
+SCRIPT_VERSION="5.7.13"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -480,6 +480,39 @@ rand_range() {
     echo $(( (random_val % range) + min ))
 }
 
+# Generate 4 non-overlapping uint32 ranges for AWG H1-H4.
+# Algorithm: 8 random uint32 → sort → 4 (low, high) pairs.
+# Sorting guarantees low ≤ high and non-overlap between pairs.
+# Minimum width per range = 1000 (for proper obfuscation).
+# Prints 4 "low-high" lines to stdout. Returns 1 on failure
+# (probability is essentially zero with uniform uint32 distribution).
+# Mitigates Russian DPI fingerprinting of static H values (#38).
+generate_awg_h_ranges() {
+    local attempt=0 max_attempts=20
+    while (( attempt < max_attempts )); do
+        local p1 p2 p3 p4 p5 p6 p7 p8 sorted
+        p1=$(rand_range 0 4294967295); p2=$(rand_range 0 4294967295)
+        p3=$(rand_range 0 4294967295); p4=$(rand_range 0 4294967295)
+        p5=$(rand_range 0 4294967295); p6=$(rand_range 0 4294967295)
+        p7=$(rand_range 0 4294967295); p8=$(rand_range 0 4294967295)
+        sorted=$(printf '%s\n' "$p1" "$p2" "$p3" "$p4" "$p5" "$p6" "$p7" "$p8" | sort -n)
+        local arr=()
+        while IFS= read -r _line; do arr+=("$_line"); done <<< "$sorted"
+        if (( ${arr[1]} - ${arr[0]} >= 1000 )) && \
+           (( ${arr[3]} - ${arr[2]} >= 1000 )) && \
+           (( ${arr[5]} - ${arr[4]} >= 1000 )) && \
+           (( ${arr[7]} - ${arr[6]} >= 1000 )); then
+            printf '%s-%s\n' "${arr[0]}" "${arr[1]}"
+            printf '%s-%s\n' "${arr[2]}" "${arr[3]}"
+            printf '%s-%s\n' "${arr[4]}" "${arr[5]}"
+            printf '%s-%s\n' "${arr[6]}" "${arr[7]}"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 # Generate CPS string for I1
 # Format: "<r N>" where N is the number of random bytes (32-256)
 generate_cps_i1() {
@@ -507,12 +540,16 @@ generate_awg_params() {
     AWG_S3=$(rand_range 8 55)
     AWG_S4=$(rand_range 4 27)
 
-    # H1-H4: non-overlapping ranges (4 sectors in uint32 space)
-    # AWG itself picks a random value from the range on each handshake
-    AWG_H1="100000-800000"
-    AWG_H2="1000000-8000000"
-    AWG_H3="10000000-80000000"
-    AWG_H4="100000000-800000000"
+    # H1-H4: 4 random non-overlapping uint32 ranges.
+    # Per-install randomization protects against Russian DPI fingerprinting
+    # of static H values (Discussion #38, elvaleto/Klavishnik).
+    # Algorithm: 8 random uint32 → sort → 4 non-overlapping pairs.
+    local _h_ranges
+    _h_ranges=$(generate_awg_h_ranges) || die "Failed to generate H1-H4 ranges."
+    AWG_H1=$(echo "$_h_ranges" | sed -n '1p')
+    AWG_H2=$(echo "$_h_ranges" | sed -n '2p')
+    AWG_H3=$(echo "$_h_ranges" | sed -n '3p')
+    AWG_H4=$(echo "$_h_ranges" | sed -n '4p')
 
     # I1: CPS concealment
     AWG_I1=$(generate_cps_i1)
