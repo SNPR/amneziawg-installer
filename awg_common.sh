@@ -3,7 +3,7 @@
 # ==============================================================================
 # Общая библиотека функций для AmneziaWG 2.0
 # Автор: @bivlked
-# Версия: 5.7.13
+# Версия: 5.8.0
 # Дата: 2026-04-07
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
@@ -19,7 +19,7 @@ CONFIG_FILE="${CONFIG_FILE:-$AWG_DIR/awgsetup_cfg.init}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
 KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # shellcheck disable=SC2034
-AWG_COMMON_VERSION="5.7.13"
+AWG_COMMON_VERSION="5.8.0"
 
 # --- Автоочистка временных файлов ---
 # ВАЖНО: trap НЕ устанавливается здесь, чтобы не перезаписать trap вызывающего скрипта.
@@ -611,7 +611,12 @@ get_next_client_ip() {
 }
 
 # Добавление [Peer] в серверный конфиг (атомарно через tmpfile + mv)
-# ВАЖНО: вызывающий код должен держать flock на ${AWG_DIR}/.awg_config.lock
+# ВАЖНО: функция берёт собственный inner flock на ${AWG_DIR}/.awg_config.lock
+# с коротким таймаутом 5s. Если caller (например generate_client) уже держит
+# тот же lock — bash fd inheritance делает повторный flock no-op (re-entrant).
+# Если caller не держит lock (прямой вызов) — функция всё равно защищена.
+# До v5.8.0 контракт "caller должен держать lock" был fragile, добавлен
+# inner flock как defense-in-depth (self-audit).
 # add_peer_to_server <name> <pubkey> <client_ip>
 add_peer_to_server() {
     local name="$1"
@@ -623,18 +628,30 @@ add_peer_to_server() {
         return 1
     fi
 
+    # Inner flock (defense-in-depth)
+    local _add_lockfile="${AWG_DIR}/.awg_config.lock"
+    local _add_fd
+    exec {_add_fd}>"$_add_lockfile" || { log_error "add_peer: cannot open lock"; return 1; }
+    if ! flock -x -w 5 "$_add_fd"; then
+        log_error "add_peer: не удалось получить блокировку конфига за 5s"
+        exec {_add_fd}>&-
+        return 1
+    fi
+
     if grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Пир '$name' уже существует в конфиге"
+        exec {_add_fd}>&-
         return 1
     fi
 
     # Добавляем пир через временный файл (атомарно)
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; return 1; }
+    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; exec {_add_fd}>&-; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
         log_error "Ошибка копирования серверного конфига"
+        exec {_add_fd}>&-
         return 1
     }
 
@@ -649,10 +666,12 @@ EOF
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Ошибка обновления серверного конфига"
+        exec {_add_fd}>&-
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
     log "Пир '$name' добавлен в серверный конфиг."
+    exec {_add_fd}>&-
     return 0
 }
 
@@ -1209,6 +1228,15 @@ check_expired_clients() {
         [[ -f "$efile" ]] || continue
         local name
         name=$(basename "$efile")
+        # Валидация имени: тот же regex что validate_client_name в manage_amneziawg.sh.
+        # Defense-in-depth — EXPIRY_DIR доступен только root, но защита от
+        # случайно попавшего невалидного файла (или symlink attack если expiry_dir
+        # когда-то станет shared) нужна перед использованием $name в путях
+        # и передачей в remove_peer_from_server (self-audit).
+        if ! [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            log_warn "Пропуск невалидного expiry файла: '$name'"
+            continue
+        fi
         local expires_at
         expires_at=$(cat "$efile" 2>/dev/null)
         if [[ -z "$expires_at" || ! "$expires_at" =~ ^[0-9]+$ ]]; then

@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 peer management script
 # Author: @bivlked
-# Version: 5.7.13
+# Version: 5.8.0
 # Date: 2026-04-07
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="5.7.13"
+SCRIPT_VERSION="5.8.0"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
@@ -28,8 +28,26 @@ VERBOSE_LIST=0
 JSON_OUTPUT=0
 EXPIRES_DURATION=""
 
-# --- Auto-cleanup of temporary files ---
+# --- Auto-cleanup of temporary files and directories ---
+# _manage_temp_dirs holds mktemp -d paths for backup/restore.
+# _awg_cleanup from awg_common.sh removes files (awg_mktemp), but not
+# directories — so this is chained cleanup: first our directories, then
+# the library one. Ensures that SIGINT during backup_configs/restore_backup
+# does not leave orphan /tmp/tmp.XXXX (audit).
+_manage_temp_dirs=()
+
+manage_mktempdir() {
+    local d
+    d=$(mktemp -d) || return 1
+    _manage_temp_dirs+=("$d")
+    echo "$d"
+}
+
 _manage_cleanup() {
+    local d
+    for d in "${_manage_temp_dirs[@]}"; do
+        [[ -d "$d" ]] && rm -rf "$d"
+    done
     type _awg_cleanup &>/dev/null && _awg_cleanup
 }
 trap _manage_cleanup EXIT INT TERM
@@ -188,9 +206,9 @@ backup_configs() {
     mkdir -p "$bd" || die "mkdir error $bd"
     chmod 700 "$bd" 2>/dev/null
     local ts bf td
-    ts=$(date +%F_%T)
+    ts=$(date +%F_%H-%M-%S)
     bf="$bd/awg_backup_${ts}.tar.gz"
-    td=$(mktemp -d)
+    td=$(manage_mktempdir) || die "Failed to create temp directory"
 
     mkdir -p "$td/server" "$td/clients" "$td/keys"
     cp -a "$SERVER_CONF_FILE"* "$td/server/" 2>/dev/null
@@ -255,7 +273,7 @@ restore_backup() {
     backup_configs
 
     local td restore_errors=0
-    td=$(mktemp -d)
+    td=$(manage_mktempdir) || { log_error "Failed to create temp directory"; return 1; }
     if ! tar -xzf "$bf" -C "$td"; then
         log_error "tar error $bf"
         rm -rf "$td"
@@ -294,7 +312,7 @@ restore_backup() {
 
     # Server keys
     # Server keys: cp -a preserves the mode from the archive, so we force 600
-    # regardless of the mode they had inside the backup (Codex audit fix).
+    # regardless of the mode they had inside the backup (audit fix).
     if [[ -f "$td/server_private.key" ]]; then
         cp -a "$td/server_private.key" "$AWG_DIR/"
         chmod 600 "$AWG_DIR/server_private.key" 2>/dev/null || true
@@ -366,7 +384,7 @@ modify_client() {
 
     log "Changing '$param' to '$value' for '$name'..."
     local bak
-    bak="${cf}.bak-$(date +%F_%T)"
+    bak="${cf}.bak-$(date +%F_%H-%M-%S)"
     cp "$cf" "$bak" || log_warn "Backup error $bak"
     log "Backup: $bak"
 
@@ -450,13 +468,21 @@ check_server() {
     fi
 
     log "AmneziaWG 2.0 status:"
-    while IFS= read -r line; do log "  $line"; done < <(awg show)
-
-    # AWG 2.0 diagnostics
-    if awg show awg0 2>/dev/null | grep -q "jc:"; then
-        log " - AWG 2.0 obfuscation parameters: active"
+    # Previously awg show was called via process substitution without an exit
+    # code check, so check could report "Status OK" even when awg crashed.
+    # Now we capture the output and check the exit code (audit).
+    local _awg_out
+    if ! _awg_out=$(awg show awg0 2>&1); then
+        log_error " - awg show awg0 failed:"
+        while IFS= read -r _l; do log_error "  $_l"; done <<< "$_awg_out"
+        ok=0
     else
-        log_warn " - AWG 2.0 obfuscation parameters not detected"
+        while IFS= read -r _l; do log "  $_l"; done <<< "$_awg_out"
+        if grep -q "jc:" <<< "$_awg_out"; then
+            log " - AWG 2.0 obfuscation parameters: active"
+        else
+            log_warn " - AWG 2.0 obfuscation parameters not detected"
+        fi
     fi
 
     if [[ "$ok" -eq 1 ]]; then

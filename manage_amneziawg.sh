@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # Скрипт для управления пользователями (пирами) AmneziaWG 2.0
 # Автор: @bivlked
-# Версия: 5.7.13
+# Версия: 5.8.0
 # Дата: 2026-04-07
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Безопасный режим и Константы ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="5.7.13"
+SCRIPT_VERSION="5.8.0"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
@@ -28,8 +28,26 @@ VERBOSE_LIST=0
 JSON_OUTPUT=0
 EXPIRES_DURATION=""
 
-# --- Автоочистка временных файлов ---
+# --- Автоочистка временных файлов и директорий ---
+# _manage_temp_dirs хранит mktemp -d пути для backup/restore.
+# _awg_cleanup из awg_common.sh удаляет файлы (awg_mktemp), но не директории —
+# поэтому здесь chained cleanup: сначала наши директории, потом библиотечный.
+# Гарантирует что SIGINT во время backup_configs/restore_backup не оставит
+# orphan /tmp/tmp.XXXX (audit).
+_manage_temp_dirs=()
+
+manage_mktempdir() {
+    local d
+    d=$(mktemp -d) || return 1
+    _manage_temp_dirs+=("$d")
+    echo "$d"
+}
+
 _manage_cleanup() {
+    local d
+    for d in "${_manage_temp_dirs[@]}"; do
+        [[ -d "$d" ]] && rm -rf "$d"
+    done
     type _awg_cleanup &>/dev/null && _awg_cleanup
 }
 trap _manage_cleanup EXIT INT TERM
@@ -188,9 +206,9 @@ backup_configs() {
     mkdir -p "$bd" || die "Ошибка mkdir $bd"
     chmod 700 "$bd" 2>/dev/null
     local ts bf td
-    ts=$(date +%F_%T)
+    ts=$(date +%F_%H-%M-%S)
     bf="$bd/awg_backup_${ts}.tar.gz"
-    td=$(mktemp -d)
+    td=$(manage_mktempdir) || die "Ошибка создания временной директории"
 
     mkdir -p "$td/server" "$td/clients" "$td/keys"
     cp -a "$SERVER_CONF_FILE"* "$td/server/" 2>/dev/null
@@ -255,7 +273,7 @@ restore_backup() {
     backup_configs
 
     local td restore_errors=0
-    td=$(mktemp -d)
+    td=$(manage_mktempdir) || { log_error "Ошибка создания временной директории"; return 1; }
     if ! tar -xzf "$bf" -C "$td"; then
         log_error "Ошибка tar $bf"
         rm -rf "$td"
@@ -293,7 +311,7 @@ restore_backup() {
     fi
 
     # Серверные ключи: cp -a сохраняет mode из архива, поэтому форсируем 600
-    # независимо от того с какими правами они лежали в backup-е (Codex audit fix).
+    # независимо от того с какими правами они лежали в backup-е (audit fix).
     if [[ -f "$td/server_private.key" ]]; then
         cp -a "$td/server_private.key" "$AWG_DIR/"
         chmod 600 "$AWG_DIR/server_private.key" 2>/dev/null || true
@@ -365,7 +383,7 @@ modify_client() {
 
     log "Изменение '$param' на '$value' для '$name'..."
     local bak
-    bak="${cf}.bak-$(date +%F_%T)"
+    bak="${cf}.bak-$(date +%F_%H-%M-%S)"
     cp "$cf" "$bak" || log_warn "Ошибка бэкапа $bak"
     log "Бэкап: $bak"
 
@@ -449,13 +467,21 @@ check_server() {
     fi
 
     log "Статус AmneziaWG 2.0:"
-    while IFS= read -r line; do log "  $line"; done < <(awg show)
-
-    # AWG 2.0 диагностика
-    if awg show awg0 2>/dev/null | grep -q "jc:"; then
-        log " - AWG 2.0 параметры обфускации: активны"
+    # Раньше awg show вызывался через process substitution без проверки exit code,
+    # из-за чего check мог отрапортовать "Состояние OK" даже когда awg упал.
+    # Теперь захватываем вывод и проверяем exit code (audit).
+    local _awg_out
+    if ! _awg_out=$(awg show awg0 2>&1); then
+        log_error " - awg show awg0 завершился с ошибкой:"
+        while IFS= read -r _l; do log_error "  $_l"; done <<< "$_awg_out"
+        ok=0
     else
-        log_warn " - AWG 2.0 параметры обфускации не обнаружены"
+        while IFS= read -r _l; do log "  $_l"; done <<< "$_awg_out"
+        if grep -q "jc:" <<< "$_awg_out"; then
+            log " - AWG 2.0 параметры обфускации: активны"
+        else
+            log_warn " - AWG 2.0 параметры обфускации не обнаружены"
+        fi
     fi
 
     if [[ "$ok" -eq 1 ]]; then

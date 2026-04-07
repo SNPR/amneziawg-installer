@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.7.13
+# Version: 5.8.0
 # Date: 2026-04-07
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.7.13"
+SCRIPT_VERSION="5.8.0"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -403,6 +403,23 @@ validate_subnet() {
     if [[ "${BASH_REMATCH[4]}" -ne 1 ]]; then
         die "Invalid subnet: '$subnet'. Last octet must be 1 (server address in subnet)."
     fi
+}
+
+# Endpoint validation (FQDN / IPv4 / [IPv6]).
+# Returns 0 if the endpoint is safe and matches one of the formats,
+# otherwise 1 (the caller decides between die or log_warn + unset).
+# Forbids newline/CR/quotes/backslash to prevent injection into
+# awgsetup_cfg.init and client.conf via the --endpoint flag (audit).
+validate_endpoint() {
+    local ep="$1"
+    [[ -n "$ep" ]] || return 1
+    # Forbid characters that could break the config or inject content
+    [[ "$ep" != *$'\n'* && "$ep" != *$'\r'* && \
+       "$ep" != *"'"* && "$ep" != *'"'* && "$ep" != *'\\'* && \
+       "$ep" != *' '* && "$ep" != *$'\t'* ]] || return 1
+    # One of three formats: FQDN, IPv4, [IPv6]
+    [[ "$ep" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*|[0-9]{1,3}(\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:]+\])$ ]] || return 1
+    return 0
 }
 
 validate_cidr_list() {
@@ -872,6 +889,12 @@ setup_improved_firewall() {
         fi
         if ! ufw enable <<< "y"; then die "UFW enable error."; fi
         log "UFW enabled."
+        # Marker: UFW was enabled by our installer (not by the user beforehand).
+        # Used in step_uninstall to decide whether disabling UFW is safe.
+        # Protects against destructive uninstall on a VPS where UFW was used
+        # for SSH/web hardening BEFORE our script was installed (audit).
+        touch "$AWG_DIR/.ufw_enabled_by_installer" 2>/dev/null || \
+            log_warn "Failed to create UFW marker — uninstall will not disable UFW automatically."
     else
         log "UFW is active. Updating rules..."
         ufw limit 22/tcp comment "SSH Rate Limit"
@@ -1095,7 +1118,7 @@ step_uninstall() {
     fi
     if [[ -z "$backup" || "$backup" =~ ^[Yy]$ ]]; then
         local bf
-        bf="$HOME/awg_uninstall_backup_$(date +%F_%T).tar.gz"
+        bf="$HOME/awg_uninstall_backup_$(date +%F_%H-%M-%S).tar.gz"
         log "Creating backup: $bf"
         tar -czf "$bf" -C / etc/amnezia "$AWG_DIR" --ignore-failed-read 2>/dev/null || log_warn "Backup creation error $bf"
         chmod 600 "$bf" || log_warn "Backup chmod error"
@@ -1113,17 +1136,29 @@ step_uninstall() {
     systemctl disable awg-quick@awg0 2>/dev/null
     modprobe -r amneziawg 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
-        log "Disabling UFW (priority — preserve SSH access)..."
+        log "Cleaning up AmneziaWG UFW rules..."
         if command -v ufw &>/dev/null; then
-            ufw --force disable 2>/dev/null
             local port_to_del
             if [[ -f "$CONFIG_FILE" ]]; then
                 # shellcheck source=/dev/null
                 port_to_del=$(safe_read_config_key "AWG_PORT" "$CONFIG_FILE")
             fi
             port_to_del=${port_to_del:-39743}
+            # Removing our rules is ALWAYS performed (idempotent)
             ufw delete allow "${port_to_del}/udp" 2>/dev/null
             ufw route delete allow in on awg0 2>/dev/null
+
+            # ufw disable runs ONLY if UFW was enabled by our installer.
+            # Protects against destructive uninstall on a VPS where UFW was used
+            # for SSH/web hardening BEFORE our script was installed (audit).
+            # Backwards compat: older installs without the marker keep UFW active.
+            if [[ -f "$AWG_DIR/.ufw_enabled_by_installer" ]]; then
+                log "Disabling UFW (was enabled by our installer)..."
+                ufw --force disable 2>/dev/null
+                rm -f "$AWG_DIR/.ufw_enabled_by_installer"
+            else
+                log "Leaving UFW active (was active before installation, or older installer version)."
+            fi
         fi
         log "Removing Fail2Ban bans..."
         if command -v fail2ban-client &>/dev/null; then
@@ -1152,12 +1187,13 @@ step_uninstall() {
         /etc/sysctl.d/99-amneziawg-forwarding.conf \
         /etc/logrotate.d/amneziawg* || log_warn "File removal error."
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
-        # Remove only our fail2ban artifacts
+        # Remove only our own jail file.
+        # Previously there was a heuristic "if jail.local contains banaction = ufw,
+        # remove the whole file" — too broad a filter, could wipe an unrelated
+        # jail.local with custom jails. Heuristic removed (audit).
+        # If a user still has a jail.local from very old installer versions,
+        # leave it for them to deal with.
         rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
-        # Backward compatibility: remove jail.local if created by our installer
-        if [[ -f /etc/fail2ban/jail.local ]] && grep -q "banaction = ufw" /etc/fail2ban/jail.local 2>/dev/null; then
-            rm -f /etc/fail2ban/jail.local
-        fi
     fi
     log "Removing DKMS..."
     rm -rf /var/lib/dkms/amneziawg* || log_warn "DKMS removal error."
@@ -1183,6 +1219,20 @@ step_uninstall() {
 initialize_setup() {
     mkdir -p "$AWG_DIR" || die "Error creating $AWG_DIR"
     chown root:root "$AWG_DIR"
+
+    # Process-wide lock: prevents two install_amneziawg.sh instances from
+    # running concurrently. Without it two parallel runs could read the
+    # same setup_state, race each other on apt-get/dkms/ufw and corrupt
+    # package state (audit).
+    # FD 9 is fixed and does not conflict with update_state (uses 200).
+    # The lock is held open for the whole process lifetime — released
+    # automatically on exit.
+    INSTALL_LOCK_FILE="$AWG_DIR/.install.lock"
+    exec 9>"$INSTALL_LOCK_FILE" || die "Cannot open $INSTALL_LOCK_FILE"
+    if ! flock -n 9; then
+        die "Another install_amneziawg.sh instance is already running. Wait for it to finish, or if the process is hung, remove $INSTALL_LOCK_FILE and try again."
+    fi
+
     touch "$LOG_FILE" || die "Failed to create log file $LOG_FILE"
     chmod 640 "$LOG_FILE"
     log "--- STARTING AmneziaWG 2.0 INSTALLATION (v${SCRIPT_VERSION}) ---"
@@ -1232,12 +1282,24 @@ initialize_setup() {
         ALLOWED_IPS_MODE=$CLI_ROUTING_MODE
         if [[ "$CLI_ROUTING_MODE" -eq 3 ]]; then ALLOWED_IPS=$CLI_CUSTOM_ROUTES; fi
     fi
-    if [[ -n "$CLI_ENDPOINT" ]]; then AWG_ENDPOINT=$CLI_ENDPOINT; fi
+    if [[ -n "$CLI_ENDPOINT" ]]; then
+        if ! validate_endpoint "$CLI_ENDPOINT"; then
+            die "Invalid --endpoint: '$CLI_ENDPOINT'. Allowed formats: FQDN (vpn.example.com), IPv4 (1.2.3.4), [IPv6] ([2001:db8::1]). Spaces, tabs, quotes, backslashes and newlines are forbidden."
+        fi
+        AWG_ENDPOINT=$CLI_ENDPOINT
+    fi
     if [[ "$CLI_NO_TWEAKS" -eq 1 ]]; then NO_TWEAKS=1; fi
 
     # Validate after CLI override
     validate_port "$AWG_PORT"
     validate_subnet "$AWG_TUNNEL_SUBNET"
+    # AWG_ENDPOINT may have come from CONFIG_FILE via safe_load_config (no CLI override).
+    # If the value is present and invalid — log_warn + reset to "" so the installer
+    # falls back to auto-detect via get_server_public_ip (audit).
+    if [[ -n "$AWG_ENDPOINT" ]] && ! validate_endpoint "$AWG_ENDPOINT"; then
+        log_warn "AWG_ENDPOINT='$AWG_ENDPOINT' from $CONFIG_FILE is invalid, falling back to auto-detect."
+        AWG_ENDPOINT=""
+    fi
 
     # Request settings from user only on first run
     if [[ "$config_exists" -eq 0 ]]; then

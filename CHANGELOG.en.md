@@ -14,19 +14,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [5.7.13] — 2026-04-07
+## [5.8.0] — 2026-04-07
+
+Major security and reliability update after several consecutive code audits. The reason for a minor bump instead of a patch release is the significant volume of breaking-semantics changes in config handling, parameter source of truth, and error propagation.
 
 ### Security
 
 - **Russian DPI fingerprinting via static H1-H4 (Discussion #38):** The H1-H4 ranges in `generate_awg_params` were hardcoded identically across all installs (`100000-800000`, `1000000-8000000`, ...). Russian DPI fingerprinted this static signature — installs stopped working over Russian mobile carriers. H1-H4 are now randomized per install: 8 random uint32 values are sorted and grouped into 4 non-overlapping pairs. Every install gets unique ranges with no static signature. Thanks @Klavishnik (report) and @elvaleto (diagnosis).
 
+- **Split-brain prevention in `load_awg_params`:** When the live `awg0.conf` exists, it is now the SOLE source of truth for AWG protocol parameters. A partially corrupt live config (for example, a missing H4 field) produces an explicit error with return 1 instead of silently falling back to stale values from the init file. This closes a class of split-brain bugs where the server runs one config while `regen` would issue clients a different set of J*/S*/H*.
+
+- **Atomic export in `load_awg_params_from_server_conf`:** The parser no longer exports `AWG_*` variables as it finds each field. It now either reads all 11 required fields successfully and exports them, or the environment is not modified at all. Protects against mixed state when `awg0.conf` is partially corrupt.
+
+- **`restore_backup` forces `chmod 600` on restored server keys** instead of inheriting the mode from the archive via `cp -a`. Protects against restoring keys with broken permissions if the backup was created with a bad umask.
+
+- **`--uninstall` no longer disables UFW globally** (HIGH severity, audit). Previously `ufw --force disable` wiped the entire firewall on a VPS where UFW was used for SSH/web hardening before our script was installed. The installer now writes a marker `.ufw_enabled_by_installer` only if UFW was inactive before installation, and uninstall disables UFW only when that marker is present. Backwards compat: older installs without the marker get safer-by-default — UFW stays active.
+
+- **Process-wide install lock** (audit). Two concurrent `install_amneziawg.sh --yes` runs could read the same `setup_state`, race each other on `apt-get` and corrupt package state. `flock -n` on `$AWG_DIR/.install.lock` is now taken at the start of main() for the entire process lifetime — a second instance gets `die "Another installer is already running"`.
+
+- **`--endpoint` validation** (audit). Previously the value was accepted verbatim and written to init and client.conf without any sanity check. Newlines or quotes in the endpoint could smuggle extra directives into configs. A new `validate_endpoint()` function rejects newlines, CR, quotes, backslashes, and requires FQDN / IPv4 / `[IPv6]` format.
+
 ### Fixed
 
-- **`regen` did not update AWG parameters in client configs (#38):** `load_awg_params` only read AWG parameters from the cached `/root/awg/awgsetup_cfg.init`, not from the live `/etc/amnezia/amneziawg/awg0.conf`. If a user manually edited `awg0.conf` (for example, to change obfuscation parameters), `regen` produced client configs with stale values. `load_awg_params` now reads the live server config first, with the init file as a fallback. Added new function `load_awg_params_from_server_conf`.
+- **`regen` did not update AWG parameters in client configs (#38):** `load_awg_params` only read AWG parameters from the cached `/root/awg/awgsetup_cfg.init`, not from the live `/etc/amnezia/amneziawg/awg0.conf`. If a user manually edited `awg0.conf` (for example, to change obfuscation parameters), `regen` produced client configs with stale values. `load_awg_params` now reads the live server config first, with the init file used only as a bootstrap fallback on first install. Added new function `load_awg_params_from_server_conf`.
+
+- **`manage add/remove` ignored `apply_config` exit code** (audit). On apply_config failure the commands still logged "Configuration applied" and returned success — the user saw "OK" while the peer was applied only to the config file, not to the live interface. The caller now checks the return code, logs an actionable error pointing at `systemctl status`, and sets `_cmd_rc=1`.
+
+- **`check_expired_clients` left peers on the live interface on apply failure** (audit). If apply_config failed after expired peers were removed from state files, the peer vanished from `expiry/` but remained active on the interface until a manual restart. Permanent stuck state. The function now checks the return code and returns 1 with an actionable message.
+
+- **`--uninstall` removed `/etc/fail2ban/jail.local` by heuristic** (audit). Previously the entire file was deleted if it contained `banaction = ufw` — too broad a filter, could wipe an unrelated `jail.local` with custom jails. The removal block has been dropped entirely, leaving only `rm -f /etc/fail2ban/jail.d/amneziawg.conf` (our own artefact).
+
+- **`check_server` did not check `awg show` exit code** (audit). Could report "State OK" even when `awg` itself crashed. The command is now captured and its exit code verified.
+
+- **`backup_configs`/`restore_backup` leaked temp directories on SIGINT** (audit). `mktemp -d` was used directly, while the `_awg_cleanup` trap only removed files. A new `manage_mktempdir` helper registers the dir in an array and chains cleanup properly.
+
+- **`add_peer_to_server` now takes an inner flock** to protect against direct calls outside `generate_client` (defense-in-depth, self-audit). The "caller must hold the lock" contract was fragile.
+
+- **`check_expired_clients` validates the client name** before using it in paths (defense-in-depth, self-audit). Previously `name=$(basename "$efile")` was used without validation.
+
+- **Backup file names no longer contain colons**: `%F_%T` → `%F_%H-%M-%S`. Colons are incompatible with FAT/NTFS when copying backups to another medium.
+
+- **`apply_config` has an explicit `return 0` on the success path** — removes exit-code ambiguity from `exec {fd}>&-`.
+
+### Optimizations
+
+- **`generate_awg_h_ranges` does a single `/dev/urandom` read** instead of 8 `rand_range` subprocess calls. `od -An -N32 -tu4 /dev/urandom` reads 32 bytes = 8 uint32 values in one operation. Falls back to `rand_range` if `/dev/urandom` is unavailable.
 
 ### Tests
 
-- 20 new bats tests: `test_h_ranges.bats` (9 H1-H4 generation checks) and `test_load_awg_params.bats` (11 awg0.conf parser and init-file priority checks). Total: 63 tests.
+- **74 bats tests** (+28 from 5.7.12 baseline):
+  - `test_h_ranges.bats` — 9 H1-H4 generation checks
+  - `test_load_awg_params.bats` — 14 awg0.conf parser, init-file priority, split-brain prevention, atomic export, bootstrap path checks
+  - `test_validate_endpoint.bats` — 8 validate_endpoint checks (valid FQDN/IPv4/IPv6, reject newline/CR/quotes/space/backslash/empty)
+- All 46 existing tests (apply_config, IP allocation, parse_duration, peer management, safe_load_config, validate) still pass without regressions.
+
+### Documentation
+
+- **ADVANCED.md/en FAQ**: added workflow "Rotating obfuscation parameters when DPI detects them" — how to edit `awg0.conf` + restart + regen, noting that as of 5.8.0 regen reads the live config.
 
 ---
 
@@ -405,8 +449,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Diagnostic report (`--diagnostic`).
 - Full uninstall (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.13...HEAD
-[5.7.13]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.12...v5.7.13
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.8.0...HEAD
+[5.8.0]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.12...v5.8.0
 [5.7.12]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.11...v5.7.12
 [5.7.11]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.10...v5.7.11
 [5.7.10]: https://github.com/bivlked/amneziawg-installer/compare/v5.7.9...v5.7.10

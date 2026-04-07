@@ -3,7 +3,7 @@
 # ==============================================================================
 # Shared function library for AmneziaWG 2.0
 # Author: @bivlked
-# Version: 5.7.13
+# Version: 5.8.0
 # Date: 2026-04-07
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
@@ -19,7 +19,7 @@ CONFIG_FILE="${CONFIG_FILE:-$AWG_DIR/awgsetup_cfg.init}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
 KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # shellcheck disable=SC2034
-AWG_COMMON_VERSION="5.7.13"
+AWG_COMMON_VERSION="5.8.0"
 
 # --- Auto-cleanup of temporary files ---
 # NOTE: trap is NOT set here to avoid overwriting the caller's trap handler.
@@ -611,7 +611,12 @@ get_next_client_ip() {
 }
 
 # [Peer] addition to server config (atomic via tmpfile + mv)
-# NOTE: caller must hold flock on ${AWG_DIR}/.awg_config.lock
+# IMPORTANT: this function takes its own inner flock on ${AWG_DIR}/.awg_config.lock
+# with a short 5s timeout. If the caller (e.g. generate_client) already holds
+# the same lock, bash fd inheritance makes the second flock a no-op (re-entrant).
+# If the caller does not hold the lock (direct call), the function is still safe.
+# Before v5.8.0 the "caller must hold the lock" contract was fragile, an inner
+# flock has been added as defense-in-depth (self-audit).
 # add_peer_to_server <name> <pubkey> <client_ip>
 add_peer_to_server() {
     local name="$1"
@@ -623,18 +628,30 @@ add_peer_to_server() {
         return 1
     fi
 
+    # Inner flock (defense-in-depth)
+    local _add_lockfile="${AWG_DIR}/.awg_config.lock"
+    local _add_fd
+    exec {_add_fd}>"$_add_lockfile" || { log_error "add_peer: cannot open lock"; return 1; }
+    if ! flock -x -w 5 "$_add_fd"; then
+        log_error "add_peer: failed to acquire config lock within 5s"
+        exec {_add_fd}>&-
+        return 1
+    fi
+
     if grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Peer '$name' already exists in config"
+        exec {_add_fd}>&-
         return 1
     fi
 
     # Add peer via temp file (atomic)
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
+    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; exec {_add_fd}>&-; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
         log_error "Failed to copy server config"
+        exec {_add_fd}>&-
         return 1
     }
 
@@ -649,10 +666,12 @@ EOF
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Failed to update server config"
+        exec {_add_fd}>&-
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
     log "Peer '$name' added to server config."
+    exec {_add_fd}>&-
     return 0
 }
 
@@ -1209,6 +1228,15 @@ check_expired_clients() {
         [[ -f "$efile" ]] || continue
         local name
         name=$(basename "$efile")
+        # Name validation: same regex as validate_client_name in manage_amneziawg.sh.
+        # Defense-in-depth — EXPIRY_DIR is root-only, but protection against an
+        # accidentally placed invalid file (or symlink attack if expiry_dir
+        # ever becomes shared) is needed before using $name in paths and
+        # passing it to remove_peer_from_server (self-audit).
+        if ! [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            log_warn "Skipping invalid expiry file: '$name'"
+            continue
+        fi
         local expires_at
         expires_at=$(cat "$efile" 2>/dev/null)
         if [[ -z "$expires_at" || ! "$expires_at" =~ ^[0-9]+$ ]]; then
