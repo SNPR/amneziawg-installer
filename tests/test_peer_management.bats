@@ -6,7 +6,6 @@ load test_helper
 # --- add_peer_to_server ---
 
 @test "add_peer: adds peer to config" {
-    require_flock
     create_server_config
     add_peer_to_server "test_client" "PUBKEY123" "10.9.9.2"
     grep -q "#_Name = test_client" "$SERVER_CONF_FILE"
@@ -15,7 +14,6 @@ load test_helper
 }
 
 @test "add_peer: rejects duplicate name" {
-    require_flock
     create_server_config
     add_test_peer "existing" "10.9.9.2"
     run add_peer_to_server "existing" "NEWKEY" "10.9.9.3"
@@ -25,7 +23,6 @@ load test_helper
 @test "add_peer: sets permissions 600" {
     # stat format differs across platforms; check on Linux only
     [[ "$(uname -s)" == "Linux" ]] || skip "stat format differs on non-Linux"
-    require_flock
     create_server_config
     add_peer_to_server "test_client" "PUBKEY123" "10.9.9.2"
     local perms

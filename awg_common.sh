@@ -610,13 +610,23 @@ get_next_client_ip() {
     return 1
 }
 
-# Добавление [Peer] в серверный конфиг (атомарно через tmpfile + mv)
-# ВАЖНО: функция берёт собственный inner flock на ${AWG_DIR}/.awg_config.lock
-# с коротким таймаутом 5s. Если caller (например generate_client) уже держит
-# тот же lock — bash fd inheritance делает повторный flock no-op (re-entrant).
-# Если caller не держит lock (прямой вызов) — функция всё равно защищена.
-# До v5.8.0 контракт "caller должен держать lock" был fragile, добавлен
-# inner flock как defense-in-depth (self-audit).
+# Добавление [Peer] в серверный конфиг (атомарно через tmpfile + mv).
+#
+# КОНТРАКТ БЛОКИРОВКИ: вызывающий код ОБЯЗАН держать exclusive flock на
+# ${AWG_DIR}/.awg_config.lock когда вызывает эту функцию. Эту блокировку
+# берёт generate_client() — единственный текущий caller. Не вызывать
+# add_peer_to_server напрямую без удержания lock'а.
+#
+# Почему inner flock здесь невозможен: bash flock не re-entrant между
+# разными file descriptors на тот же файл. generate_client() открывает
+# .awg_config.lock на свой fd и держит exclusive lock, а попытка
+# открыть тот же файл на новый fd внутри add_peer_to_server и взять
+# на нём exclusive lock приводит к самоблокировке (родительский lock
+# виден как чужой). Контракт-based locking — единственный надёжный
+# вариант для bash в этой ситуации. Re-entrant поведение возможно
+# только если sub-функция использует TOТ ЖЕ fd что родитель (через
+# inheritance), но это требует передачи fd как аргумента.
+#
 # add_peer_to_server <name> <pubkey> <client_ip>
 add_peer_to_server() {
     local name="$1"
@@ -628,30 +638,18 @@ add_peer_to_server() {
         return 1
     fi
 
-    # Inner flock (defense-in-depth)
-    local _add_lockfile="${AWG_DIR}/.awg_config.lock"
-    local _add_fd
-    exec {_add_fd}>"$_add_lockfile" || { log_error "add_peer: cannot open lock"; return 1; }
-    if ! flock -x -w 5 "$_add_fd"; then
-        log_error "add_peer: не удалось получить блокировку конфига за 5s"
-        exec {_add_fd}>&-
-        return 1
-    fi
-
     if grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Пир '$name' уже существует в конфиге"
-        exec {_add_fd}>&-
         return 1
     fi
 
     # Добавляем пир через временный файл (атомарно)
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; exec {_add_fd}>&-; return 1; }
+    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
         log_error "Ошибка копирования серверного конфига"
-        exec {_add_fd}>&-
         return 1
     }
 
@@ -666,12 +664,10 @@ EOF
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Ошибка обновления серверного конфига"
-        exec {_add_fd}>&-
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
     log "Пир '$name' добавлен в серверный конфиг."
-    exec {_add_fd}>&-
     return 0
 }
 

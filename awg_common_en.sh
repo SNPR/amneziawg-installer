@@ -610,13 +610,23 @@ get_next_client_ip() {
     return 1
 }
 
-# [Peer] addition to server config (atomic via tmpfile + mv)
-# IMPORTANT: this function takes its own inner flock on ${AWG_DIR}/.awg_config.lock
-# with a short 5s timeout. If the caller (e.g. generate_client) already holds
-# the same lock, bash fd inheritance makes the second flock a no-op (re-entrant).
-# If the caller does not hold the lock (direct call), the function is still safe.
-# Before v5.8.0 the "caller must hold the lock" contract was fragile, an inner
-# flock has been added as defense-in-depth (self-audit).
+# [Peer] addition to server config (atomic via tmpfile + mv).
+#
+# LOCKING CONTRACT: the caller MUST hold an exclusive flock on
+# ${AWG_DIR}/.awg_config.lock when invoking this function. The lock is
+# acquired by generate_client() — the only current caller. Do not call
+# add_peer_to_server directly without holding the lock.
+#
+# Why an inner flock is not possible here: bash flock is not re-entrant
+# across different file descriptors on the same file. generate_client()
+# opens .awg_config.lock on its own fd and holds an exclusive lock; an
+# attempt to open the same file on a new fd inside add_peer_to_server
+# and take an exclusive lock there would self-deadlock (the parent lock
+# is seen as foreign). Contract-based locking is the only reliable
+# option in this situation. Re-entrant behaviour is possible only if
+# the sub-function uses the SAME fd as the parent (via inheritance),
+# which would require passing the fd as an argument.
+#
 # add_peer_to_server <name> <pubkey> <client_ip>
 add_peer_to_server() {
     local name="$1"
@@ -628,30 +638,18 @@ add_peer_to_server() {
         return 1
     fi
 
-    # Inner flock (defense-in-depth)
-    local _add_lockfile="${AWG_DIR}/.awg_config.lock"
-    local _add_fd
-    exec {_add_fd}>"$_add_lockfile" || { log_error "add_peer: cannot open lock"; return 1; }
-    if ! flock -x -w 5 "$_add_fd"; then
-        log_error "add_peer: failed to acquire config lock within 5s"
-        exec {_add_fd}>&-
-        return 1
-    fi
-
     if grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Peer '$name' already exists in config"
-        exec {_add_fd}>&-
         return 1
     fi
 
     # Add peer via temp file (atomic)
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; exec {_add_fd}>&-; return 1; }
+    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
         log_error "Failed to copy server config"
-        exec {_add_fd}>&-
         return 1
     }
 
@@ -666,12 +664,10 @@ EOF
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
         log_error "Failed to update server config"
-        exec {_add_fd}>&-
         return 1
     fi
     chmod 600 "$SERVER_CONF_FILE"
     log "Peer '$name' added to server config."
-    exec {_add_fd}>&-
     return 0
 }
 
