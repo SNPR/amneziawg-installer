@@ -573,6 +573,7 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
   <tr><td>Tattelecom (Letai)</td><td>Jc=3, I1=&lt;r 64&gt;</td><td>✅</td></tr>
   <tr><td>Yota (Moscow)</td><td>I1=&lt;b 0xce...&gt;, Jmax=261</td><td>✅</td></tr>
   <tr><td>Yota/Tele2 (Moscow)</td><td>Jc=3, Jmin=40, Jmax=70</td><td>✅</td></tr>
+  <tr><td>Tele2 (Krasnoyarsk)</td><td>Jc=3 (client config only)</td><td>✅</td></tr>
   <tr><td>Beeline</td><td>default v5.8.3</td><td>✅</td></tr>
   <tr><td>Megafon (Moscow)</td><td>Jc=3, Jmin=80, Jmax=268</td><td>❌ testing</td></tr>
   </table>
@@ -826,6 +827,8 @@ Not all clients support AWG 2.0. Check compatibility before choosing a client:
 | [AWG Manager](https://github.com/hoaxisr/awg-manager) | Keenetic (Entware) | Web interface for managing AWG tunnels on Keenetic routers |
 | [AmneziaWG for Merlin](https://github.com/r0otx/asuswrt-merlin-amneziawg) | ASUS (Asuswrt-Merlin) | AWG 2.0 addon with web UI, GeoIP/GeoSite routing |
 | [awg-proxy](https://github.com/timbrs/amneziawg-mikrotik-c) | MikroTik (RouterOS Container) | Docker container bridging MikroTik's native WireGuard to AmneziaWG |
+
+> **Keenetic native AWG 2.0:** Firmware 4.x supports AWG 2.0 natively without extra packages. If the tunnel connects but traffic doesn't flow — the issue is the I1 format. Working options: `I1 = <r 64>` or the DNS-mimicking pattern `I1 = <r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>`. After replacing I1 in the server config: `sudo systemctl restart awg-quick@awg0` + `manage regen <client>`. [Discussion #45](https://github.com/bivlked/amneziawg-installer/discussions/45).
 
 ---
 
