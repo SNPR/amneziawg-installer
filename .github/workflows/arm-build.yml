@@ -103,6 +103,7 @@ jobs:
             -e OUTPUT_DIR=/output
             -e MODULE_VERSION
           run: |
+            bash <<'CONTAINER_SCRIPT'
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
 
@@ -113,6 +114,7 @@ jobs:
 
             # Add Raspberry Pi Foundation apt repo if needed
             if [[ "${EXTRA_SOURCES:-}" == "rpi" ]]; then
+              mkdir -p /etc/apt/keyrings
               curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
                 | gpg --dearmor -o /etc/apt/keyrings/raspberrypi.gpg
               echo "deb [signed-by=/etc/apt/keyrings/raspberrypi.gpg] \
@@ -124,6 +126,7 @@ jobs:
             apt-get install -y --no-install-recommends "${HEADERS_PKG}"
             mkdir -p /output
             bash /workspace/scripts/build-arm-deb.sh
+            CONTAINER_SCRIPT
 
       - name: Generate SHA256 checksums
         run: |
