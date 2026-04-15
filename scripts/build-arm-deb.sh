@@ -50,13 +50,14 @@ echo "--- Cloning amneziawg-linux-kernel-module ---"
 git clone --depth=1 ${MODULE_VERSION:+--branch "$MODULE_VERSION"} \
     "$MODULE_REPO" "$WORK_DIR/src"
 
-# Build
+# Build (upstream Makefile lives in src/ subdir of the cloned repo)
 echo "--- Building kernel module ---"
-make -C "/lib/modules/${KERNEL_VERSION}/build" \
-    M="$WORK_DIR/src" \
-    modules
+make -C "$WORK_DIR/src/src" \
+    KERNELRELEASE="$KERNEL_VERSION" \
+    KERNELDIR="/lib/modules/${KERNEL_VERSION}/build" \
+    module
 
-KO_PATH="$WORK_DIR/src/amneziawg.ko"
+KO_PATH="$WORK_DIR/src/src/amneziawg.ko"
 if [[ ! -f "$KO_PATH" ]]; then
     echo "ERROR: amneziawg.ko not found after build" >&2
     exit 1
