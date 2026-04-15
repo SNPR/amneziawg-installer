@@ -100,6 +100,8 @@ jobs:
             -v ${{ github.workspace }}:/workspace
             -v ${{ github.workspace }}/output:/output
             -e KERNEL_ID
+            -e EXTRA_SOURCES
+            -e HEADERS_PKG
             -e OUTPUT_DIR=/output
             -e MODULE_VERSION
           run: |
