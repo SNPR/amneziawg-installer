@@ -18,8 +18,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare-release:
+    name: Ensure arm-packages release exists
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create arm-packages release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view arm-packages --repo "${{ github.repository }}" &>/dev/null; then
+            gh release create arm-packages \
+              --repo "${{ github.repository }}" \
+              --title "ARM prebuilt kernel modules" \
+              --notes "Precompiled amneziawg.ko packages for ARM targets. Updated automatically on each installer release. See README for supported kernels." \
+              --prerelease
+          fi
+
   build-arm-deb:
     name: Build ${{ matrix.id }}
+    needs: prepare-release
     runs-on: ubuntu-latest
 
     strategy:
@@ -137,17 +154,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Create or update the arm-packages release tag
-          if ! gh release view arm-packages --repo "${{ github.repository }}" &>/dev/null; then
-            gh release create arm-packages \
-              --repo "${{ github.repository }}" \
-              --title "ARM prebuilt kernel modules" \
-              --notes "Precompiled amneziawg.ko packages for ARM targets. Updated automatically on each installer release. See README for supported kernels." \
-              --prerelease
+          shopt -s nullglob
+          debs=( ${{ github.workspace }}/output/*.deb )
+          if [[ ${#debs[@]} -eq 0 ]]; then
+            echo "::error::No .deb artifacts found in output/"
+            exit 1
           fi
-
-          # Upload .deb and .deb.sha256 (overwrite if exists)
-          for deb in ${{ github.workspace }}/output/*.deb; do
+          for deb in "${debs[@]}"; do
             gh release upload arm-packages "$deb" \
               --repo "${{ github.repository }}" \
               --clobber
