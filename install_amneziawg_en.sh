@@ -1479,8 +1479,10 @@ initialize_setup() {
         log "AWG service is active — skipping port check."
     fi
 
-    # AWG 2.0 parameter generation (first run only)
-    if [[ -z "${AWG_Jc:-}" ]]; then
+    # AWG 2.0 parameter generation
+    # Regenerate if: first run OR explicit CLI override (--preset/--jc/--jmin/--jmax)
+    if [[ -z "${AWG_Jc:-}" ]] || [[ -n "${CLI_PRESET:-}" ]] || [[ -n "${CLI_JC:-}" ]] \
+        || [[ -n "${CLI_JMIN:-}" ]] || [[ -n "${CLI_JMAX:-}" ]]; then
         generate_awg_params
     else
         log "AWG 2.0 parameters already set from config."
@@ -1501,7 +1503,7 @@ export AWG_PORT=${AWG_PORT}
 export AWG_TUNNEL_SUBNET='${AWG_TUNNEL_SUBNET}'
 export DISABLE_IPV6=${DISABLE_IPV6}
 export ALLOWED_IPS_MODE=${ALLOWED_IPS_MODE}
-export ALLOWED_IPS='$(echo "$ALLOWED_IPS" | sed 's/\\,/,/g')'
+export ALLOWED_IPS='${ALLOWED_IPS}'
 export AWG_ENDPOINT='${AWG_ENDPOINT}'
 # AWG 2.0 Parameters
 export AWG_Jc=${AWG_Jc}
@@ -1792,6 +1794,8 @@ PPASRC
         if _try_install_prebuilt_arm; then
             log "Prebuilt kernel module installed. Installing userspace tools from PPA..."
             install_packages "amneziawg-tools" "wireguard-tools" "qrencode"
+            log "Step 2 completed (prebuilt ARM)."
+            request_reboot 3
             return
         fi
         log "No matching prebuilt — falling back to DKMS build."

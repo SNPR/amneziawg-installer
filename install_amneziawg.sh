@@ -1479,8 +1479,10 @@ initialize_setup() {
         log "Сервис AWG активен — пропуск проверки порта."
     fi
 
-    # Генерация AWG 2.0 параметров (только на первом запуске)
-    if [[ -z "${AWG_Jc:-}" ]]; then
+    # Генерация AWG 2.0 параметров
+    # Перегенерация если: первый запуск ИЛИ явный CLI override (--preset/--jc/--jmin/--jmax)
+    if [[ -z "${AWG_Jc:-}" ]] || [[ -n "${CLI_PRESET:-}" ]] || [[ -n "${CLI_JC:-}" ]] \
+        || [[ -n "${CLI_JMIN:-}" ]] || [[ -n "${CLI_JMAX:-}" ]]; then
         generate_awg_params
     else
         log "AWG 2.0 параметры уже заданы из конфига."
@@ -1501,7 +1503,7 @@ export AWG_PORT=${AWG_PORT}
 export AWG_TUNNEL_SUBNET='${AWG_TUNNEL_SUBNET}'
 export DISABLE_IPV6=${DISABLE_IPV6}
 export ALLOWED_IPS_MODE=${ALLOWED_IPS_MODE}
-export ALLOWED_IPS='$(echo "$ALLOWED_IPS" | sed 's/\\,/,/g')'
+export ALLOWED_IPS='${ALLOWED_IPS}'
 export AWG_ENDPOINT='${AWG_ENDPOINT}'
 # AWG 2.0 Parameters
 export AWG_Jc=${AWG_Jc}
@@ -1783,6 +1785,8 @@ PPASRC
         if _try_install_prebuilt_arm; then
             log "Модуль ядра установлен из предсобранного пакета. Установка утилит из PPA..."
             install_packages "amneziawg-tools" "wireguard-tools" "qrencode"
+            log "Шаг 2 завершен (prebuilt ARM)."
+            request_reboot 3
             return
         fi
         log "Совпадений не найдено — откат на DKMS."
