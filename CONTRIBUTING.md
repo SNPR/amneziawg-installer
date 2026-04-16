@@ -52,7 +52,7 @@ Before submitting a PR, ensure:
    done
    ```
 
-3. **Unit tests (bats-core)** pass. Current expected baseline on `v5.8.4`: **92 tests**.
+3. **Unit tests (bats-core)** pass. Current expected baseline on `v5.9.0`: **98 tests**.
    ```bash
    bats tests/
    ```
@@ -147,7 +147,8 @@ docs: update CHANGELOG for v5.5
 
 1. Fill in the PR template completely
 2. Ensure CI checks pass (ShellCheck + syntax)
-3. Update **both** `CHANGELOG.md` and `CHANGELOG.en.md` if applicable
+3. **If your PR adds or modifies a GitHub Actions workflow** (`.github/workflows/*.yml`) or a build script (`scripts/*.sh`), run the workflow via `workflow_dispatch` on your fork and confirm it passes **before** requesting review. This catches environment-specific failures that local testing cannot.
+4. Update **both** `CHANGELOG.md` and `CHANGELOG.en.md` if applicable
 4. Update `[Unreleased]` comparator link in both CHANGELOGs when bumping version
 5. Request a review from `@bivlked`
 6. Address review feedback

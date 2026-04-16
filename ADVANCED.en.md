@@ -41,6 +41,7 @@ This is a supplement to the main [README.en.md](README.en.md), containing deeper
 - [📱 MTU and Mobile Clients](#mtu-mobile-adv)
 - [📋 AWG 2.0 Client Compatibility](#client-compat-adv)
 - [🐧 Debian Support](#debian-support-adv)
+- [🔧 Raspberry Pi and ARM64 Support](#arm-support-adv)
 - [⚠️ Known Limitations](#limitations-adv)
 - [🤝 Contributing](#contributing-adv)
 - [💖 Acknowledgements](#thanks-adv)
@@ -858,6 +859,50 @@ apt-get update && apt-get install -y curl
 **Expected warnings:**
 
 During installation on Debian, you may see a `sudo removal refused` warning — this is normal, as Debian uses `sudo` as a system package and the script correctly skips its removal.
+
+---
+
+<a id="arm-support-adv"></a>
+## 🔧 Raspberry Pi and ARM64 Support
+
+Starting with v5.9.0, the installer works on ARM systems alongside x86_64.
+
+**Supported platforms:**
+
+| Platform | Architecture | Kernel headers package |
+|----------|-------------|----------------------|
+| Raspberry Pi 3, 4 (64-bit) | ARM64 (aarch64) | `linux-headers-rpi-v8` |
+| Raspberry Pi 5 | ARM64 (aarch64) | `linux-headers-rpi-2712` |
+| Raspberry Pi 3, 4 (32-bit) | ARMv7 (armhf) | `linux-headers-rpi-v7` |
+| Ubuntu ARM64 (AWS Graviton, Oracle Ampere, Hetzner) | ARM64 | `linux-headers-generic` |
+| Debian ARM64 (cloud VPS) | ARM64 | `linux-headers-arm64` |
+
+**How it works:**
+
+1. The installer detects the kernel version and architecture automatically.
+2. If a prebuilt `amneziawg.ko` package matching your kernel exists in the [arm-packages release](https://github.com/bivlked/amneziawg-installer/releases/tag/arm-packages), it is downloaded and installed via `dpkg`. This takes 2-3 minutes.
+3. If no prebuilt package matches, the installer falls back to DKMS compilation from source. This works on any kernel but takes longer (10-30 min depending on hardware).
+
+**Raspberry Pi kernel detection:**
+
+Raspberry Pi Foundation kernels have a `+rpt` suffix in their version string (e.g. `6.12.75+rpt-rpi-v8`). The installer maps this suffix to the correct headers package. Standard Debian/Ubuntu ARM64 kernels use their default headers.
+
+**Troubleshooting:**
+
+<details>
+<summary><strong>Q: Module load fails on Raspberry Pi</strong></summary>
+Check that kernel headers match your running kernel: <code>uname -r</code> vs <code>ls /lib/modules/</code>. If they differ, update your kernel: <code>sudo apt update && sudo apt upgrade</code>, reboot, and re-run the installer.
+</details>
+
+<details>
+<summary><strong>Q: DKMS compilation takes a very long time on Pi 3</strong></summary>
+Raspberry Pi 3 has 1 GB RAM and 4 cores at 1.2 GHz. Kernel module compilation can take 20-30 minutes — this is normal. Make sure swap is enabled (the installer configures it automatically).
+</details>
+
+<details>
+<summary><strong>Q: How do I check if the prebuilt module was used?</strong></summary>
+Look for <code>Prebuilt module installed</code> in the install log (<code>/root/awg/install_amneziawg.log</code>). If DKMS was used instead, you'll see <code>dkms install</code> output.
+</details>
 
 ---
 

@@ -32,6 +32,19 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Architecture
+      description: What CPU architecture is your server?
+      options:
+        - x86_64 (amd64)
+        - ARM64 (aarch64)
+        - ARMv7 (armhf)
+        - Other
+    validations:
+      required: false
+
   - type: input
     id: script-version
     attributes:

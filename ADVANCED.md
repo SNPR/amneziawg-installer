@@ -41,6 +41,7 @@
 - [📱 MTU и мобильные клиенты](#mtu-mobile-adv)
 - [📋 Совместимость клиентов AWG 2.0](#client-compat-adv)
 - [🐧 Поддержка Debian](#debian-support-adv)
+- [🔧 Raspberry Pi и ARM64](#arm-support-adv)
 - [⚠️ Известные ограничения](#limitations-adv)
 - [🤝 Внесение вклада (Contributing)](#contributing-adv)
 - [💖 Благодарности](#thanks-adv)
@@ -858,6 +859,50 @@ apt-get update && apt-get install -y curl
 **Ожидаемые предупреждения:**
 
 При установке на Debian вы можете увидеть предупреждение `sudo removal refused` — это нормально, так как Debian использует `sudo` как системный пакет и скрипт корректно пропускает его удаление.
+
+---
+
+<a id="arm-support-adv"></a>
+## 🔧 Raspberry Pi и ARM64
+
+Начиная с v5.9.0, инсталлятор работает на ARM-системах наравне с x86_64.
+
+**Поддерживаемые платформы:**
+
+| Платформа | Архитектура | Пакет заголовков ядра |
+|-----------|-------------|----------------------|
+| Raspberry Pi 3, 4 (64-bit) | ARM64 (aarch64) | `linux-headers-rpi-v8` |
+| Raspberry Pi 5 | ARM64 (aarch64) | `linux-headers-rpi-2712` |
+| Raspberry Pi 3, 4 (32-bit) | ARMv7 (armhf) | `linux-headers-rpi-v7` |
+| Ubuntu ARM64 (AWS Graviton, Oracle Ampere, Hetzner) | ARM64 | `linux-headers-generic` |
+| Debian ARM64 (облачные VPS) | ARM64 | `linux-headers-arm64` |
+
+**Как это работает:**
+
+1. Инсталлятор определяет версию ядра и архитектуру автоматически.
+2. Если в [arm-packages release](https://github.com/bivlked/amneziawg-installer/releases/tag/arm-packages) есть готовый пакет `amneziawg.ko` для вашего ядра, он скачивается и устанавливается через `dpkg`. Это занимает 2-3 минуты.
+3. Если готовый пакет не подходит, инсталлятор переключается на DKMS-сборку из исходников. Работает с любым ядром, но занимает больше времени (10-30 мин в зависимости от оборудования).
+
+**Определение ядра Raspberry Pi:**
+
+Ядра Raspberry Pi Foundation имеют суффикс `+rpt` в строке версии (например, `6.12.75+rpt-rpi-v8`). Инсталлятор маппит этот суффикс на правильный пакет заголовков. Стандартные ядра Debian/Ubuntu ARM64 используют свои обычные заголовки.
+
+**Решение проблем:**
+
+<details>
+<summary><strong>В: Модуль не загружается на Raspberry Pi</strong></summary>
+Проверьте, что заголовки ядра совпадают с работающим ядром: <code>uname -r</code> vs <code>ls /lib/modules/</code>. Если они различаются, обновите ядро: <code>sudo apt update && sudo apt upgrade</code>, перезагрузитесь и запустите инсталлятор повторно.
+</details>
+
+<details>
+<summary><strong>В: DKMS-сборка занимает очень много времени на Pi 3</strong></summary>
+Raspberry Pi 3 имеет 1 ГБ RAM и 4 ядра на 1.2 ГГц. Компиляция модуля ядра может занять 20-30 минут — это нормально. Убедитесь, что swap включен (инсталлятор настраивает его автоматически).
+</details>
+
+<details>
+<summary><strong>В: Как узнать, был ли использован готовый модуль?</strong></summary>
+Ищите <code>Prebuilt module installed</code> в логе установки (<code>/root/awg/install_amneziawg.log</code>). Если использовался DKMS, вы увидите вывод <code>dkms install</code>.
+</details>
 
 ---
 
