@@ -515,6 +515,15 @@ modify_client() {
         return 1
     fi
 
+    # Блокировка для защиты от конкурентных modify/add/remove/restore
+    local modify_lockfile="${AWG_DIR}/.awg_config.lock"
+    local modify_lock_fd
+    exec {modify_lock_fd}>"$modify_lockfile"
+    if ! flock -x -w 10 "$modify_lock_fd"; then
+        log_error "Не удалось получить блокировку конфигурации (другая операция выполняется)"
+        return 1
+    fi
+
     # Допустимые для модификации параметры
     local allowed_params="DNS|Endpoint|AllowedIPs|PersistentKeepalive"
     if ! [[ "$param" =~ ^($allowed_params)$ ]]; then

@@ -35,14 +35,15 @@ jobs:
         id: changelog
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
+          ESCAPED="${VERSION//./\\.}"
 
-          if ! grep -q "^## \[${VERSION}\]" CHANGELOG.en.md; then
+          if ! grep -q "^## \\[${ESCAPED}\\]" CHANGELOG.en.md; then
             echo "::error::Version ${VERSION} not found in CHANGELOG.en.md"
             exit 1
           fi
 
           # Extract: from version header to next version header or end of file
-          awk "/^## \[${VERSION}\]/{found=1; next} /^## \[/{if(found) exit} found" CHANGELOG.en.md > /tmp/release-notes.md
+          awk "/^## \\[${ESCAPED}\\]/{found=1; next} /^## \\[/{if(found) exit} found" CHANGELOG.en.md > /tmp/release-notes.md
 
           echo "--- Release notes preview ---"
           cat /tmp/release-notes.md

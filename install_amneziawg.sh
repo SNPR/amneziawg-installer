@@ -1105,6 +1105,10 @@ create_diagnostic_report() {
     rf="$AWG_DIR/diag_$(date +%F_%T).txt"
     {
         echo "=== AMNEZIAWG 2.0 DIAGNOSTIC REPORT ==="
+        echo ""
+        echo "!!! ВНИМАНИЕ: Отчёт содержит IP-адреса, порты и маршруты."
+        echo "!!! Перед публикацией в issue проверьте и замените приватные данные."
+        echo ""
         echo "Generated: $(date)"
         echo "Hostname: $(hostname)"
         echo "Installer: v${SCRIPT_VERSION}"
@@ -1119,7 +1123,11 @@ create_diagnostic_report() {
         echo "Swap: $(free -m | awk '/Swap:/ {print $2}') MB"
         echo ""
         echo "--- Configuration ($CONFIG_FILE) ---"
-        cat "$CONFIG_FILE" 2>/dev/null || echo "File not found"
+        if [[ -f "$CONFIG_FILE" ]]; then
+            sed 's/AWG_ENDPOINT=.*/AWG_ENDPOINT=[HIDDEN]/' "$CONFIG_FILE"
+        else
+            echo "File not found"
+        fi
         echo ""
         echo "--- Server Config ($SERVER_CONF_FILE) ---"
         # Маскируем приватный ключ

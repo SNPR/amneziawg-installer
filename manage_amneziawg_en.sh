@@ -515,6 +515,15 @@ modify_client() {
         return 1
     fi
 
+    # Lock to protect against concurrent modify/add/remove/restore
+    local modify_lockfile="${AWG_DIR}/.awg_config.lock"
+    local modify_lock_fd
+    exec {modify_lock_fd}>"$modify_lockfile"
+    if ! flock -x -w 10 "$modify_lock_fd"; then
+        log_error "Could not acquire config lock (another operation in progress)"
+        return 1
+    fi
+
     # Parameters allowed for modification
     local allowed_params="DNS|Endpoint|AllowedIPs|PersistentKeepalive"
     if ! [[ "$param" =~ ^($allowed_params)$ ]]; then
