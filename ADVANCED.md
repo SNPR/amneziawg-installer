@@ -11,6 +11,7 @@
 <a id="toc-adv"></a>
 - [✨ Возможности (Подробно)](#features-detailed-adv)
 - [🔐 Параметры AWG 2.0](#awg2-params-adv)
+  - [Presets (v5.10.0+)](#presets-adv)
 - [⚙️ Детали конфигурации клиента](#config-details-adv)
   - [AllowedIPs](#allowedips-adv)
   - [PersistentKeepalive](#persistentkeepalive-adv)
@@ -97,6 +98,46 @@
 * H1-H4 диапазоны **не должны пересекаться** (гарантируется алгоритмом генерации).
 * `S1 + 56 ≠ S2` — предотвращает одинаковый размер init и response сообщений.
 * Все узлы (сервер + клиенты) **должны** использовать одинаковые параметры.
+
+<a id="presets-adv"></a>
+### Presets (v5.10.0+)
+
+Presets — это готовые наборы параметров обфускации, оптимизированные для конкретных условий сети. Выбираются при установке через флаг `--preset`.
+
+| Preset | Jc | Jmin | Jmax | Когда использовать |
+|--------|-----|------|------|-------------------|
+| `default` | 3-6 (случайно) | 40-89 | Jmin + 50..250 | Домашний и проводной интернет, стандартные VPS |
+| `mobile` | **3** (фиксированный) | 30-50 | Jmin + 20..80 | Мобильные операторы (Tele2, Yota, Мегафон, Таттелеком) |
+
+**Установка с preset:**
+
+```bash
+# Стандартный профиль (по умолчанию)
+sudo bash install_amneziawg.sh --yes --route-amnezia
+
+# Мобильный профиль — для SIM-карт, LTE/5G модемов, мобильных роутеров
+sudo bash install_amneziawg.sh --preset=mobile --yes --route-amnezia
+```
+
+**Точечные переопределения (`--jc`, `--jmin`, `--jmax`):**
+
+Можно переопределить отдельные параметры поверх любого preset:
+
+```bash
+# Mobile preset, но Jc=4 вместо 3
+sudo bash install_amneziawg.sh --preset=mobile --jc=4 --yes --route-amnezia
+
+# Полностью ручные параметры
+sudo bash install_amneziawg.sh --jc=2 --jmin=20 --jmax=60 --yes --route-amnezia
+```
+
+| Флаг | Диапазон | Описание |
+|------|---------|----------|
+| `--jc=N` | 1-128 | Количество junk-пакетов |
+| `--jmin=N` | 0-1280 | Минимальный размер junk (байт) |
+| `--jmax=N` | 0-1280 | Максимальный размер junk (байт), должен быть ≥ Jmin |
+
+> **Совет:** Если VPN работает на домашнем Wi-Fi, но нестабилен через мобильную сеть — переустановите с `--preset=mobile`. Подробнее о проблемах мобильных операторов — в <a href="#faq-advanced-adv">FAQ</a>.
 
 ---
 
@@ -557,26 +598,29 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 
 <details>
   <summary><strong>В: Подключается через мобильную сеть только с третьего раза / нестабильно</strong></summary>
-  <b>О:</b> Если после установки VPN работает на домашнем/проводном интернете но нестабилен на мобильном — попробуйте снизить количество junk-пакетов и размер CPS. Discussion #38 (@elvaleto): на Таттелеком (Летай) c Jc=4-8 подключалось раза с третьего, а после снижения <code>Jc = 3</code> и <code>I1 = &lt;r 64&gt;</code> заработало сразу. Мобильные сети имеют меньший MTU, больше packet loss и DPI ближе к абоненту — лишние junk-пакеты создают дополнительную нагрузку на handshake.
+  <b>О:</b> Начиная с v5.10.0 достаточно установить с флагом <code>--preset=mobile</code> — он автоматически выставляет оптимальные параметры для мобильных сетей (Jc=3, узкий Jmax). Discussion #38 (@elvaleto): на Таттелеком (Летай) c Jc=4-8 подключалось раза с третьего, а после снижения <code>Jc = 3</code> заработало сразу.
   <br><br>
-  Что делать:
+  <b>Новая установка (рекомендуется):</b>
+  <pre>sudo bash install_amneziawg.sh --preset=mobile --yes --route-amnezia</pre>
+
+  <b>Существующая установка — ручная правка:</b>
   <ol>
     <li>Откройте <code>/etc/amnezia/amneziawg/awg0.conf</code> и замените <code>Jc</code> на <code>3</code>, а <code>I1</code> на <code>&lt;r 64&gt;</code>.</li>
     <li><code>sudo systemctl restart awg-quick@awg0</code></li>
     <li><code>sudo bash /root/awg/manage_amneziawg.sh regen &lt;имя_клиента&gt;</code> для каждого клиента.</li>
     <li>Раздайте обновлённые конфиги.</li>
   </ol>
-  С v5.8.2 дефолтный Jc снижен с 4-8 до 3-6, что должно улучшить совместимость с мобильными из коробки. Если всё равно нестабильно — поставьте <code>Jc = 2</code> и <code>I1 = &lt;r 32&gt;</code>.
+  Если <code>--preset=mobile</code> недостаточно — попробуйте ещё ниже: <code>--jc=2 --jmin=20 --jmax=60</code>.
   <br><br>
   <b>Отчёты по операторам (из issues/discussions):</b>
   <table>
-  <tr><th>Оператор</th><th>Параметры</th><th>Результат</th></tr>
-  <tr><td>Таттелеком (Летай)</td><td>Jc=3, I1=&lt;r 64&gt;</td><td>✅</td></tr>
-  <tr><td>Yota (Москва)</td><td>I1=&lt;b 0xce...&gt;, Jmax=261</td><td>✅</td></tr>
-  <tr><td>Yota/Tele2 (Москва)</td><td>Jc=3, Jmin=40, Jmax=70</td><td>✅</td></tr>
-  <tr><td>Tele2 (Красноярск)</td><td>Jc=3 (только клиентский конфиг)</td><td>✅</td></tr>
-  <tr><td>Beeline</td><td>дефолт v5.8.3</td><td>✅</td></tr>
-  <tr><td>Megafon (Москва)</td><td>Jc=3, Jmin=80, Jmax=268</td><td>❌ тестируется</td></tr>
+  <tr><th>Оператор</th><th>Параметры</th><th>Рекомендация</th><th>Результат</th></tr>
+  <tr><td>Таттелеком (Летай)</td><td>Jc=3, I1=&lt;r 64&gt;</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Yota (Москва)</td><td>I1=&lt;b 0xce...&gt;, Jmax=261</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Yota/Tele2 (Москва)</td><td>Jc=3, Jmin=40, Jmax=70</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Tele2 (Красноярск)</td><td>Jc=3</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Beeline</td><td>дефолт</td><td><code>--preset=default</code></td><td>✅</td></tr>
+  <tr><td>Megafon (Москва)</td><td>Jc=3, Jmin=80, Jmax=268</td><td><code>--preset=mobile</code></td><td>🔄 тестируется</td></tr>
   </table>
 </details>
 

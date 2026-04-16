@@ -14,6 +14,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [5.10.0] — 2026-04-16
+
+Mobile network optimization: `--preset=mobile` and `--jc`/`--jmin`/`--jmax` CLI flags, comprehensive security and reliability audit across the entire codebase ([Discussion #38](https://github.com/bivlked/amneziawg-installer/discussions/38), [Issue #42](https://github.com/bivlked/amneziawg-installer/issues/42)).
+
+### Added
+
+- **`--preset=mobile` CLI flag for mobile carriers.** Locks Jc=3 with narrow Jmax (Jmin+20..80) — confirmed working settings for Tele2, Yota, Megafon, Tattelecom and other carriers that block AWG connections with Jc>3 or Jmax>300. `--preset=default` is also available for explicit selection of the standard profile (Jc=3-6, Jmin=40-89, Jmax=Jmin+50..250).
+- **`--jc=N`, `--jmin=N`, `--jmax=N` CLI flags.** Fine-grained override of obfuscation parameters on top of any preset. Jc: 1-128, Jmin/Jmax: 0-1280, Jmax must be ≥ Jmin. Example: `--preset=mobile --jc=4` uses the mobile profile but with Jc=4 instead of 3.
+- **Protocol boundary validation in `validate_awg_config`.** Checks AWG parameter ranges after backup restore: Jc (1-128), Jmin/Jmax (0-1280, Jmax ≥ Jmin), S3 (0-64), S4 (0-32), H1-H4 range ordering (lower < upper).
+- **`AWG_PRESET` saved to configuration.** The selected preset is recorded in `awgsetup_cfg.init` for diagnostics and reproducibility.
+
+### Security
+
+- **Config parser BOM and CRLF hardening.** `safe_load_config` and `safe_read_config_key` now strip BOM (UTF-8 `\xEF\xBB\xBF`) and CR (`\r`) before parsing. Prevents issues when configs are edited in Windows text editors.
+- **Special character escaping in `regenerate_client`.** `sed` replacements properly escape `&`, `\`, `/` in values, preventing injection through client keys.
+- **GitHub Actions pinned to SHA.** All 7 actions across 4 workflows are pinned to specific commit SHAs instead of mutable tags (supply chain protection).
+- **Endpoint masking in diagnostic report.** `generate_diagnostic_report` replaces the server IP address with `***MASKED***` for safe sharing of diagnostic output.
+- **File permissions for vpn:// URIs.** `secure_files` and `restore_backup` set `chmod 600` for `.vpnuri` and `.png` (QR code) files.
+- **Client name validation in `set_client_expiry`.** Prevents path traversal through client names.
+- **Quoted paths in cron file.** `install_expiry_cron` properly quotes paths with spaces.
+
+### Reliability
+
+- **TOCTOU fix in `modify_client`.** Parameter validation moved before lock acquisition, client state checks moved inside the lock. File descriptor is properly closed on all error paths.
+- **Correct service restart.** Step 7 now detects an already-running service and uses `enable + restart` instead of a duplicate `awg-quick up`, preventing the "interface already exists" error.
+- **I1 stale value fix.** `load_awg_params` clears `AWG_I1` before parsing the server config, preventing CPS parameter contamination from the initial configuration.
+- **Forced regeneration with CLI flags.** Re-running with `--preset` or `--jc`/`--jmin`/`--jmax` forces AWG parameter regeneration even when the config already exists.
+- **ARM prebuilt step completion.** The prebuilt `.deb` installation path now correctly updates state and requests a reboot, preventing an infinite step-2 loop.
+- **Correct regex in `release.yml`.** Dots are now escaped in the version pattern (`5\.10\.0` instead of `5.10.0`).
+- **Extended preflight in `build-arm-deb.sh`.** Added `modinfo`, `sha256sum`, `awk`, `xz` checks, kernel detection via `/lib/modules/*/build`, empty `MODULE_VER` guard.
+
+### CI/CD
+
+- **Expanded ShellCheck scope.** Workflow now lints `scripts/*.sh` and `tests/*.bash` in addition to root `.sh` files.
+- **Test workflow hygiene.** Added `permissions: contents: read` and `concurrency` group to prevent parallel runs.
+
+### Tests
+
+- **+33 new bats tests** (131 total, up from 98). `test_preset.bats` (18): preset selection, CLI overrides, validation. `test_validate.bats` (+8): protocol boundary checks. `test_safe_load_config.bats` (+4): CRLF, BOM, BOM+CRLF, values with `=`. `test_validate_endpoint.bats` (+3): full IPv6, single-label hostname, empty brackets.
+
+> 📣 **Main features of the 5.x branch** — see the [v5.8.0 release notes](https://github.com/bivlked/amneziawg-installer/releases/tag/v5.8.0). ARM support — see [v5.9.0](https://github.com/bivlked/amneziawg-installer/releases/tag/v5.9.0). v5.10.0 adds mobile network optimization and a comprehensive audit with no breaking changes.
+
+---
+
 ## [5.9.0] — 2026-04-15
 
 Raspberry Pi (arm64 and armhf) and ARM64 server support (AWS Graviton, Oracle Ampere, Hetzner arm64). Full implementation by [@pyr0ball](https://github.com/pyr0ball) ([PR #43](https://github.com/bivlked/amneziawg-installer/pull/43), [Issue #37](https://github.com/bivlked/amneziawg-installer/issues/37)).

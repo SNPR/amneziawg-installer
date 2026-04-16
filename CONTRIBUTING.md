@@ -52,7 +52,7 @@ Before submitting a PR, ensure:
    done
    ```
 
-3. **Unit tests (bats-core)** pass. Current expected baseline on `v5.9.0`: **98 tests**.
+3. **Unit tests (bats-core)** pass. Current expected baseline on `v5.10.0`: **131 tests**.
    ```bash
    bats tests/
    ```

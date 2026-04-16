@@ -14,6 +14,50 @@
 
 ---
 
+## [5.10.0] — 2026-04-16
+
+Оптимизация для мобильных сетей: CLI-флаги `--preset=mobile` и `--jc`/`--jmin`/`--jmax`, комплексный аудит безопасности и надёжности всего кодовой базы ([Discussion #38](https://github.com/bivlked/amneziawg-installer/discussions/38), [Issue #42](https://github.com/bivlked/amneziawg-installer/issues/42)).
+
+### Добавлено
+
+- **CLI-флаг `--preset=mobile` для мобильных сетей.** Фиксирует Jc=3, узкий Jmax (Jmin+20..80) — подтверждённые настройки для Tele2, Yota, Мегафон, Таттелеком и других операторов, блокирующих AWG с Jc>3 и Jmax>300. Также доступен `--preset=default` для явного выбора стандартного профиля (Jc=3-6, Jmin=40-89, Jmax=Jmin+50..250).
+- **CLI-флаги `--jc=N`, `--jmin=N`, `--jmax=N`.** Точечное переопределение параметров обфускации поверх любого preset. Jc: 1-128, Jmin/Jmax: 0-1280, Jmax должен быть ≥ Jmin. Пример: `--preset=mobile --jc=4` использует mobile-профиль, но с Jc=4 вместо 3.
+- **Валидация протокольных границ в `validate_awg_config`.** Проверка AWG-параметров после восстановления из бэкапа: Jc (1-128), Jmin/Jmax (0-1280, Jmax ≥ Jmin), S3 (0-64), S4 (0-32), корректность H1-H4 диапазонов (нижняя граница < верхней).
+- **Сохранение `AWG_PRESET` в конфигурацию.** Выбранный preset записывается в `awgsetup_cfg.init` для диагностики и воспроизводимости.
+
+### Безопасность
+
+- **Защита конфигурационного парсера от BOM и CRLF.** `safe_load_config` и `safe_read_config_key` теперь удаляют BOM (UTF-8 `\xEF\xBB\xBF`) и CR (`\r`) перед парсингом. Защищает от проблем при редактировании конфигов в Windows-редакторах.
+- **Экранирование спецсимволов в `regenerate_client`.** `sed`-замены корректно экранируют `&`, `\`, `/` в значениях, предотвращая инъекцию через ключи клиента.
+- **Привязка GitHub Actions к SHA-хешам.** Все 7 actions в 4 workflow привязаны к конкретным SHA вместо мутабельных тегов (supply chain protection).
+- **Маскирование endpoint в диагностическом отчёте.** Функция `generate_diagnostic_report` заменяет IP-адрес сервера на `***MASKED***` для безопасной публикации отчётов.
+- **Права доступа для vpn:// URI.** `secure_files` и `restore_backup` устанавливают `chmod 600` для файлов `.vpnuri` и `.png` (QR-коды).
+- **Валидация имени клиента в `set_client_expiry`.** Защита от path traversal через имя клиента.
+- **Кавычки в путях cron-файла.** `install_expiry_cron` корректно обрамляет пути с пробелами.
+
+### Надёжность
+
+- **Устранение TOCTOU в `modify_client`.** Валидация параметров вынесена до захвата лока, проверка состояния клиента — внутри лока. File descriptor корректно закрывается на всех путях ошибки.
+- **Корректный restart сервиса.** Шаг 7 теперь определяет уже запущенный сервис и использует `enable + restart` вместо повторного `awg-quick up`, предотвращая ошибку «interface already exists».
+- **Устранение утечки I1.** `load_awg_params` очищает `AWG_I1` перед парсингом серверного конфига, предотвращая подмену CPS-параметра значением из начальной конфигурации.
+- **Корректная перегенерация при CLI-флагах.** При повторном запуске с `--preset` или `--jc`/`--jmin`/`--jmax` параметры AWG принудительно перегенерируются, даже если конфиг уже существует.
+- **Завершение шага при ARM prebuilt.** Путь установки через prebuilt `.deb` теперь корректно обновляет state и запрашивает перезагрузку, предотвращая бесконечный цикл шага 2.
+- **Корректный формат regex в `release.yml`.** Экранированы точки в паттерне версии (`5\.10\.0` вместо `5.10.0`).
+- **Preflight-проверки в `build-arm-deb.sh`.** Добавлены проверки `modinfo`, `sha256sum`, `awk`, `xz`, определение kernel через `/lib/modules/*/build`, guard на пустой `MODULE_VER`.
+
+### CI/CD
+
+- **Расширение scope ShellCheck.** Workflow теперь линтит `scripts/*.sh` и `tests/*.bash` помимо корневых `.sh`.
+- **Hygiene для test.yml.** Добавлены `permissions: contents: read` и `concurrency` group для предотвращения параллельных прогонов.
+
+### Тесты
+
+- **+33 новых bats-теста** (131 total, было 98). `test_preset.bats` (18): preset selection, CLI overrides, валидация. `test_validate.bats` (+8): протокольные границы. `test_safe_load_config.bats` (+4): CRLF, BOM, BOM+CRLF, значения с `=`. `test_validate_endpoint.bats` (+3): полный IPv6, single-label hostname, пустые скобки.
+
+> 📣 **Основные возможности ветки 5.x** — в [v5.8.0 release notes](https://github.com/bivlked/amneziawg-installer/releases/tag/v5.8.0). ARM-поддержка — в [v5.9.0](https://github.com/bivlked/amneziawg-installer/releases/tag/v5.9.0). v5.10.0 — оптимизация для мобильных сетей и комплексный аудит без breaking changes.
+
+---
+
 ## [5.9.0] — 2026-04-15
 
 Поддержка Raspberry Pi (arm64 и armhf) и серверов на ARM64 (AWS Graviton, Oracle Ampere, Hetzner arm64). Полная реализация от [@pyr0ball](https://github.com/pyr0ball) ([PR #43](https://github.com/bivlked/amneziawg-installer/pull/43), [Issue #37](https://github.com/bivlked/amneziawg-installer/issues/37)).

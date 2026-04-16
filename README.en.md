@@ -6,7 +6,7 @@
 <p align="center"><em>One-command VPN that works where WireGuard gets blocked — self-hosted on any $3 VPS</em></p>
 
 <p align="center">
-  <img src="logo.jpg" alt="AmneziaWG 2.0 VPN Installer — Ubuntu, Debian, Raspberry Pi, ARM64" width="600">
+  <img src="logo.jpg" alt="AmneziaWG 2.0 VPN Installer — Ubuntu, Debian, Raspberry Pi, ARM64, mobile carrier optimization" width="600">
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
   <img src="https://img.shields.io/badge/Architecture-x86__64_|_ARM64_|_ARMv7-green" alt="x86_64 | ARM64 | ARMv7">
   <a href="https://github.com/bivlked/amneziawg-installer/blob/main/LICENSE"><img src="https://img.shields.io/github/license/bivlked/amneziawg-installer" alt="License"></a>
   <img src="https://img.shields.io/badge/Status-Stable-success" alt="Status">
-  <a href="https://github.com/bivlked/amneziawg-installer/releases"><img src="https://img.shields.io/badge/Installer_Version-5.9.0-blue" alt="Version"></a>
+  <a href="https://github.com/bivlked/amneziawg-installer/releases"><img src="https://img.shields.io/badge/Installer_Version-5.10.0-blue" alt="Version"></a>
   <img src="https://img.shields.io/badge/AmneziaWG-2.0-blueviolet" alt="AWG 2.0">
   <a href="https://github.com/bivlked/amneziawg-installer/actions/workflows/shellcheck.yml"><img src="https://github.com/bivlked/amneziawg-installer/actions/workflows/shellcheck.yml/badge.svg" alt="ShellCheck"></a>
   <a href="https://github.com/bivlked/amneziawg-installer/stargazers"><img src="https://img.shields.io/github/stars/bivlked/amneziawg-installer?style=flat" alt="Stars"></a>
@@ -96,7 +96,7 @@ Works on Ubuntu 24.04/25.10 and Debian 12/13. Any cheap VPS with 1 GB RAM is eno
 ## 🚀 Quick Start
 
 ```bash
-wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/install_amneziawg_en.sh
+wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg_en.sh
 chmod +x install_amneziawg_en.sh
 sudo bash ./install_amneziawg_en.sh
 ```
@@ -124,6 +124,7 @@ All parameters are accepted automatically. Details: [ADVANCED.en.md#cli-params-a
 * **Easy management** — add/remove clients, temporary clients with auto-removal, traffic stats, backups
 * **4 operating systems** — Ubuntu 24.04, Ubuntu 25.10, Debian 12, Debian 13
 * **x86_64 and ARM** — cloud VPS, Raspberry Pi 3/4/5, ARM64 servers (AWS Graviton, Oracle Ampere, Hetzner)
+* **Mobile network optimization** — `--preset=mobile` for Tele2, Yota, Megafon and other carriers with DPI blocking
 
 <details>
 <summary><strong>All features</strong></summary>
@@ -160,7 +161,7 @@ All parameters are accepted automatically. Details: [ADVANCED.en.md#cli-params-a
 | Debian 12 (bookworm) | ✅ Supported | Tested. PPA via codename mapping to focal |
 | Debian 13 (trixie) | ✅ Supported | Tested. PPA via codename mapping to noble, DEB822 |
 
-**Architecture support (v5.9.0+):**
+**Architecture support (v5.10.0+):**
 
 | Architecture | Status | Platforms |
 |---|---|---|
@@ -208,8 +209,8 @@ This installation method ensures correct handling of interactive prompts and col
 
 2.  **Download the script:**
     ```bash
-    wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/install_amneziawg_en.sh
-    # or: curl -fLo install_amneziawg_en.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/install_amneziawg_en.sh
+    wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg_en.sh
+    # or: curl -fLo install_amneziawg_en.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg_en.sh
     ```
 3.  **Make it executable:**
     ```bash
@@ -223,7 +224,7 @@ This installation method ensures correct handling of interactive prompts and col
 
     > **Russian version:** For Russian output, use `install_amneziawg.sh`:
     > ```bash
-    > wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/install_amneziawg.sh
+    > wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg.sh
     > sudo bash ./install_amneziawg.sh
     > ```
     > The Russian version is functionally identical; only user-facing messages and logs are in Russian.
@@ -334,11 +335,11 @@ sudo bash /root/awg/manage_amneziawg.sh <command> [arguments]
 
 ```bash
 # Installation (English)
-wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/install_amneziawg_en.sh
+wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg_en.sh
 sudo bash ./install_amneziawg_en.sh       # Run (+ 2 reboots)
 
 # Installation (Russian)
-wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/install_amneziawg.sh
+wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg.sh
 sudo bash ./install_amneziawg.sh          # Run (+ 2 reboots)
 
 # Client management
@@ -404,13 +405,13 @@ For the changelog, see **[CHANGELOG.en.md](CHANGELOG.en.md)**.
   <b>A:</b> Download the updated scripts and replace them on the server:
   <pre>
   # English version:
-  wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/manage_amneziawg_en.sh
-  wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/awg_common_en.sh
+  wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/manage_amneziawg_en.sh
+  wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/awg_common_en.sh
   chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 
   # Russian version:
-  wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/manage_amneziawg.sh
-  wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.9.0/awg_common.sh
+  wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/manage_amneziawg.sh
+  wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/awg_common.sh
   chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
   </pre>
   Server reinstallation is not required.

@@ -11,6 +11,7 @@ This is a supplement to the main [README.en.md](README.en.md), containing deeper
 <a id="toc-adv"></a>
 - [✨ Features (Detailed)](#features-detailed-adv)
 - [🔐 AWG 2.0 Parameters](#awg2-params-adv)
+  - [Presets (v5.10.0+)](#presets-adv)
 - [⚙️ Client Configuration Details](#config-details-adv)
   - [AllowedIPs](#allowedips-adv)
   - [PersistentKeepalive](#persistentkeepalive-adv)
@@ -97,6 +98,46 @@ All parameters are generated automatically during installation and saved to `/ro
 * H1-H4 ranges **must not overlap** (guaranteed by the generation algorithm).
 * `S1 + 56 ≠ S2` — prevents init and response messages from having the same size.
 * All nodes (server + clients) **must** use identical parameters.
+
+<a id="presets-adv"></a>
+### Presets (v5.10.0+)
+
+Presets are ready-made obfuscation parameter profiles optimized for specific network conditions. Selected during installation via the `--preset` flag.
+
+| Preset | Jc | Jmin | Jmax | When to use |
+|--------|-----|------|------|------------|
+| `default` | 3-6 (random) | 40-89 | Jmin + 50..250 | Home/wired internet, standard VPS |
+| `mobile` | **3** (fixed) | 30-50 | Jmin + 20..80 | Mobile carriers (Tele2, Yota, Megafon, Tattelecom) |
+
+**Installation with a preset:**
+
+```bash
+# Standard profile (default)
+sudo bash install_amneziawg.sh --yes --route-amnezia
+
+# Mobile profile — for SIM cards, LTE/5G modems, mobile routers
+sudo bash install_amneziawg.sh --preset=mobile --yes --route-amnezia
+```
+
+**Fine-grained overrides (`--jc`, `--jmin`, `--jmax`):**
+
+Individual parameters can be overridden on top of any preset:
+
+```bash
+# Mobile preset, but Jc=4 instead of 3
+sudo bash install_amneziawg.sh --preset=mobile --jc=4 --yes --route-amnezia
+
+# Fully manual parameters
+sudo bash install_amneziawg.sh --jc=2 --jmin=20 --jmax=60 --yes --route-amnezia
+```
+
+| Flag | Range | Description |
+|------|-------|------------|
+| `--jc=N` | 1-128 | Number of junk packets |
+| `--jmin=N` | 0-1280 | Minimum junk size (bytes) |
+| `--jmax=N` | 0-1280 | Maximum junk size (bytes), must be ≥ Jmin |
+
+> **Tip:** If VPN works on home Wi-Fi but is unstable on mobile data — reinstall with `--preset=mobile`. More about mobile carrier issues in the <a href="#faq-advanced-adv">FAQ</a>.
 
 ---
 
@@ -557,26 +598,29 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 
 <details>
   <summary><strong>Q: VPN connects over cellular only on the third attempt / unstable</strong></summary>
-  <b>A:</b> If the VPN works fine on home/wired internet but is unstable on cellular — try reducing junk packet count and CPS size. Discussion #38 (@elvaleto): on Tattelecom (Letai) with Jc=4-8 it took multiple attempts to connect, but after setting <code>Jc = 3</code> and <code>I1 = &lt;r 64&gt;</code> it worked immediately. Cellular networks have smaller MTU, higher packet loss, and DPI closer to the subscriber — extra junk packets add overhead to the handshake.
+  <b>A:</b> Starting with v5.10.0, simply install with the <code>--preset=mobile</code> flag — it automatically sets optimal parameters for mobile networks (Jc=3, narrow Jmax). Discussion #38 (@elvaleto): on Tattelecom (Letai) with Jc=4-8 it took multiple attempts to connect, but after setting <code>Jc = 3</code> it worked immediately.
   <br><br>
-  What to do:
+  <b>Fresh install (recommended):</b>
+  <pre>sudo bash install_amneziawg.sh --preset=mobile --yes --route-amnezia</pre>
+
+  <b>Existing install — manual edit:</b>
   <ol>
     <li>Open <code>/etc/amnezia/amneziawg/awg0.conf</code> and change <code>Jc</code> to <code>3</code> and <code>I1</code> to <code>&lt;r 64&gt;</code>.</li>
     <li><code>sudo systemctl restart awg-quick@awg0</code></li>
     <li><code>sudo bash /root/awg/manage_amneziawg.sh regen &lt;client_name&gt;</code> for each client.</li>
     <li>Redistribute updated configs.</li>
   </ol>
-  As of v5.8.2 the default Jc has been lowered from 4-8 to 3-6, which should improve cellular compatibility out of the box. If it is still unstable — try <code>Jc = 2</code> and <code>I1 = &lt;r 32&gt;</code>.
+  If <code>--preset=mobile</code> is not enough — try even lower values: <code>--jc=2 --jmin=20 --jmax=60</code>.
   <br><br>
   <b>Carrier reports (from issues/discussions):</b>
   <table>
-  <tr><th>Carrier</th><th>Parameters</th><th>Result</th></tr>
-  <tr><td>Tattelecom (Letai)</td><td>Jc=3, I1=&lt;r 64&gt;</td><td>✅</td></tr>
-  <tr><td>Yota (Moscow)</td><td>I1=&lt;b 0xce...&gt;, Jmax=261</td><td>✅</td></tr>
-  <tr><td>Yota/Tele2 (Moscow)</td><td>Jc=3, Jmin=40, Jmax=70</td><td>✅</td></tr>
-  <tr><td>Tele2 (Krasnoyarsk)</td><td>Jc=3 (client config only)</td><td>✅</td></tr>
-  <tr><td>Beeline</td><td>default v5.8.3</td><td>✅</td></tr>
-  <tr><td>Megafon (Moscow)</td><td>Jc=3, Jmin=80, Jmax=268</td><td>❌ testing</td></tr>
+  <tr><th>Carrier</th><th>Parameters</th><th>Recommendation</th><th>Result</th></tr>
+  <tr><td>Tattelecom (Letai)</td><td>Jc=3, I1=&lt;r 64&gt;</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Yota (Moscow)</td><td>I1=&lt;b 0xce...&gt;, Jmax=261</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Yota/Tele2 (Moscow)</td><td>Jc=3, Jmin=40, Jmax=70</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Tele2 (Krasnoyarsk)</td><td>Jc=3</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Beeline</td><td>default</td><td><code>--preset=default</code></td><td>✅</td></tr>
+  <tr><td>Megafon (Moscow)</td><td>Jc=3, Jmin=80, Jmax=268</td><td><code>--preset=mobile</code></td><td>🔄 testing</td></tr>
   </table>
 </details>
 

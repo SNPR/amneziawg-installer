@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.9.0
-# Date: 2026-04-15
+# Version: 5.10.0
+# Date: 2026-04-16
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.9.0"
+SCRIPT_VERSION="5.10.0"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -33,8 +33,8 @@ MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 # Verified in step5_download_scripts() after curl.
 # Verification is skipped when AWG_BRANCH is overridden (test branch).
 # Format: sha256sum output (hex, 64 chars).
-COMMON_SCRIPT_SHA256="6376c4a63e3cc1c8a15184542d4626d3df3c0124a7a28a396613c61886e61a44"
-MANAGE_SCRIPT_SHA256="3432d3c12b5acfdfda0293e36077e01b67aacdb6e5bd0573633d55dde9d2912f"
+COMMON_SCRIPT_SHA256="9fa34141c1fc51caa224fca7812680069d12897dbb3461f05416659cbee97da7"
+MANAGE_SCRIPT_SHA256="e7ccba01379ddfe5ad18a7fb3d41f702bc815c7418093a9033bdc0882ab7526b"
 
 # CLI flags
 UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
