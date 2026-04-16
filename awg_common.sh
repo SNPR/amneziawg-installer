@@ -1112,12 +1112,28 @@ validate_awg_config() {
     fi
 
     local ok=1
-    local param
-    local params=("Jc" "Jmin" "Jmax" "S1" "S2" "S3" "S4" "H1" "H2" "H3" "H4")
+    local param val
+    local int_params=("Jc" "Jmin" "Jmax" "S1" "S2" "S3" "S4")
+    local range_params=("H1" "H2" "H3" "H4")
 
-    for param in "${params[@]}"; do
-        if ! grep -q "^${param} = " "$SERVER_CONF_FILE"; then
+    for param in "${int_params[@]}"; do
+        val=$(sed -n "s/^${param} = //p" "$SERVER_CONF_FILE" | head -1)
+        if [[ -z "$val" ]]; then
             log_error "Параметр '$param' не найден в серверном конфиге"
+            ok=0
+        elif ! [[ "$val" =~ ^[0-9]+$ ]]; then
+            log_error "Параметр '$param' содержит невалидное значение: '$val' (ожидается целое число)"
+            ok=0
+        fi
+    done
+
+    for param in "${range_params[@]}"; do
+        val=$(sed -n "s/^${param} = //p" "$SERVER_CONF_FILE" | head -1)
+        if [[ -z "$val" ]]; then
+            log_error "Параметр '$param' не найден в серверном конфиге"
+            ok=0
+        elif ! [[ "$val" =~ ^[0-9]+-[0-9]+$ ]]; then
+            log_error "Параметр '$param' содержит невалидное значение: '$val' (ожидается формат MIN-MAX)"
             ok=0
         fi
     done

@@ -45,7 +45,7 @@ ARCH="$(dpkg --print-architecture)"
 echo "Architecture: $ARCH"
 
 # Verify build tools are available
-for cmd in make gcc git dpkg-deb depmod; do
+for cmd in make gcc git dpkg-deb depmod modinfo sha256sum awk xz; do
     command -v "$cmd" &>/dev/null || { echo "ERROR: $cmd not found" >&2; exit 1; }
 done
 

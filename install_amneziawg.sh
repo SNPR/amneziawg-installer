@@ -446,6 +446,8 @@ validate_endpoint() {
 
 validate_cidr_list() {
     local input="$1" cidr
+    input="${input//$'\r'/}"
+    input="${input//$'\t'/ }"
     IFS=',' read -ra cidrs <<< "$input"
     for cidr in "${cidrs[@]}"; do
         cidr=$(echo "$cidr" | tr -d ' ')
@@ -1191,9 +1193,12 @@ step_uninstall() {
         local bf
         bf="$HOME/awg_uninstall_backup_$(date +%F_%H-%M-%S).tar.gz"
         log "Создание бэкапа: $bf"
-        tar -czf "$bf" -C / etc/amnezia "$AWG_DIR" --ignore-failed-read 2>/dev/null || log_warn "Ошибка создания бэкапа $bf"
-        chmod 600 "$bf" || log_warn "Ошибка chmod бэкапа"
-        log "Бэкап создан: $bf"
+        if tar -czf "$bf" -C / etc/amnezia "$AWG_DIR" --ignore-failed-read 2>/dev/null \
+            && chmod 600 "$bf"; then
+            log "Бэкап создан: $bf"
+        else
+            log_warn "Бэкап не удался — проверьте $bf вручную перед продолжением"
+        fi
     fi
     # Загружаем флаг --no-tweaks из сохранённой конфигурации
     local saved_no_tweaks=0
