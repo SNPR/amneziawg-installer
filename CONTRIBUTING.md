@@ -17,7 +17,7 @@ Thank you for your interest in contributing! This guide covers the process and c
 ### General
 
 - All scripts use `set -o pipefail`
-- Comments and user-facing text are in **Russian**
+- Russian scripts are the primary implementation; changes must be mirrored in the corresponding English scripts (`*_en.sh`)
 - Error handling: use `die()` for fatal errors, `log_error()` / `log_warn()` for non-fatal
 - Logging: all output through `log_msg()` with appropriate level (INFO, WARN, ERROR, DEBUG)
 

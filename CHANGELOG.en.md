@@ -609,7 +609,10 @@ Major security and reliability update after several consecutive code audits. The
 - Diagnostic report (`--diagnostic`).
 - Full uninstall (`--uninstall`).
 
-[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.8.3...HEAD
+[Unreleased]: https://github.com/bivlked/amneziawg-installer/compare/v5.10.0...HEAD
+[5.10.0]: https://github.com/bivlked/amneziawg-installer/compare/v5.9.0...v5.10.0
+[5.9.0]: https://github.com/bivlked/amneziawg-installer/compare/v5.8.4...v5.9.0
+[5.8.4]: https://github.com/bivlked/amneziawg-installer/compare/v5.8.3...v5.8.4
 [5.8.3]: https://github.com/bivlked/amneziawg-installer/compare/v5.8.2...v5.8.3
 [5.8.2]: https://github.com/bivlked/amneziawg-installer/compare/v5.8.1...v5.8.2
 [5.8.1]: https://github.com/bivlked/amneziawg-installer/compare/v5.8.0...v5.8.1

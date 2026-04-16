@@ -253,7 +253,7 @@ export ALLOWED_IPS='0.0.0.0/5, 8.0.0.0/7, ...'
 export AWG_ENDPOINT=''
 export AWG_Jc=6
 export AWG_Jmin=55
-export AWG_Jmax=780
+export AWG_Jmax=205
 export AWG_S1=72
 export AWG_S2=56
 export AWG_S3=32
@@ -263,6 +263,7 @@ export AWG_H2='3456789-4567890'
 export AWG_H3='56789012-67890123'
 export AWG_H4='456789012-567890123'
 export AWG_I1='<r 128>'
+export AWG_PRESET='default'
 ```
 </details>
 
@@ -279,7 +280,7 @@ PostUp = iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o 
 PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 Jc = 6
 Jmin = 55
-Jmax = 780
+Jmax = 205
 S1 = 72
 S2 = 56
 S3 = 32
@@ -308,7 +309,7 @@ DNS = 1.1.1.1
 MTU = 1280
 Jc = 6
 Jmin = 55
-Jmax = 780
+Jmax = 205
 S1 = 72
 S2 = 56
 S3 = 32
@@ -350,6 +351,11 @@ PersistentKeepalive = 33
   --route-amnezia       Режим: Список Amnezia+DNS (умолч.)
   --route-custom=СЕТИ   Режим: Только указанные сети
   --endpoint=IP         Указать внешний IP (для серверов за NAT)
+  --preset=ТИП          Набор параметров обфускации: default, mobile
+                        mobile: Jc=3, узкий Jmax — для мобильных операторов (Tele2, Yota, Мегафон)
+  --jc=N                Задать Jc вручную (1-128, поверх preset)
+  --jmin=N              Задать Jmin вручную (0-1280, поверх preset)
+  --jmax=N              Задать Jmax вручную (0-1280, поверх preset, ≥ Jmin)
   -y, --yes             Неинтерактивный режим (все подтверждения auto-yes)
   --no-tweaks           Пропустить hardening/оптимизацию (без UFW, Fail2Ban, sysctl tweaks)
 ```

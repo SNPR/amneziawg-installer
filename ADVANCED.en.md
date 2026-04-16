@@ -113,11 +113,13 @@ Presets are ready-made obfuscation parameter profiles optimized for specific net
 
 ```bash
 # Standard profile (default)
-sudo bash install_amneziawg.sh --yes --route-amnezia
+sudo bash install_amneziawg_en.sh --yes --route-amnezia
 
 # Mobile profile — for SIM cards, LTE/5G modems, mobile routers
-sudo bash install_amneziawg.sh --preset=mobile --yes --route-amnezia
+sudo bash install_amneziawg_en.sh --preset=mobile --yes --route-amnezia
 ```
+
+> **Note:** `install_amneziawg_en.sh` and `install_amneziawg.sh` are functionally identical — only the output language differs.
 
 **Fine-grained overrides (`--jc`, `--jmin`, `--jmax`):**
 
@@ -125,10 +127,10 @@ Individual parameters can be overridden on top of any preset:
 
 ```bash
 # Mobile preset, but Jc=4 instead of 3
-sudo bash install_amneziawg.sh --preset=mobile --jc=4 --yes --route-amnezia
+sudo bash install_amneziawg_en.sh --preset=mobile --jc=4 --yes --route-amnezia
 
 # Fully manual parameters
-sudo bash install_amneziawg.sh --jc=2 --jmin=20 --jmax=60 --yes --route-amnezia
+sudo bash install_amneziawg_en.sh --jc=2 --jmin=20 --jmax=60 --yes --route-amnezia
 ```
 
 | Flag | Range | Description |
@@ -253,7 +255,7 @@ export ALLOWED_IPS='0.0.0.0/5, 8.0.0.0/7, ...'
 export AWG_ENDPOINT=''
 export AWG_Jc=6
 export AWG_Jmin=55
-export AWG_Jmax=780
+export AWG_Jmax=205
 export AWG_S1=72
 export AWG_S2=56
 export AWG_S3=32
@@ -263,6 +265,7 @@ export AWG_H2='3456789-4567890'
 export AWG_H3='56789012-67890123'
 export AWG_H4='456789012-567890123'
 export AWG_I1='<r 128>'
+export AWG_PRESET='default'
 ```
 </details>
 
@@ -279,7 +282,7 @@ PostUp = iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o 
 PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 Jc = 6
 Jmin = 55
-Jmax = 780
+Jmax = 205
 S1 = 72
 S2 = 56
 S3 = 32
@@ -308,7 +311,7 @@ DNS = 1.1.1.1
 MTU = 1280
 Jc = 6
 Jmin = 55
-Jmax = 780
+Jmax = 205
 S1 = 72
 S2 = 56
 S3 = 32
@@ -350,6 +353,11 @@ Options:
   --route-amnezia       Mode: Amnezia List + DNS (default)
   --route-custom=NETS   Mode: Only specified networks
   --endpoint=IP         Specify external IP (for servers behind NAT)
+  --preset=TYPE         Obfuscation parameter preset: default, mobile
+                        mobile: Jc=3, narrow Jmax — for mobile carriers (Tele2, Yota, Megafon)
+  --jc=N                Set Jc manually (1-128, overrides preset)
+  --jmin=N              Set Jmin manually (0-1280, overrides preset)
+  --jmax=N              Set Jmax manually (0-1280, overrides preset, must be >= Jmin)
   -y, --yes             Non-interactive mode (all confirmations auto-yes)
   --no-tweaks           Skip hardening/optimization (no UFW, Fail2Ban, sysctl tweaks)
 ```

@@ -124,7 +124,7 @@ sudo bash ./install_amneziawg.sh --yes --route-all
 * **Удобное управление** — добавление/удаление клиентов, временные клиенты с авто-удалением, статистика, бэкапы
 * **4 операционные системы** — Ubuntu 24.04, Ubuntu 25.10, Debian 12, Debian 13
 * **x86_64 и ARM** — облачные VPS, Raspberry Pi 3/4/5, ARM64-серверы (AWS Graviton, Oracle Ampere, Hetzner)
-* **Оптимизация для мобильных сетей** — `--preset=mobile` для Tele2, Yota, Мегафон и других операторов с DPI-блокировками
+* **Оптимизация для мобильных сетей** — `--preset=mobile` для Tele2, Yota, Мегафон и других операторов с DPI-блокировками. Тонкая настройка через `--jc`, `--jmin`, `--jmax` ([подробнее](ADVANCED.md#presets-adv))
 
 <details>
 <summary><strong>Все возможности</strong></summary>

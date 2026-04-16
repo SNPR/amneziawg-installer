@@ -49,8 +49,8 @@ body:
     id: script-version
     attributes:
       label: Script Version
-      description: Version of the script (shown at the top of each script or in `--version` output).
-      placeholder: "e.g., 5.7.12"
+      description: Version of the script (shown in the log header or in the script file header comment).
+      placeholder: "e.g., 5.10.0"
     validations:
       required: true
 
