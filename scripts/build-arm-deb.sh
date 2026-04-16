@@ -102,7 +102,11 @@ MODULE_INSTALL_PATH="${DEB_DIR}/lib/modules/${KERNEL_VERSION}/extra"
 mkdir -p "$MODULE_INSTALL_PATH" "${DEB_DIR}/DEBIAN"
 
 cp "$KO_PATH" "$MODULE_INSTALL_PATH/amneziawg.ko"
-xz -9 "$MODULE_INSTALL_PATH/amneziawg.ko" 2>/dev/null || true  # compress if xz available
+if xz -9 "$MODULE_INSTALL_PATH/amneziawg.ko" 2>/dev/null; then
+    echo "Module compressed with xz"
+else
+    echo "xz compression skipped — packaging uncompressed .ko"
+fi
 
 cat > "${DEB_DIR}/DEBIAN/control" <<EOF
 Package: ${PKG_NAME}

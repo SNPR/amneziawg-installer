@@ -120,3 +120,21 @@ setup() {
     run validate_endpoint "0.0.0.0"
     [ "$status" -eq 0 ]
 }
+
+# --- IPv6 edge-case coverage ---
+
+@test "validate_endpoint: accepts full-length bracketed IPv6" {
+    run validate_endpoint "[2001:db8:85a3:0:0:8a2e:370:7334]"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_endpoint: accepts single-label hostname (e.g. localhost)" {
+    # Single-label hosts are accepted — AWG itself validates at runtime
+    run validate_endpoint "localhost"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_endpoint: rejects empty brackets" {
+    run validate_endpoint "[]"
+    [ "$status" -eq 1 ]
+}

@@ -752,7 +752,11 @@ remove_peer_from_server() {
     # Нормализация: сжать множественные пустые строки в одну
     local tmpclean
     tmpclean=$(awg_mktemp) || { log_error "Ошибка mktemp"; exec {lock_fd}>&-; return 1; }
-    cat -s "$tmpfile" > "$tmpclean" && mv "$tmpclean" "$tmpfile"
+    if cat -s "$tmpfile" > "$tmpclean" 2>/dev/null; then
+        mv "$tmpclean" "$tmpfile"
+    else
+        rm -f "$tmpclean"
+    fi
 
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
