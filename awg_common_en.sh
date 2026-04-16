@@ -1136,6 +1136,42 @@ validate_awg_config() {
         fi
     done
 
+    # Protocol boundary checks (defense-in-depth for restored backups)
+    local jc jmin jmax s3 s4
+    jc=$(sed -n 's/^Jc = //p' "$SERVER_CONF_FILE" | head -1)
+    jmin=$(sed -n 's/^Jmin = //p' "$SERVER_CONF_FILE" | head -1)
+    jmax=$(sed -n 's/^Jmax = //p' "$SERVER_CONF_FILE" | head -1)
+    s3=$(sed -n 's/^S3 = //p' "$SERVER_CONF_FILE" | head -1)
+    s4=$(sed -n 's/^S4 = //p' "$SERVER_CONF_FILE" | head -1)
+    if [[ "$jc" =~ ^[0-9]+$ ]]; then
+        if [[ "$jc" -lt 1 || "$jc" -gt 128 ]]; then
+            log_error "Jc=$jc is out of range (1-128)"
+            ok=0
+        fi
+    fi
+    if [[ "$jmin" =~ ^[0-9]+$ && "$jmax" =~ ^[0-9]+$ ]]; then
+        if [[ "$jmin" -gt 1280 ]]; then
+            log_error "Jmin=$jmin exceeds 1280"
+            ok=0
+        fi
+        if [[ "$jmax" -gt 1280 ]]; then
+            log_error "Jmax=$jmax exceeds 1280"
+            ok=0
+        fi
+        if [[ "$jmax" -lt "$jmin" ]]; then
+            log_error "Jmax ($jmax) is less than Jmin ($jmin)"
+            ok=0
+        fi
+    fi
+    if [[ "$s3" =~ ^[0-9]+$ && "$s3" -gt 64 ]]; then
+        log_error "S3=$s3 exceeds maximum (64)"
+        ok=0
+    fi
+    if [[ "$s4" =~ ^[0-9]+$ && "$s4" -gt 32 ]]; then
+        log_error "S4=$s4 exceeds maximum (32)"
+        ok=0
+    fi
+
     for param in "${range_params[@]}"; do
         val=$(sed -n "s/^${param} = //p" "$SERVER_CONF_FILE" | head -1)
         if [[ -z "$val" ]]; then
@@ -1144,6 +1180,12 @@ validate_awg_config() {
         elif ! [[ "$val" =~ ^[0-9]+-[0-9]+$ ]]; then
             log_error "Parameter '$param' has invalid value: '$val' (expected MIN-MAX format)"
             ok=0
+        else
+            local range_lo="${val%-*}" range_hi="${val#*-}"
+            if [[ "$range_lo" -ge "$range_hi" ]]; then
+                log_error "Parameter '$param': lower bound ($range_lo) >= upper bound ($range_hi)"
+                ok=0
+            fi
         fi
     done
 
