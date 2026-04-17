@@ -29,6 +29,7 @@
 </p>
 
 <p align="center">
+  <a href="#tldr">⚡ TL;DR (2 nodes + WARP)</a> •
   <a href="#why">Why this project</a> •
   <a href="#comparison">AWG vs WG</a> •
   <a href="#cli-vs-panel">CLI vs panels</a> •
@@ -92,8 +93,97 @@ Works on Ubuntu 24.04/25.10 and Debian 12/13. Any cheap VPS with 1 GB RAM is eno
 
 ---
 
+<a id="tldr"></a>
+## ⚡ TL;DR — full recipe: two servers + WARP + mobile-DPI bypass
+
+> **The SNPR/amneziawg-installer fork** adds a multi-hop cascade, Cloudflare WARP egress on the exit node, and aggressive QUIC masquerading for mobile-carrier DPI. The recipe below is exactly the setup we brought up live: clients connect to **Node 2** on UDP 500, traffic is forwarded through **Node 1**, and from there out via **Cloudflare WARP** — external sites see a Cloudflare IP, not the VPS.
+>
+> You need: **2 VPSes** (Ubuntu 24.04/25.10 or Debian 12/13), root over SSH. We'll call Node 1 (exit) `IP1` and Node 2 (entry) `IP2`.
+
+### 1. On both nodes — clone the fork
+
+```bash
+git clone https://github.com/SNPR/amneziawg-installer.git /root/amneziawg-installer
+cd /root/amneziawg-installer
+```
+
+Important: clone into `/root/amneziawg-installer` specifically (NOT into `/root/awg` — that is the installer's runtime directory). The installer will detect the local clone and pull `awg_common.sh` / `manage_amneziawg.sh` straight from it, with no CDN download.
+
+### 2. On Node 1 (exit) — AWG server with WARP egress
+
+```bash
+sudo bash install_amneziawg_en.sh \
+  --role=exit \
+  --subnet=10.9.0.1/24 \
+  --egress=warp \
+  --yes
+```
+
+The installer fetches wgcf, registers a free Cloudflare WARP account and wires up policy-routing — all client traffic leaves through WARP. If it asks for a reboot (usually once or twice), say yes, then run the **same command** again after the reboot.
+
+After install — generate the config Node 2 will use to reach Node 1 and copy it over:
+
+```bash
+sudo bash /root/awg/manage_amneziawg.sh add hop_to_entry
+scp /root/awg/hop_to_entry.conf root@<IP2>:/root/
+```
+
+### 3. On Node 2 (entry) — AWG server for clients + cascade
+
+```bash
+sudo bash install_amneziawg_en.sh \
+  --role=entry \
+  --upstream-conf=/root/hop_to_entry.conf \
+  --subnet=10.8.0.1/24 \
+  --route-all \
+  --preset=mobile \
+  --port=500 \
+  --i1-mode=quic \
+  --yes
+```
+
+Flag rationale:
+
+- `--route-all` — client configs get `AllowedIPs = 0.0.0.0/0`. Without this many mobile clients fail to install a default route and traffic leaks around the tunnel.
+- `--preset=mobile` — Jc=3, narrow Jmax (≤130). The obfuscation profile that works against Tele2, Yota, Megafon and other carriers that block AWG with Jc>3 / Jmax>300.
+- `--port=500` — UDP 500 (IKE/NAT-T). Mobile carriers almost never filter it because native iOS/Android VPN clients use it.
+- `--i1-mode=quic` — the client `.conf` gets a ~1150-byte fake QUIC v1 Initial packet as the I1 prefix. DPI sees `0xc?000000 01 ...`, treats it as ordinary QUIC browser traffic, and lets it pass.
+
+### 4. Grab the client config and import
+
+```bash
+# On your laptop:
+scp root@<IP2>:/root/awg/my_phone.conf .
+scp root@<IP2>:/root/awg/my_phone.png .
+scp root@<IP2>:/root/awg/my_phone.vpnuri .
+```
+
+On your phone in **Amnezia VPN ≥ 4.8.12.7** — import the QR (`my_phone.png`) or the deep-link (`vpn://...` from `.vpnuri`).
+
+### ⚠️ Critical — check Amnezia VPN settings on the phone
+
+In the app's settings look for the tunnel mode / split-tunneling / app list. It MUST be set to **"All traffic through VPN"** (All apps / Tunnel all traffic). If split-tunneling is on with a white/blacklist of apps, your browser or curl may be excluded and the traffic will go around the VPN even though the app shows "Connected". This is the single most common cause of "it doesn't work" when the infrastructure itself is fine.
+
+### 5. Verify from the phone
+
+Connect the VPN, open a browser or Termux:
+
+```
+curl -4 -m 10 ifconfig.me
+```
+
+Should return a **Cloudflare IP** (`104.x` or `162.x` range). That confirms the full chain: **client → Node 2 (AWG/QUIC) → Node 1 (cascade) → WARP → internet**.
+
+Optionally https://ipleak.net — to confirm no v4 or DNS is leaking outside Cloudflare.
+
+### Full guide
+
+Everything else (diagnostics, MTU, changing ports, client management, uninstall) is in [MULTIHOP.en.md](MULTIHOP.en.md).
+
+---
+
 <a id="quickstart"></a>
-## 🚀 Quick Start
+## 🚀 Quick Start (upstream single-node, without the fork)
 
 ```bash
 wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg_en.sh

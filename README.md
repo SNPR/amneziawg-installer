@@ -29,6 +29,7 @@
 </p>
 
 <p align="center">
+  <a href="#tldr">⚡ TL;DR (2 ноды + WARP)</a> •
   <a href="#zachem">Зачем это нужно</a> •
   <a href="#sravnenie">AWG vs WG</a> •
   <a href="#cli-vs-panel">CLI vs панели</a> •
@@ -92,8 +93,97 @@
 
 ---
 
+<a id="tldr"></a>
+## ⚡ TL;DR — полный рецепт: два сервера + WARP + мобильный DPI
+
+> **Форк SNPR/amneziawg-installer** добавляет multi-hop каскад, Cloudflare WARP egress на exit-ноде и агрессивный QUIC-маскарад для мобильного DPI. Рецепт ниже — ровно та связка, которую мы подняли вживую: клиенты подключаются к **Ноде 2** на UDP 500, трафик идёт через **Ноду 1**, а наружу выходит через **Cloudflare WARP** — внешние сайты видят IP Cloudflare, не VPS.
+>
+> Нужно: **2 VPS** (Ubuntu 24.04/25.10 или Debian 12/13), root-доступ по SSH. Обозначим Ноду 1 (exit) как `IP1`, Ноду 2 (entry) как `IP2`.
+
+### 1. На обеих нодах — клонируй форк
+
+```bash
+git clone https://github.com/SNPR/amneziawg-installer.git /root/amneziawg-installer
+cd /root/amneziawg-installer
+```
+
+Важно: клонируй именно в `/root/amneziawg-installer` (не в `/root/awg` — там рабочая директория установщика). Скрипт сам увидит локальный клон и возьмёт `awg_common.sh` / `manage_amneziawg.sh` прямо из него, без скачивания из CDN.
+
+### 2. На Ноде 1 (exit) — AWG-сервер с WARP egress
+
+```bash
+sudo bash install_amneziawg.sh \
+  --role=exit \
+  --subnet=10.9.0.1/24 \
+  --egress=warp \
+  --yes
+```
+
+Скрипт сам поставит wgcf, зарегистрирует бесплатный Cloudflare WARP, настроит policy-routing — все пакеты клиентов будут уходить наружу через WARP. Если запросит перезагрузку (1–2 раза) — соглашайся и запусти **ту же команду** после ребута.
+
+После установки — сгенерируй конфиг, которым Нода 2 будет подключаться к Ноде 1, и скопируй его:
+
+```bash
+sudo bash /root/awg/manage_amneziawg.sh add hop_to_entry
+scp /root/awg/hop_to_entry.conf root@<IP2>:/root/
+```
+
+### 3. На Ноде 2 (entry) — AWG-сервер для клиентов + каскад
+
+```bash
+sudo bash install_amneziawg.sh \
+  --role=entry \
+  --upstream-conf=/root/hop_to_entry.conf \
+  --subnet=10.8.0.1/24 \
+  --route-all \
+  --preset=mobile \
+  --port=500 \
+  --i1-mode=quic \
+  --yes
+```
+
+Пояснения по флагам:
+
+- `--route-all` — в клиентских конфигах будет `AllowedIPs = 0.0.0.0/0`. Без этого мобильные клиенты часто не ставят default-route, и трафик утекает мимо VPN.
+- `--preset=mobile` — Jc=3 и узкий Jmax (≤130). Оптимальный профиль обфускации для Tele2, Yota, Мегафон и других операторов, режущих AWG с Jc>3 / Jmax>300.
+- `--port=500` — UDP 500 (IKE/NAT-T). Мобильные операторы почти не фильтруют его, потому что через него работают нативные iOS/Android VPN.
+- `--i1-mode=quic` — в клиентский `.conf` добавляется ~1150-байтный фейковый заголовок QUIC v1 Initial-пакета. DPI видит `0xc?000000 01 ...`, принимает за обычный QUIC-трафик и пропускает.
+
+### 4. Забери клиентский конфиг и импортируй
+
+```bash
+# На локальной машине:
+scp root@<IP2>:/root/awg/my_phone.conf .
+scp root@<IP2>:/root/awg/my_phone.png .
+scp root@<IP2>:/root/awg/my_phone.vpnuri .
+```
+
+На телефоне в **Amnezia VPN ≥ 4.8.12.7** — импортируй QR (`my_phone.png`) или deep-link (`vpn://...` из `.vpnuri`).
+
+### ⚠️ Критически важно — проверь настройки Amnezia VPN на телефоне
+
+В настройках приложения найди режим туннелирования / split-tunneling / список приложений. Должен быть выставлен **«Весь трафик через VPN»** (All apps / Tunnel all traffic). Если там включён split-tunneling с white/blacklist'ом приложений — твой браузер/curl могут быть исключены, и трафик пойдёт мимо VPN, даже если VPN показывает «подключено». Это самая частая причина «не работает» при работающей инфраструктуре.
+
+### 5. Проверка с телефона
+
+Подключись к VPN, открой браузер или Termux:
+
+```
+curl -4 -m 10 ifconfig.me
+```
+
+Должен вернуть **IP Cloudflare** (диапазон `104.x` или `162.x`). Это подтверждает всю цепочку: **клиент → Нода 2 (AWG/QUIC) → Нода 1 (каскад) → WARP → интернет**.
+
+Опционально на https://ipleak.net — убедиться что ни v4, ни DNS не утекают мимо Cloudflare.
+
+### Полное руководство
+
+Все детали (диагностика, MTU, замена портов, управление клиентами, uninstall) — в [MULTIHOP.md](MULTIHOP.md).
+
+---
+
 <a id="quickstart"></a>
-## 🚀 Быстрый старт
+## 🚀 Быстрый старт (upstream single-node, без форка)
 
 ```bash
 wget https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.10.0/install_amneziawg.sh
