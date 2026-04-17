@@ -976,9 +976,25 @@ setup_warp_egress() {
     # чтобы не снести wgcf пользователя если он был до нас)
     touch "$marker" 2>/dev/null || log_warn "Не создан маркер $marker"
 
+    # Upstream WireGuard module для wg-quick@wgcf. amneziawg — отдельный модуль,
+    # его загрузка не подтягивает `wireguard`, без которого `ip link add dev
+    # wgcf type wireguard` падает. На Ubuntu 24.04/Debian 13 модуль встроен в
+    # ядро или доступен из linux-modules — modprobe обычно работает без доп.
+    # пакетов. Не фейлим установку если modprobe упал: wg-quick сам попробует.
+    if ! lsmod 2>/dev/null | grep -q -w wireguard; then
+        log "Загрузка модуля wireguard (нужен для wg-quick@wgcf)..."
+        modprobe wireguard 2>/dev/null || log_warn "modprobe wireguard не удался — wg-quick попробует сам."
+    fi
+
     log "Запуск wg-quick@wgcf..."
-    if ! systemctl enable --now wg-quick@wgcf 2>/dev/null; then
+    local _sc_err
+    _sc_err=$(awg_mktemp) || _sc_err="/tmp/wgcf_systemctl.err.$$"
+    if ! systemctl enable --now wg-quick@wgcf 2>"$_sc_err"; then
         log_error "systemctl enable --now wg-quick@wgcf упал"
+        [[ -s "$_sc_err" ]] && while IFS= read -r _ln; do log_error "  $_ln"; done < "$_sc_err"
+        # Дамп статуса сервиса для диагностики (ExecStart exit code, logs)
+        systemctl status wg-quick@wgcf --no-pager -l 2>&1 | head -30 \
+            | while IFS= read -r _ln; do log_error "status: $_ln"; done
         return 1
     fi
 
@@ -991,7 +1007,13 @@ setup_warp_egress() {
         fi
         sleep 1
     done
-    log_error "Интерфейс wgcf так и не поднялся. Проверьте: systemctl status wg-quick@wgcf"
+    log_error "Интерфейс wgcf так и не поднялся за 5 сек."
+    log_error "systemctl status wg-quick@wgcf:"
+    systemctl status wg-quick@wgcf --no-pager -l 2>&1 | head -30 \
+        | while IFS= read -r _ln; do log_error "  $_ln"; done
+    log_error "journalctl -u wg-quick@wgcf -n 20:"
+    journalctl -u wg-quick@wgcf -n 20 --no-pager 2>&1 \
+        | while IFS= read -r _ln; do log_error "  $_ln"; done
     return 1
 }
 

@@ -979,9 +979,26 @@ setup_warp_egress() {
     # avoid destroying a user's pre-existing wgcf deployment)
     touch "$marker" 2>/dev/null || log_warn "Failed to create marker $marker"
 
+    # Upstream WireGuard module needed by wg-quick@wgcf. The amneziawg module
+    # is separate and does NOT pull `wireguard` with it, without which
+    # `ip link add dev wgcf type wireguard` fails. On Ubuntu 24.04 / Debian 13
+    # the module is either built-in or available from linux-modules —
+    # modprobe usually works without extra packages. Don't fail if modprobe
+    # errors out: wg-quick will try it again itself.
+    if ! lsmod 2>/dev/null | grep -q -w wireguard; then
+        log "Loading wireguard module (required by wg-quick@wgcf)..."
+        modprobe wireguard 2>/dev/null || log_warn "modprobe wireguard failed — wg-quick will retry."
+    fi
+
     log "Starting wg-quick@wgcf..."
-    if ! systemctl enable --now wg-quick@wgcf 2>/dev/null; then
+    local _sc_err
+    _sc_err=$(awg_mktemp) || _sc_err="/tmp/wgcf_systemctl.err.$$"
+    if ! systemctl enable --now wg-quick@wgcf 2>"$_sc_err"; then
         log_error "systemctl enable --now wg-quick@wgcf failed"
+        [[ -s "$_sc_err" ]] && while IFS= read -r _ln; do log_error "  $_ln"; done < "$_sc_err"
+        # Dump the unit status for diagnostics (ExecStart exit code, logs)
+        systemctl status wg-quick@wgcf --no-pager -l 2>&1 | head -30 \
+            | while IFS= read -r _ln; do log_error "status: $_ln"; done
         return 1
     fi
 
@@ -994,7 +1011,13 @@ setup_warp_egress() {
         fi
         sleep 1
     done
-    log_error "wgcf interface never came up. Check: systemctl status wg-quick@wgcf"
+    log_error "wgcf interface never came up within 5 s."
+    log_error "systemctl status wg-quick@wgcf:"
+    systemctl status wg-quick@wgcf --no-pager -l 2>&1 | head -30 \
+        | while IFS= read -r _ln; do log_error "  $_ln"; done
+    log_error "journalctl -u wg-quick@wgcf -n 20:"
+    journalctl -u wg-quick@wgcf -n 20 --no-pager 2>&1 \
+        | while IFS= read -r _ln; do log_error "  $_ln"; done
     return 1
 }
 
