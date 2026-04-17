@@ -2111,10 +2111,43 @@ verify_sha256() {
 
 step5_download_scripts() {
     update_state 5
-    log "### STEP 5: Downloading management scripts ###"
+    log "### STEP 5: Installing management scripts ###"
     cd "$AWG_DIR" || die "Error changing to $AWG_DIR"
 
-    # Downloading awg_common.sh
+    # Local path PREFERRED: if the installer is launched from a cloned
+    # repository (i.e. awg_common.sh / manage_amneziawg.sh live next to
+    # install_amneziawg.sh — which is EXACTLY the version the user wants),
+    # use them directly without hitting the network or SHA256 verification.
+    # This makes the workflow "git clone → sudo bash install_amneziawg.sh"
+    # work for forks: without this branch step5 would fetch upstream
+    # versions from the CDN and our local fork modifications would be
+    # silently discarded. The CDN path remains as a fallback for
+    # `curl | bash` usage.
+    local script_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
+    fi
+    # Derive basenames from the URLs — the EN installer references *_en.sh
+    # files, and those are what sits next to install_amneziawg_en.sh in a clone.
+    local _common_basename="${COMMON_SCRIPT_URL##*/}"
+    local _manage_basename="${MANAGE_SCRIPT_URL##*/}"
+    if [[ -n "$script_dir" && "$script_dir" != "$AWG_DIR" \
+          && -f "$script_dir/$_common_basename" \
+          && -f "$script_dir/$_manage_basename" ]]; then
+        log "Found local clone ($script_dir) — using files from there."
+        cp "$script_dir/$_common_basename" "$COMMON_SCRIPT_PATH" \
+            || die "Failed to copy $_common_basename"
+        cp "$script_dir/$_manage_basename" "$MANAGE_SCRIPT_PATH" \
+            || die "Failed to copy $_manage_basename"
+        chmod 700 "$COMMON_SCRIPT_PATH" "$MANAGE_SCRIPT_PATH" \
+            || log_warn "chmod on local scripts failed"
+        log "Scripts installed from local clone (SHA256 check skipped — files are trusted)."
+        log "Step 5 completed."
+        update_state 6
+        return 0
+    fi
+
+    # Fallback: download from CDN (upstream release)
     log "Downloading $COMMON_SCRIPT_PATH..."
     if curl -fLso "$COMMON_SCRIPT_PATH" --max-time 60 --retry 2 "$COMMON_SCRIPT_URL"; then
         chmod 700 "$COMMON_SCRIPT_PATH" || die "chmod awg_common.sh error"

@@ -2101,10 +2101,42 @@ verify_sha256() {
 
 step5_download_scripts() {
     update_state 5
-    log "### ШАГ 5: Скачивание скриптов управления ###"
+    log "### ШАГ 5: Установка скриптов управления ###"
     cd "$AWG_DIR" || die "Ошибка перехода в $AWG_DIR"
 
-    # Скачивание awg_common.sh
+    # Локальный путь ПРЕФЕРЕН: если installer запущен из склонированного
+    # репозитория (т.е. рядом с install_amneziawg.sh лежат awg_common.sh и
+    # manage_amneziawg.sh — ИМЕННО те версии, которые пользователь хочет),
+    # используем их напрямую без обращения в сеть и без SHA256-проверки.
+    # Это делает workflow "git clone → sudo bash install_amneziawg.sh"
+    # рабочим для форков: без этого ветвления step5 тянул бы upstream-версии
+    # из CDN, а наши локальные модификации в форке игнорировались бы.
+    # CDN остаётся как fallback для `curl | bash` сценария.
+    local script_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
+    fi
+    # basename'ы берём из URL — EN-инсталлятор ссылается на *_en.sh файлы,
+    # и рядом с install_amneziawg_en.sh в клоне лежат именно они.
+    local _common_basename="${COMMON_SCRIPT_URL##*/}"
+    local _manage_basename="${MANAGE_SCRIPT_URL##*/}"
+    if [[ -n "$script_dir" && "$script_dir" != "$AWG_DIR" \
+          && -f "$script_dir/$_common_basename" \
+          && -f "$script_dir/$_manage_basename" ]]; then
+        log "Найден локальный клон ($script_dir) — использую файлы оттуда."
+        cp "$script_dir/$_common_basename" "$COMMON_SCRIPT_PATH" \
+            || die "Ошибка копирования $_common_basename"
+        cp "$script_dir/$_manage_basename" "$MANAGE_SCRIPT_PATH" \
+            || die "Ошибка копирования $_manage_basename"
+        chmod 700 "$COMMON_SCRIPT_PATH" "$MANAGE_SCRIPT_PATH" \
+            || log_warn "Ошибка chmod локальных скриптов"
+        log "Скрипты установлены из локального клона (SHA256-проверка пропущена — файлы доверенные)."
+        log "Шаг 5 завершен."
+        update_state 6
+        return 0
+    fi
+
+    # Fallback: скачивание из CDN (upstream-релиз)
     log "Скачивание $COMMON_SCRIPT_PATH..."
     if curl -fLso "$COMMON_SCRIPT_PATH" --max-time 60 --retry 2 "$COMMON_SCRIPT_URL"; then
         chmod 700 "$COMMON_SCRIPT_PATH" || die "Ошибка chmod awg_common.sh"

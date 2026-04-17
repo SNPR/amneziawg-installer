@@ -28,11 +28,22 @@ Both nodes default to the same subnet `10.9.9.0/24`. It will work, but debugging
 
 ---
 
+## First — clone the fork on both nodes
+
+**Important:** clone the fork into a path that is **NOT** `/root/awg` (that's the installer's working directory). Standard layout:
+
+```bash
+git clone https://github.com/SNPR/amneziawg-installer.git /root/amneziawg-installer
+cd /root/amneziawg-installer
+```
+
+In step 5 the installer detects that `awg_common.sh` and `manage_amneziawg.sh` live next to it and uses those directly — **no upstream CDN download**. Our `--role=entry` and `--egress=warp` changes are guaranteed to land on the target node.
+
 ## Node 1 (exit) — the "egress" server
 
 On the exit node you can use **the original upstream script** ([bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer)) without our modifications — a plain AmneziaWG 2.0 server is all it needs, nothing cascade-specific. If you prefer consistency, run our fork with `--role=exit` — the resulting config will be identical (the `--role=exit` flag just stamps the role into `awgsetup_cfg.init` for bookkeeping).
 
-**Step A.** Install (single command):
+**Step A.** Install (single command from the clone directory):
 
 ```bash
 sudo bash install_amneziawg_en.sh \
