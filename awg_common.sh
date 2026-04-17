@@ -972,6 +972,54 @@ setup_warp_egress() {
         log "Table=off добавлен в $warp_conf"
     fi
 
+    # Стрипаем IPv6 из Address-строк. wgcf generate пишет
+    #   Address = 172.16.0.2/32, 2606:4700:...:6d74/128
+    # При DISABLE_IPV6=1 (наш дефолт) net.ipv6.conf.all.disable_ipv6 отключает
+    # v6 на всех интерфейсах, и `ip -6 address add` в wg-quick падает с
+    # "IPv6 is disabled on this device" — весь wg-quick@wgcf срывается.
+    # Для нашей схемы v6 не нужен: policy routing `ip rule from <подсеть>`
+    # на v4, клиентский AWG-трафик тоже v4 (см. render_server_config).
+    # Идемпотентно: если Address уже v4-only, awk просто перевыписывает без
+    # изменений.
+    local v6tmp
+    v6tmp=$(awg_mktemp) || { log_error "mktemp"; return 1; }
+    # had_v6 живёт в awk-скрипте; его значение пробрасывается наружу через
+    # exit code (10 если в Address был IPv6, 0 если не было)
+    awk '
+        /^[[:space:]]*Address[[:space:]]*=/ {
+            sub(/^[[:space:]]*Address[[:space:]]*=[[:space:]]*/, "")
+            n = split($0, parts, /[[:space:]]*,[[:space:]]*/)
+            out = ""
+            for (i = 1; i <= n; i++) {
+                p = parts[i]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", p)
+                if (p == "") continue
+                # v4: содержит точку, без двоеточия; v6: есть двоеточие
+                if (p ~ /:/) { had_v6 = 1; continue }
+                out = (out ? out ", " : "") p
+            }
+            if (out != "") print "Address = " out
+            # если v4 не было — строка вовсе выкидывается (деградируем в no-address,
+            # что вряд ли случится — wgcf всегда даёт хоть один v4)
+            next
+        }
+        { print }
+        END { exit had_v6 ? 10 : 0 }
+    ' "$warp_conf" > "$v6tmp"
+    local _awk_rc=$?
+    if [[ $_awk_rc -eq 10 ]]; then
+        mv "$v6tmp" "$warp_conf" && chmod 600 "$warp_conf" \
+            || { rm -f "$v6tmp"; log_error "не удалось записать $warp_conf без IPv6"; return 1; }
+        log "IPv6 убран из Address в $warp_conf (host без v6)."
+    elif [[ $_awk_rc -eq 0 ]]; then
+        # v6 не было — просто оставляем исходный файл
+        rm -f "$v6tmp"
+    else
+        rm -f "$v6tmp"
+        log_error "awk на $warp_conf вернул rc=$_awk_rc"
+        return 1
+    fi
+
     # Маркер того что wgcf поднят нашим инсталлятором (нужен для uninstall —
     # чтобы не снести wgcf пользователя если он был до нас)
     touch "$marker" 2>/dev/null || log_warn "Не создан маркер $marker"

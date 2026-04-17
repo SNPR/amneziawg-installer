@@ -975,6 +975,54 @@ setup_warp_egress() {
         log "Table=off added to $warp_conf"
     fi
 
+    # Strip IPv6 from Address lines. wgcf generate writes
+    #   Address = 172.16.0.2/32, 2606:4700:...:6d74/128
+    # With DISABLE_IPV6=1 (our default) net.ipv6.conf.all.disable_ipv6 shuts
+    # v6 off on every interface, and `ip -6 address add` inside wg-quick
+    # fails with "IPv6 is disabled on this device", taking the whole
+    # wg-quick@wgcf service down with it. We don't need v6 for this setup:
+    # the policy routing `ip rule from <subnet>` uses v4, and the client
+    # AWG traffic is v4 too (see render_server_config). Idempotent: if
+    # Address is already v4-only, awk just writes it back unchanged.
+    local v6tmp
+    v6tmp=$(awg_mktemp) || { log_error "mktemp"; return 1; }
+    # had_v6 is awk-local; its value bubbles out as the awk exit code
+    # (10 when there was IPv6 in Address, 0 otherwise)
+    awk '
+        /^[[:space:]]*Address[[:space:]]*=/ {
+            sub(/^[[:space:]]*Address[[:space:]]*=[[:space:]]*/, "")
+            n = split($0, parts, /[[:space:]]*,[[:space:]]*/)
+            out = ""
+            for (i = 1; i <= n; i++) {
+                p = parts[i]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", p)
+                if (p == "") continue
+                # v4: has a dot, no colon; v6: has a colon
+                if (p ~ /:/) { had_v6 = 1; continue }
+                out = (out ? out ", " : "") p
+            }
+            if (out != "") print "Address = " out
+            # if there was no v4 at all the line is dropped (not realistic —
+            # wgcf always includes a v4 entry)
+            next
+        }
+        { print }
+        END { exit had_v6 ? 10 : 0 }
+    ' "$warp_conf" > "$v6tmp"
+    local _awk_rc=$?
+    if [[ $_awk_rc -eq 10 ]]; then
+        mv "$v6tmp" "$warp_conf" && chmod 600 "$warp_conf" \
+            || { rm -f "$v6tmp"; log_error "could not write $warp_conf without IPv6"; return 1; }
+        log "IPv6 stripped from Address in $warp_conf (host has v6 off)."
+    elif [[ $_awk_rc -eq 0 ]]; then
+        # No v6 to strip — leave the original file as-is
+        rm -f "$v6tmp"
+    else
+        rm -f "$v6tmp"
+        log_error "awk on $warp_conf returned rc=$_awk_rc"
+        return 1
+    fi
+
     # Marker that wgcf was raised by our installer (needed by uninstall to
     # avoid destroying a user's pre-existing wgcf deployment)
     touch "$marker" 2>/dev/null || log_warn "Failed to create marker $marker"
