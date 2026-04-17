@@ -1,5 +1,5 @@
 <p align="center">
-  <b>RU</b> Русский | <b>EN</b> <a href="MULTIHOP.en.md">English</a> (TODO)
+  <b>RU</b> Русский | <b>EN</b> <a href="MULTIHOP.en.md">English</a>
 </p>
 
 # Multi-hop (каскад) из двух AmneziaWG-серверов

@@ -14,6 +14,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Cloudflare WARP egress for exit- and single-nodes.** New flag `--egress=direct|warp` (default `direct`). With `--egress=warp` the installer:
+  1. Downloads [wgcf](https://github.com/ViRb3/wgcf) (multi-arch: amd64 / arm64 / armv7) from GitHub Releases.
+  2. Runs `wgcf register --accept-tos` and `wgcf generate`, placing the profile at `/etc/wireguard/wgcf.conf`.
+  3. Patches the profile: `Table = off` (critical — otherwise the host default route moves into WARP and SSH dies) and strips `DNS =` (so `resolv.conf` isn't hijacked).
+  4. Enables `wg-quick@wgcf` and adds to `awg0.conf`'s PostUp/PostDown: `ip rule from <AWG_TUNNEL_SUBNET> table <N> priority <P>`, `ip route replace default dev wgcf table <N>`, `MASQUERADE -o wgcf`, `TCPMSS --clamp-mss-to-pmtu`. External sites see a Cloudflare IP, not the VPS IP.
+- **Companion flags:** `--warp-table=N` (default `2408`, WARP UDP port used as a mnemonic), `--warp-priority=N` (default `789`). A collision with `--upstream-table` is rejected during validation.
+- **`AWG_EGRESS=warp` + `AWG_ROLE=entry` explicitly rejected** — on the entry node egress is already delegated to the upstream, WARP there would be a pointless third wrapper.
+- **UFW:** next to the existing `ufw route allow in on awg0 out on <nic>` rule a `ufw route allow in on awg0 out on wgcf` is added when egress=warp.
+- **Uninstall** stops and removes `wg-quick@wgcf` / `wgcf.conf` / `wgcf-account.toml` / `/usr/local/bin/wgcf` only when the marker `$AWG_DIR/.wgcf_enabled_by_installer` is present — protects a user's pre-existing wgcf from destructive removal.
+- **Tests:** `tests/test_warp_egress.bats` — 5 cases (PostUp/PostDown rendering with correct `ip rule`/`ip route`/`MASQUERADE -o wgcf`/TCPMSS, fallback to NIC MASQUERADE in `direct` mode, precedence of `role=entry` over `AWG_EGRESS=warp` when both end up in the config file, loading of `AWG_EGRESS`/`AWG_WARP_*` via `safe_load_config`, custom table/priority).
 - **Out-of-the-box multi-hop / cascade of two AWG servers.** New installer CLI flags: `--role=single|exit|entry` (default `single` — existing behaviour unchanged), `--upstream-conf=<file>` (required when `role=entry`), `--upstream-iface=<name>` (default `awg1`), `--upstream-table=<N>` (default `123`), `--upstream-fwmark=<hex>` (default `0xca6d` — distinct from wg-quick's `0xca6c` to avoid policy-rule clashes).
   - On the exit node: ordinary install (`--role=exit`), then `manage add <name>` produces a client `.conf` for the entry node that gets copied over.
   - On the entry node: `install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --yes` brings up `awg0` (for clients) and `awg1` (upstream client to exit) in one command, with policy-routing of client traffic into `awg1`, MASQUERADE on `awg1`, and TCPMSS clamp on SYN (without it, nested encapsulation truncates handshakes on some HTTPS sites).
@@ -27,7 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Server PostUp / PostDown for `role=entry`** now differs completely from `role=single`/`exit`: instead of MASQUERADE on the external NIC it installs FORWARD between `awg0` and `awg1` plus a TCPMSS clamp on SYN/RST in mangle. MASQUERADE is performed on the upstream side (`awg1`) so the exit server does not drop packets by cryptokey-routing AllowedIPs.
 - **The UFW rule `ufw route allow in on awg0 out on <nic>`** is not added when `role=entry` (traffic egresses via `awg1`); instead `ufw route allow in on awg0 out on <upstream-iface>` is added when the second service starts.
-- **Uninstall** now also stops and disables `awg-quick@<upstream-iface>` when the stored config says `role=entry`.
+- **Uninstall** now also stops and disables `awg-quick@<upstream-iface>` when the stored config says `role=entry`, and `wg-quick@wgcf` when our installer brought WARP up.
 
 ---
 

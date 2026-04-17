@@ -193,7 +193,8 @@ safe_load_config() {
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
-                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY)
+                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
+                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY)
                     export "$key=$value"
                     ;;
             esac
@@ -437,12 +438,14 @@ render_server_config() {
         return 1
     }
 
-    # PostUp/PostDown rules for routing.
-    # role=entry: client traffic is forwarded into the second tunnel
-    # ($AWG_UPSTREAM_IFACE, usually awg1), so MASQUERADE on $nic is NOT needed
-    # (done on the exit node). We add FORWARD accept to awg1 and reverse
-    # conntrack state + TCPMSS clamp: without clamp, nested encapsulation
-    # truncates SYNs for some HTTPS sites (see multi-hop guides).
+    # PostUp/PostDown rules for routing. Three modes:
+    #   role=entry          — FORWARD into $AWG_UPSTREAM_IFACE + TCPMSS clamp;
+    #                         MASQUERADE is performed on the upstream side
+    #   egress=warp         — policy-route the client subnet into Cloudflare
+    #                         WARP (wg-quick@wgcf with Table=off) via a
+    #                         dedicated table; the NIC stays free for the
+    #                         node's own egress (SSH, apt)
+    #   plain mode          — FORWARD + MASQUERADE on the primary NIC
     local postup postdown
     if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
         local up_iface="${AWG_UPSTREAM_IFACE:-awg1}"
@@ -452,13 +455,33 @@ render_server_config() {
         postdown="iptables -D FORWARD -i %i -o ${up_iface} -j ACCEPT"
         postdown="${postdown}; iptables -D FORWARD -i ${up_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
         postdown="${postdown}; iptables -t mangle -D FORWARD -o ${up_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+    elif [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        local warp_iface="${AWG_WARP_IFACE:-wgcf}"
+        local warp_tbl="${AWG_WARP_TABLE:-2408}"
+        local warp_prio="${AWG_WARP_PRIORITY:-789}"
+        # Clients arrive from AWG_TUNNEL_SUBNET (after MASQUERADE on entry in
+        # a cascade, or straight from the client in single mode). The from-rule
+        # only catches them; the server's own traffic uses the main table.
+        postup="ip route replace default dev ${warp_iface} table ${warp_tbl}"
+        postup="${postup}; ip rule add from ${server_ip%.*}.0/${subnet_mask} table ${warp_tbl} priority ${warp_prio}"
+        postup="${postup}; iptables -I FORWARD -i %i -o ${warp_iface} -j ACCEPT"
+        postup="${postup}; iptables -I FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postup="${postup}; iptables -t nat -A POSTROUTING -o ${warp_iface} -j MASQUERADE"
+        postup="${postup}; iptables -t mangle -A FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="iptables -t mangle -D FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="${postdown}; iptables -t nat -D POSTROUTING -o ${warp_iface} -j MASQUERADE"
+        postdown="${postdown}; iptables -D FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postdown="${postdown}; iptables -D FORWARD -i %i -o ${warp_iface} -j ACCEPT"
+        postdown="${postdown}; ip rule del from ${server_ip%.*}.0/${subnet_mask} table ${warp_tbl} priority ${warp_prio}"
+        postdown="${postdown}; ip route del default dev ${warp_iface} table ${warp_tbl}"
     else
         postup="iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
         postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
 
-    # IPv6 rules if not disabled
-    if [[ "${DISABLE_IPV6:-1}" -eq 0 && "${AWG_ROLE:-single}" != "entry" ]]; then
+    # IPv6 rules if not disabled (only in plain mode; WARP and entry egress
+    # go via v4, IPv6 forwarding there makes no real sense)
+    if [[ "${DISABLE_IPV6:-1}" -eq 0 && "${AWG_ROLE:-single}" != "entry" && "${AWG_EGRESS:-direct}" != "warp" ]]; then
         postup="${postup}; ip6tables -I FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
         postdown="${postdown}; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
@@ -812,6 +835,155 @@ render_upstream_config() {
     chmod 600 "$out_conf"
     log "Upstream interface ${iface} written: $out_conf (table=${tbl}, fwmark=${fwmark})"
     return 0
+}
+
+# ==============================================================================
+# WARP egress: route client traffic through Cloudflare WARP
+# ==============================================================================
+#
+# Used on role=exit / role=single when the operator wants external sites to
+# see a Cloudflare IP instead of the VPS IP. Implementation:
+#
+#   1. wgcf is fetched from github.com/ViRb3/wgcf (prebuilt binaries for
+#      amd64/arm64/armv7). TLS is verified by curl; we do NOT pin SHA256 —
+#      wgcf releases are signed by the author and change often, a pin would
+#      quickly drift.
+#   2. `wgcf register` creates a free WARP Cloudflare account (account.toml).
+#   3. `wgcf generate` produces a wg-quick config with real account keys.
+#   4. We patch the config: Table=off (do NOT touch the host default route —
+#      otherwise SSH dies) and strip DNS=... (otherwise resolv.conf is
+#      overwritten with WARP's).
+#   5. Enable wg-quick@wgcf — wgcf link comes up without installing routes
+#      into the main table thanks to Table=off.
+#
+# The concrete iptables/ip rule rules that steer clients into wgcf live in
+# awg0's PostUp/PostDown (see render_server_config, AWG_EGRESS=warp branch).
+# This function prepares only the wgcf side.
+
+# Download the wgcf binary from GitHub Releases for the current arch.
+# Idempotent: if /usr/local/bin/wgcf is already present, does nothing.
+_download_wgcf_binary() {
+    if command -v wgcf >/dev/null 2>&1; then
+        log_debug "wgcf already installed: $(command -v wgcf)"
+        return 0
+    fi
+    local arch url
+    case "$(uname -m)" in
+        x86_64|amd64)   arch="amd64" ;;
+        aarch64|arm64)  arch="arm64" ;;
+        armv7l|armv7)   arch="armv7" ;;
+        *) log_error "Architecture $(uname -m) is not supported by wgcf"; return 1 ;;
+    esac
+    # GitHub API returns JSON with assets; grab browser_download_url for arch
+    url=$(curl -fsSL --max-time 15 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
+        | grep '"browser_download_url"' \
+        | grep -E "linux_${arch}\"?$" \
+        | head -1 \
+        | sed -E 's/.*"(https[^"]+)".*/\1/')
+    if [[ -z "$url" ]]; then
+        log_error "Could not find a wgcf release for arch=${arch} via GitHub API"
+        return 1
+    fi
+    log "Downloading wgcf: $url"
+    if ! curl -fsSL --max-time 60 --retry 2 -o /usr/local/bin/wgcf "$url"; then
+        log_error "Failed to download wgcf"
+        rm -f /usr/local/bin/wgcf
+        return 1
+    fi
+    chmod 0755 /usr/local/bin/wgcf || { log_error "chmod wgcf"; return 1; }
+    log "wgcf installed: /usr/local/bin/wgcf"
+    return 0
+}
+
+# Register the Cloudflare WARP account and generate wgcf.conf with Table=off.
+# Idempotent: if both files already exist, only verifies/restores Table=off.
+setup_warp_egress() {
+    local warp_conf="/etc/wireguard/wgcf.conf"
+    local warp_account="/etc/wireguard/wgcf-account.toml"
+    local marker="${AWG_DIR}/.wgcf_enabled_by_installer"
+
+    if [[ "${AWG_EGRESS:-direct}" != "warp" ]]; then
+        log_debug "setup_warp_egress: AWG_EGRESS != warp, skipping"
+        return 0
+    fi
+
+    _download_wgcf_binary || return 1
+
+    mkdir -p /etc/wireguard || { log_error "mkdir /etc/wireguard"; return 1; }
+    chmod 700 /etc/wireguard
+
+    # Account registration (only if account.toml is missing)
+    if [[ ! -f "$warp_account" ]]; then
+        log "Registering WARP account via wgcf..."
+        # wgcf >=2.2 supports --accept-tos; older builds need "yes" on stdin.
+        # Cover both with a single fallback chain.
+        if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register --accept-tos >/dev/null 2>&1); then
+            if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register >/dev/null 2>&1); then
+                log_error "wgcf register failed. Check reachability of api.cloudflareclient.com"
+                return 1
+            fi
+        fi
+        [[ -f "$warp_account" ]] || {
+            log_error "wgcf register finished but $warp_account was not created"
+            return 1
+        }
+        chmod 600 "$warp_account"
+    else
+        log_debug "WARP account already registered ($warp_account)"
+    fi
+
+    # Profile generation (only if missing)
+    if [[ ! -f "$warp_conf" ]]; then
+        log "Generating WARP config..."
+        ( cd /etc/wireguard && rm -f wgcf-profile.conf && wgcf generate >/dev/null 2>&1 ) || {
+            log_error "wgcf generate failed"
+            return 1
+        }
+        [[ -f /etc/wireguard/wgcf-profile.conf ]] || {
+            log_error "wgcf generate did not create wgcf-profile.conf"
+            return 1
+        }
+        mv /etc/wireguard/wgcf-profile.conf "$warp_conf"
+        chmod 600 "$warp_conf"
+    else
+        log_debug "WARP config already exists ($warp_conf)"
+    fi
+
+    # Patch: Table=off (mandatory — otherwise the host default route migrates
+    # into wgcf and SSH drops) + strip DNS=... (so resolv.conf isn't hijacked)
+    sed -i '/^DNS[[:space:]]*=/d' "$warp_conf" || log_warn "sed DNS strip"
+    if ! grep -qE '^Table[[:space:]]*=[[:space:]]*off$' "$warp_conf"; then
+        # Insert Table=off right after [Interface]
+        local tmp
+        tmp=$(awg_mktemp) || { log_error "mktemp"; return 1; }
+        awk '/^\[Interface\]/{print; print "Table = off"; next} {print}' "$warp_conf" > "$tmp" \
+            && mv "$tmp" "$warp_conf" \
+            || { rm -f "$tmp"; log_error "could not add Table=off"; return 1; }
+        chmod 600 "$warp_conf"
+        log "Table=off added to $warp_conf"
+    fi
+
+    # Marker that wgcf was raised by our installer (needed by uninstall to
+    # avoid destroying a user's pre-existing wgcf deployment)
+    touch "$marker" 2>/dev/null || log_warn "Failed to create marker $marker"
+
+    log "Starting wg-quick@wgcf..."
+    if ! systemctl enable --now wg-quick@wgcf 2>/dev/null; then
+        log_error "systemctl enable --now wg-quick@wgcf failed"
+        return 1
+    fi
+
+    # Wait for the interface (up to 5 s)
+    local _i
+    for _i in 1 2 3 4 5; do
+        if ip link show wgcf >/dev/null 2>&1; then
+            log "wgcf interface is up."
+            return 0
+        fi
+        sleep 1
+    done
+    log_error "wgcf interface never came up. Check: systemctl status wg-quick@wgcf"
+    return 1
 }
 
 # ==============================================================================

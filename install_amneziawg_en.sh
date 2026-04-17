@@ -44,6 +44,8 @@ CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS
 # Multi-hop / cascade: node role and upstream tunnel parameters (for role=entry)
 CLI_ROLE=""; CLI_UPSTREAM_CONF=""; CLI_UPSTREAM_IFACE=""
 CLI_UPSTREAM_TABLE=""; CLI_UPSTREAM_FWMARK=""
+# WARP egress: route client traffic through Cloudflare WARP (for role=exit|single)
+CLI_EGRESS=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
@@ -82,6 +84,9 @@ while [[ $# -gt 0 ]]; do
         --upstream-iface=*)   CLI_UPSTREAM_IFACE="${1#*=}" ;;
         --upstream-table=*)   CLI_UPSTREAM_TABLE="${1#*=}" ;;
         --upstream-fwmark=*)  CLI_UPSTREAM_FWMARK="${1#*=}" ;;
+        --egress=*)           CLI_EGRESS="${1#*=}" ;;
+        --warp-table=*)       CLI_WARP_TABLE="${1#*=}" ;;
+        --warp-priority=*)    CLI_WARP_PRIORITY="${1#*=}" ;;
         *) echo "Unknown argument: $1"; HELP=1 ;;
     esac
     shift
@@ -172,6 +177,15 @@ Multi-hop (cascade of two AWG servers):
   --upstream-table=N    routing table for client traffic (default 123)
   --upstream-fwmark=HEX fwmark for upstream packets (default 0xca6d)
 
+WARP egress (for role=exit or single — NOT compatible with role=entry):
+  --egress=MODE         direct (default) | warp
+                        warp: installs wgcf (Cloudflare WARP WireGuard client),
+                        brings up wg-quick@wgcf with Table=off, and policy-routes
+                        AWG client traffic into WARP. External sites see a
+                        Cloudflare IP instead of the VPS IP.
+  --warp-table=N        routing table for WARP traffic (default 2408)
+  --warp-priority=N     ip rule priority for WARP (default 789)
+
 Examples:
   sudo bash install_amneziawg_en.sh                             # Interactive installation
   sudo bash install_amneziawg_en.sh --port=51820 --route-all    # Non-interactive
@@ -179,6 +193,8 @@ Examples:
   sudo bash install_amneziawg_en.sh --preset=mobile --yes       # Optimized for mobile networks
   sudo bash install_amneziawg_en.sh --role=exit --yes           # Cascade exit node
   sudo bash install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --yes
+  sudo bash install_amneziawg_en.sh --egress=warp --yes         # Standalone server with WARP egress
+  sudo bash install_amneziawg_en.sh --role=exit --egress=warp --yes   # Cascade exit with WARP egress
   sudo bash install_amneziawg_en.sh --uninstall                 # Uninstall
   sudo bash install_amneziawg_en.sh --diagnostic                # Diagnostics
 
@@ -395,7 +411,8 @@ safe_load_config() {
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
-                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY)
+                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
+                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY)
                     export "$key=$value"
                     ;;
             esac
@@ -1007,6 +1024,11 @@ setup_improved_firewall() {
                 || { log_warn "UFW: failed to add route rule"; ufw_errors=1; }
             log "VPN routing rule added (awg0 → ${main_nic})."
         fi
+        if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+            ufw route allow in on awg0 out on "${AWG_WARP_IFACE:-wgcf}" comment "AmneziaWG→WARP egress" \
+                || { log_warn "UFW: failed to add route awg0→${AWG_WARP_IFACE:-wgcf}"; ufw_errors=1; }
+            log "WARP routing rule added (awg0 → ${AWG_WARP_IFACE:-wgcf})."
+        fi
         if [[ "$ufw_errors" -ne 0 ]]; then
             log_error "One or more UFW rules failed to apply. Check settings manually."
             return 1
@@ -1040,6 +1062,10 @@ setup_improved_firewall() {
         if [[ -n "$main_nic" ]]; then
             ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
                 || { log_warn "UFW: failed to add route rule"; ufw_errors=1; }
+        fi
+        if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+            ufw route allow in on awg0 out on "${AWG_WARP_IFACE:-wgcf}" comment "AmneziaWG→WARP egress" \
+                || { log_warn "UFW: failed to add route awg0→${AWG_WARP_IFACE:-wgcf}"; ufw_errors=1; }
         fi
         if [[ "$ufw_errors" -ne 0 ]]; then
             log_error "One or more UFW rules failed to apply. Check settings manually."
@@ -1300,6 +1326,18 @@ step_uninstall() {
         systemctl stop "awg-quick@${_up_iface}" 2>/dev/null
         systemctl disable "awg-quick@${_up_iface}" 2>/dev/null
     fi
+    # WARP egress: tear down wgcf ONLY if it was brought up by our installer.
+    # The $AWG_DIR/.wgcf_enabled_by_installer marker protects a user's
+    # pre-existing wgcf from destructive removal.
+    if [[ -f "$AWG_DIR/.wgcf_enabled_by_installer" ]]; then
+        log "Stopping Cloudflare WARP (wg-quick@wgcf)..."
+        systemctl stop wg-quick@wgcf 2>/dev/null
+        systemctl disable wg-quick@wgcf 2>/dev/null
+        rm -f /etc/wireguard/wgcf.conf /etc/wireguard/wgcf-account.toml
+        rm -f /usr/local/bin/wgcf
+        rm -f "$AWG_DIR/.wgcf_enabled_by_installer"
+        log "WARP removed."
+    fi
     modprobe -r amneziawg 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
         log "Cleaning up AmneziaWG UFW rules..."
@@ -1510,6 +1548,38 @@ initialize_setup() {
     fi
     export AWG_ROLE AWG_UPSTREAM_IFACE AWG_UPSTREAM_TABLE AWG_UPSTREAM_FWMARK AWG_UPSTREAM_PRIORITY
 
+    # WARP egress: client traffic flows out via Cloudflare WARP instead of
+    # direct NAT on eth0. Available only for role=single or role=exit. On
+    # entry the egress is already delegated to the upstream node — putting
+    # WARP there would add a pointless third wrapper, so we reject it.
+    AWG_EGRESS="${AWG_EGRESS:-direct}"
+    if [[ -n "$CLI_EGRESS" ]]; then AWG_EGRESS="$CLI_EGRESS"; fi
+    case "$AWG_EGRESS" in
+        direct|warp) ;;
+        *) die "Invalid --egress='$AWG_EGRESS'. Allowed: direct, warp." ;;
+    esac
+    if [[ "$AWG_EGRESS" == "warp" && "$AWG_ROLE" == "entry" ]]; then
+        die "--egress=warp is incompatible with --role=entry. Put WARP on the exit node (or single), not on entry."
+    fi
+    AWG_WARP_IFACE="${AWG_WARP_IFACE:-wgcf}"
+    AWG_WARP_TABLE="${CLI_WARP_TABLE:-${AWG_WARP_TABLE:-2408}}"
+    AWG_WARP_PRIORITY="${CLI_WARP_PRIORITY:-${AWG_WARP_PRIORITY:-789}}"
+    if [[ "$AWG_EGRESS" == "warp" ]]; then
+        if ! [[ "$AWG_WARP_TABLE" =~ ^[0-9]+$ ]] || [[ "$AWG_WARP_TABLE" -lt 1 ]] \
+           || [[ "$AWG_WARP_TABLE" -gt 4294967295 ]]; then
+            die "Invalid --warp-table='$AWG_WARP_TABLE'."
+        fi
+        if ! [[ "$AWG_WARP_PRIORITY" =~ ^[0-9]+$ ]]; then
+            die "Invalid --warp-priority='$AWG_WARP_PRIORITY'."
+        fi
+        # Collision with the upstream table (123 on single/exit it isn't set,
+        # but guard the config anyway)
+        if [[ "$AWG_WARP_TABLE" == "${AWG_UPSTREAM_TABLE:-123}" ]]; then
+            die "--warp-table must not equal --upstream-table (${AWG_WARP_TABLE})."
+        fi
+    fi
+    export AWG_EGRESS AWG_WARP_IFACE AWG_WARP_TABLE AWG_WARP_PRIORITY
+
     # Validate after CLI override
     validate_port "$AWG_PORT"
     validate_subnet "$AWG_TUNNEL_SUBNET"
@@ -1605,6 +1675,11 @@ export AWG_UPSTREAM_IFACE='${AWG_UPSTREAM_IFACE:-awg1}'
 export AWG_UPSTREAM_TABLE=${AWG_UPSTREAM_TABLE:-123}
 export AWG_UPSTREAM_FWMARK='${AWG_UPSTREAM_FWMARK:-0xca6d}'
 export AWG_UPSTREAM_PRIORITY=${AWG_UPSTREAM_PRIORITY:-456}
+# WARP egress (Cloudflare)
+export AWG_EGRESS='${AWG_EGRESS:-direct}'
+export AWG_WARP_IFACE='${AWG_WARP_IFACE:-wgcf}'
+export AWG_WARP_TABLE=${AWG_WARP_TABLE:-2408}
+export AWG_WARP_PRIORITY=${AWG_WARP_PRIORITY:-789}
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -2098,6 +2173,14 @@ step6_generate_configs() {
         s_bak="${SERVER_CONF_FILE}.bak-$(date +%F_%H%M%S)"
         cp "$SERVER_CONF_FILE" "$s_bak" || log_warn "Backup error $s_bak"
         log "Server config backup: $s_bak"
+    fi
+
+    # WARP egress: bring wgcf up BEFORE rendering awg0.conf — the PostUp in
+    # the resulting config references the wgcf interface, which must exist
+    # by the time systemctl start awg-quick@awg0 fires in step 7.
+    if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        log "Installing WARP egress (Cloudflare)..."
+        setup_warp_egress || die "setup_warp_egress failed. See log."
     fi
 
     # Create AWG 2.0 server config
