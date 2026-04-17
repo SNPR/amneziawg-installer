@@ -12,6 +12,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Out-of-the-box multi-hop / cascade of two AWG servers.** New installer CLI flags: `--role=single|exit|entry` (default `single` — existing behaviour unchanged), `--upstream-conf=<file>` (required when `role=entry`), `--upstream-iface=<name>` (default `awg1`), `--upstream-table=<N>` (default `123`), `--upstream-fwmark=<hex>` (default `0xca6d` — distinct from wg-quick's `0xca6c` to avoid policy-rule clashes).
+  - On the exit node: ordinary install (`--role=exit`), then `manage add <name>` produces a client `.conf` for the entry node that gets copied over.
+  - On the entry node: `install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --yes` brings up `awg0` (for clients) and `awg1` (upstream client to exit) in one command, with policy-routing of client traffic into `awg1`, MASQUERADE on `awg1`, and TCPMSS clamp on SYN (without it, nested encapsulation truncates handshakes on some HTTPS sites).
+  - `AWG_ROLE`/`AWG_UPSTREAM_*` are persisted in `awgsetup_cfg.init`; on a re-run after reboot `--upstream-conf` is not required again if `awg1.conf` already exists.
+- **`manage_amneziawg.sh upstream <action>`** — cascade management on the entry node: `show`, `up`, `down`, `restart`, `apply`. The `restart` command (without `upstream`) also restarts `awg1` when `role=entry`.
+- **Validation and injection hardening for the upstream-conf parser.** New helpers `_validate_iface_name`, `_extract_upstream_field`, `render_upstream_config` in `awg_common.sh` — every extracted value goes through an allowlist and is rejected if it contains newline/CR/quotes; `Table`/`FwMark`/priority/iface are regex-validated.
+- **`apply_config` now accepts an interface name** (default `awg0`) — the same function drives both the primary and the upstream tunnel.
+- **Cascade tests:** `tests/test_upstream.bats` — 11 cases (interface-name validation, `[Interface]`/`[Peer]` field parsing, `awg1.conf` rendering with correct Table/FwMark/PostUp/MASQUERADE, rejection of incomplete AWG 2.0 sets, rejection of shell-metachars in values, entry-mode `render_server_config` with FORWARD-to-awg1 and TCPMSS clamp, single-mode with classic MASQUERADE).
+
+### Changed
+
+- **Server PostUp / PostDown for `role=entry`** now differs completely from `role=single`/`exit`: instead of MASQUERADE on the external NIC it installs FORWARD between `awg0` and `awg1` plus a TCPMSS clamp on SYN/RST in mangle. MASQUERADE is performed on the upstream side (`awg1`) so the exit server does not drop packets by cryptokey-routing AllowedIPs.
+- **The UFW rule `ufw route allow in on awg0 out on <nic>`** is not added when `role=entry` (traffic egresses via `awg1`); instead `ufw route allow in on awg0 out on <upstream-iface>` is added when the second service starts.
+- **Uninstall** now also stops and disables `awg-quick@<upstream-iface>` when the stored config says `role=entry`.
+
 ---
 
 ## [5.10.0] — 2026-04-16

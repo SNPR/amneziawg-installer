@@ -41,6 +41,9 @@ UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=
 _APT_UPDATED=0
 CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"
 CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0
+# Multi-hop / cascade: node role and upstream tunnel parameters (for role=entry)
+CLI_ROLE=""; CLI_UPSTREAM_CONF=""; CLI_UPSTREAM_IFACE=""
+CLI_UPSTREAM_TABLE=""; CLI_UPSTREAM_FWMARK=""
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
@@ -74,6 +77,11 @@ while [[ $# -gt 0 ]]; do
         --jc=*)          CLI_JC="${1#*=}" ;;
         --jmin=*)        CLI_JMIN="${1#*=}" ;;
         --jmax=*)        CLI_JMAX="${1#*=}" ;;
+        --role=*)        CLI_ROLE="${1#*=}" ;;
+        --upstream-conf=*)    CLI_UPSTREAM_CONF="${1#*=}" ;;
+        --upstream-iface=*)   CLI_UPSTREAM_IFACE="${1#*=}" ;;
+        --upstream-table=*)   CLI_UPSTREAM_TABLE="${1#*=}" ;;
+        --upstream-fwmark=*)  CLI_UPSTREAM_FWMARK="${1#*=}" ;;
         *) echo "Unknown argument: $1"; HELP=1 ;;
     esac
     shift
@@ -155,11 +163,22 @@ Options:
   --jmin=N             Set Jmin manually (0-1280, overrides preset)
   --jmax=N             Set Jmax manually (0-1280, overrides preset, must be >= Jmin)
 
+Multi-hop (cascade of two AWG servers):
+  --role=ROLE           single (default) | exit | entry
+                        exit:  ordinary server that the entry attaches to
+                        entry: additionally brings up an upstream tunnel to exit
+  --upstream-conf=FILE  (for role=entry) path to the .conf from `manage add` on the exit node
+  --upstream-iface=NAME upstream interface name (default awg1)
+  --upstream-table=N    routing table for client traffic (default 123)
+  --upstream-fwmark=HEX fwmark for upstream packets (default 0xca6d)
+
 Examples:
   sudo bash install_amneziawg_en.sh                             # Interactive installation
   sudo bash install_amneziawg_en.sh --port=51820 --route-all    # Non-interactive
   sudo bash install_amneziawg_en.sh --route-amnezia --yes       # Fully automated
   sudo bash install_amneziawg_en.sh --preset=mobile --yes       # Optimized for mobile networks
+  sudo bash install_amneziawg_en.sh --role=exit --yes           # Cascade exit node
+  sudo bash install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --yes
   sudo bash install_amneziawg_en.sh --uninstall                 # Uninstall
   sudo bash install_amneziawg_en.sh --diagnostic                # Diagnostics
 
@@ -375,7 +394,8 @@ safe_load_config() {
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
-                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE)
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY)
                     export "$key=$value"
                     ;;
             esac
@@ -1269,6 +1289,17 @@ step_uninstall() {
     log "Stopping service..."
     systemctl stop awg-quick@awg0 2>/dev/null
     systemctl disable awg-quick@awg0 2>/dev/null
+    # Multi-hop: tear down the upstream interface too, when role=entry
+    local _up_iface=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        _up_iface=$(safe_read_config_key "AWG_UPSTREAM_IFACE" "$CONFIG_FILE" 2>/dev/null || echo "")
+    fi
+    _up_iface="${_up_iface:-awg1}"
+    if [[ "$_up_iface" != "awg0" ]] && systemctl list-unit-files "awg-quick@${_up_iface}.service" 2>/dev/null | grep -q "${_up_iface}"; then
+        log "Stopping upstream interface ${_up_iface}..."
+        systemctl stop "awg-quick@${_up_iface}" 2>/dev/null
+        systemctl disable "awg-quick@${_up_iface}" 2>/dev/null
+    fi
     modprobe -r amneziawg 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
         log "Cleaning up AmneziaWG UFW rules..."
@@ -1435,6 +1466,50 @@ initialize_setup() {
     fi
     if [[ "$CLI_NO_TWEAKS" -eq 1 ]]; then NO_TWEAKS=1; fi
 
+    # Multi-hop: node role and upstream tunnel parameters.
+    # CLI > saved config > defaults. Value 'single' requires no upstream fields;
+    # 'exit' is just an ordinary server marked with the role for manager and
+    # documentation; 'entry' requires an upstream config.
+    AWG_ROLE="${AWG_ROLE:-single}"
+    if [[ -n "$CLI_ROLE" ]]; then AWG_ROLE="$CLI_ROLE"; fi
+    case "$AWG_ROLE" in
+        single|exit|entry) ;;
+        *) die "Invalid --role='$AWG_ROLE'. Allowed: single, exit, entry." ;;
+    esac
+    AWG_UPSTREAM_IFACE="${CLI_UPSTREAM_IFACE:-${AWG_UPSTREAM_IFACE:-awg1}}"
+    AWG_UPSTREAM_TABLE="${CLI_UPSTREAM_TABLE:-${AWG_UPSTREAM_TABLE:-123}}"
+    AWG_UPSTREAM_FWMARK="${CLI_UPSTREAM_FWMARK:-${AWG_UPSTREAM_FWMARK:-0xca6d}}"
+    AWG_UPSTREAM_PRIORITY="${AWG_UPSTREAM_PRIORITY:-456}"
+    if [[ "$AWG_ROLE" == "entry" ]]; then
+        if [[ "$AWG_UPSTREAM_IFACE" == "awg0" ]]; then
+            die "--upstream-iface=awg0 clashes with the primary interface. Use awg1."
+        fi
+        if ! [[ "$AWG_UPSTREAM_IFACE" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]]; then
+            die "Invalid --upstream-iface='$AWG_UPSTREAM_IFACE'."
+        fi
+        if ! [[ "$AWG_UPSTREAM_TABLE" =~ ^[0-9]+$ ]] || [[ "$AWG_UPSTREAM_TABLE" -lt 1 ]] \
+           || [[ "$AWG_UPSTREAM_TABLE" -gt 4294967295 ]]; then
+            die "Invalid --upstream-table='$AWG_UPSTREAM_TABLE'."
+        fi
+        if ! [[ "$AWG_UPSTREAM_FWMARK" =~ ^(0x[0-9a-fA-F]{1,8}|[0-9]+)$ ]]; then
+            die "Invalid --upstream-fwmark='$AWG_UPSTREAM_FWMARK' (expected 0xHHHH or a number)."
+        fi
+        # Upstream conf: CLI is mandatory only on the first run. If
+        # awg1.conf already exists on disk (second run after reboot) we assume
+        # it was created correctly earlier and do not require --upstream-conf.
+        local _up_iface_conf="/etc/amnezia/amneziawg/${AWG_UPSTREAM_IFACE}.conf"
+        if [[ -n "$CLI_UPSTREAM_CONF" ]]; then
+            if [[ ! -f "$CLI_UPSTREAM_CONF" ]]; then
+                die "--upstream-conf not found: '$CLI_UPSTREAM_CONF'."
+            fi
+            AWG_UPSTREAM_CONF="$CLI_UPSTREAM_CONF"
+            export AWG_UPSTREAM_CONF
+        elif [[ ! -f "$_up_iface_conf" ]]; then
+            die "role=entry requires --upstream-conf=<file.conf> (from manage add on the exit node)."
+        fi
+    fi
+    export AWG_ROLE AWG_UPSTREAM_IFACE AWG_UPSTREAM_TABLE AWG_UPSTREAM_FWMARK AWG_UPSTREAM_PRIORITY
+
     # Validate after CLI override
     validate_port "$AWG_PORT"
     validate_subnet "$AWG_TUNNEL_SUBNET"
@@ -1524,6 +1599,12 @@ export AWG_I1='${AWG_I1}'
 export AWG_PRESET='${AWG_PRESET:-default}'
 export NO_TWEAKS=${NO_TWEAKS}
 export AWG_APPLY_MODE='${AWG_APPLY_MODE:-syncconf}'
+# Multi-hop (cascade)
+export AWG_ROLE='${AWG_ROLE:-single}'
+export AWG_UPSTREAM_IFACE='${AWG_UPSTREAM_IFACE:-awg1}'
+export AWG_UPSTREAM_TABLE=${AWG_UPSTREAM_TABLE:-123}
+export AWG_UPSTREAM_FWMARK='${AWG_UPSTREAM_FWMARK:-0xca6d}'
+export AWG_UPSTREAM_PRIORITY=${AWG_UPSTREAM_PRIORITY:-456}
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -2053,6 +2134,27 @@ step6_generate_configs() {
     # Config validation
     validate_awg_config || log_warn "Config validation found issues."
 
+    # Multi-hop: deploy the upstream interface (awg1) for role=entry.
+    # If --upstream-conf is not given on a repeat run, keep the existing
+    # ${AWG_UPSTREAM_IFACE}.conf as-is.
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        local _up_conf_out="/etc/amnezia/amneziawg/${AWG_UPSTREAM_IFACE:-awg1}.conf"
+        if [[ -n "${AWG_UPSTREAM_CONF:-}" ]]; then
+            log "Deploying upstream interface ${AWG_UPSTREAM_IFACE:-awg1} from ${AWG_UPSTREAM_CONF}..."
+            if [[ -f "$_up_conf_out" ]]; then
+                local _up_bak
+                _up_bak="${_up_conf_out}.bak-$(date +%F_%H%M%S)"
+                cp "$_up_conf_out" "$_up_bak" || log_warn "Backup failed $_up_bak"
+                log "Upstream config backup: $_up_bak"
+            fi
+            render_upstream_config || die "Failed to write upstream config (${AWG_UPSTREAM_IFACE:-awg1})."
+        elif [[ ! -f "$_up_conf_out" ]]; then
+            die "role=entry: no upstream config in CLI or on disk ($_up_conf_out)."
+        else
+            log "Upstream config already exists: $_up_conf_out — skipping render."
+        fi
+    fi
+
     # Set file permissions
     secure_files
 
@@ -2091,6 +2193,23 @@ step7_start_service() {
         [[ $_attempt -lt 5 ]] && log_debug "Waiting for service startup... (attempt $_attempt/5)"
     done
     check_service_status || die "Service status check failed."
+
+    # Multi-hop: bring up the upstream interface. Its absence is not fatal for
+    # awg0 itself (client handshake still works), but clients won't get
+    # internet until the cascade is up — warn the operator.
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        local _up="${AWG_UPSTREAM_IFACE:-awg1}"
+        log "Enabling and starting awg-quick@${_up} (upstream cascade)..."
+        if systemctl enable --now "awg-quick@${_up}"; then
+            log "Upstream tunnel ${_up} started."
+            if command -v ufw &>/dev/null && ! ufw status 2>/dev/null | grep -q inactive; then
+                ufw route allow in on awg0 out on "${_up}" comment "AmneziaWG cascade awg0->${_up}" \
+                    || log_warn "UFW: failed to add route awg0→${_up}."
+            fi
+        else
+            log_warn "awg-quick@${_up} did not start. Check: systemctl status awg-quick@${_up}"
+        fi
+    fi
 
     # Fail2Ban
     if [[ "$NO_TWEAKS" -eq 0 ]]; then

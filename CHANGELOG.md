@@ -12,6 +12,33 @@
 
 ## [Unreleased]
 
+### Добавлено
+
+- **WARP egress (Cloudflare) для exit- и single-ноды.** Новый флаг `--egress=direct|warp` (по умолчанию `direct`). При `--egress=warp` установщик:
+  1. Скачивает [wgcf](https://github.com/ViRb3/wgcf) (мультиарх: amd64 / arm64 / armv7) с GitHub Releases.
+  2. Выполняет `wgcf register --accept-tos` и `wgcf generate`, размещает профиль в `/etc/wireguard/wgcf.conf`.
+  3. Патчит профиль: `Table = off` (критично — иначе дефолт-роут хоста уходит в WARP и SSH отваливается), удаляет `DNS =` (чтобы `resolv.conf` не перехватывался).
+  4. Включает `wg-quick@wgcf` и дописывает в PostUp/PostDown `awg0.conf` policy routing: `ip rule from <AWG_TUNNEL_SUBNET> table <N> priority <P>`, `ip route replace default dev wgcf table <N>`, `MASQUERADE -o wgcf`, `TCPMSS --clamp-mss-to-pmtu`. Внешние сайты видят IP Cloudflare, а не IP VPS.
+- **Сопутствующие флаги:** `--warp-table=N` (по умолчанию `2408`, порт WARP UDP как мнемоника), `--warp-priority=N` (по умолчанию `789`). Коллизия с `--upstream-table` проверяется на этапе валидации.
+- **`AWG_EGRESS=warp` + `AWG_ROLE=entry` отклоняются явно** — на entry-ноде egress уже делегирован upstream'у, WARP там был бы третьей обёрткой без смысла.
+- **UFW:** к существующему правилу `ufw route allow in on awg0 out on <nic>` добавляется `ufw route allow in on awg0 out on wgcf` когда egress=warp.
+- **Uninstall** гасит и удаляет `wg-quick@wgcf` / `wgcf.conf` / `wgcf-account.toml` / `/usr/local/bin/wgcf` только если установкой wgcf занимался наш скрипт (маркер `$AWG_DIR/.wgcf_enabled_by_installer`) — защита от destructive-удаления уже существовавшего wgcf пользователя.
+- **Тесты:** `tests/test_warp_egress.bats` — 5 кейсов (рендер PostUp/PostDown с корректными `ip rule`/`ip route`/`MASQUERADE -o wgcf`/TCPMSS, fallback на NIC MASQUERADE при `direct`, приоритет `role=entry` над `AWG_EGRESS=warp` на случай одновременного присутствия в config-файле, загрузка `AWG_EGRESS`/`AWG_WARP_*` через `safe_load_config`, кастомные table/priority).
+- **Multi-hop / каскад двух AWG-серверов «из коробки».** Новые CLI-флаги установщика: `--role=single|exit|entry` (по умолчанию `single` — старое поведение не меняется), `--upstream-conf=<файл>` (обязателен при `role=entry`), `--upstream-iface=<имя>` (умолчание `awg1`), `--upstream-table=<N>` (умолчание `123`), `--upstream-fwmark=<hex>` (умолчание `0xca6d` — не совпадает с дефолтом wg-quick `0xca6c`).
+  - На exit-ноде: обычная установка (`--role=exit`), затем `manage add <name>` генерирует клиентский `.conf` для entry-ноды и копируется на неё.
+  - На entry-ноде: `install_amneziawg.sh --role=entry --upstream-conf=/root/from_exit.conf --yes` поднимает `awg0` (для клиентов) и `awg1` (upstream-клиент к exit) одной командой, с policy-routing'ом клиентского трафика в `awg1`, MASQUERADE на `awg1` и TCPMSS-клампом SYN (иначе вложенная инкапсуляция режет handshakes у части HTTPS-сайтов).
+  - Параметры `AWG_ROLE`/`AWG_UPSTREAM_*` персистятся в `awgsetup_cfg.init`, при перезапуске установщика после reboot не требуется повторно указывать `--upstream-conf` если `awg1.conf` уже создан.
+- **`manage_amneziawg.sh upstream <action>`** — управление каскадом на entry-ноде: `show`, `up`, `down`, `restart`, `apply`. Команда `restart` (без `upstream`) теперь тоже перезапускает `awg1` если `role=entry`.
+- **Валидация и защита от injection в parser upstream-конфига.** Выделены helpers `_validate_iface_name`, `_extract_upstream_field`, `render_upstream_config` в `awg_common.sh` — все извлекаемые значения проходят allowlist и отвергаются если содержат newline/CR/кавычки; параметры `Table`/`FwMark`/priority/iface валидируются регексами.
+- **`apply_config` теперь принимает имя интерфейса** (default `awg0`) — одна и та же функция работает и для основного, и для upstream-туннеля.
+- **Тесты для каскада:** `tests/test_upstream.bats` — 11 кейсов (валидация имён интерфейсов, парсинг полей `[Interface]`/`[Peer]`, рендер `awg1.conf` с корректными Table/FwMark/PostUp/MASQUERADE, отказ при неполном AWG 2.0 наборе, отказ при shell-metachars в значениях, entry-режим `render_server_config` с FORWARD-to-awg1 и TCPMSS clamp, single-режим с классическим MASQUERADE).
+
+### Изменено
+
+- **PostUp / PostDown серверного конфига для `role=entry`** полностью отличается от `role=single`/`exit`: вместо MASQUERADE на внешний NIC — FORWARD между `awg0` и `awg1` + TCPMSS clamp на SYN/RST в mangle. MASQUERADE выполняется на upstream-стороне (`awg1`) чтобы exit-сервер не отбрасывал пакеты по cryptokey-routing AllowedIPs.
+- **UFW-правило `ufw route allow in on awg0 out on <nic>`** не добавляется при `role=entry` (трафик уходит через `awg1`); вместо него добавляется `ufw route allow in on awg0 out on <upstream-iface>` при запуске второго сервиса.
+- **Деинсталляция** теперь останавливает и отключает `awg-quick@<upstream-iface>` если конфиг сохранил `role=entry`, а также `wg-quick@wgcf` если наш инсталлятор поднимал WARP.
+
 ---
 
 ## [5.10.0] — 2026-04-16

@@ -192,7 +192,8 @@ safe_load_config() {
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
-                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE)
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY)
                     export "$key=$value"
                     ;;
             esac
@@ -436,12 +437,28 @@ render_server_config() {
         return 1
     }
 
-    # PostUp/PostDown rules for routing
-    local postup="iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
-    local postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
+    # PostUp/PostDown rules for routing.
+    # role=entry: client traffic is forwarded into the second tunnel
+    # ($AWG_UPSTREAM_IFACE, usually awg1), so MASQUERADE on $nic is NOT needed
+    # (done on the exit node). We add FORWARD accept to awg1 and reverse
+    # conntrack state + TCPMSS clamp: without clamp, nested encapsulation
+    # truncates SYNs for some HTTPS sites (see multi-hop guides).
+    local postup postdown
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        local up_iface="${AWG_UPSTREAM_IFACE:-awg1}"
+        postup="iptables -I FORWARD -i %i -o ${up_iface} -j ACCEPT"
+        postup="${postup}; iptables -I FORWARD -i ${up_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postup="${postup}; iptables -t mangle -A FORWARD -o ${up_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="iptables -D FORWARD -i %i -o ${up_iface} -j ACCEPT"
+        postdown="${postdown}; iptables -D FORWARD -i ${up_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postdown="${postdown}; iptables -t mangle -D FORWARD -o ${up_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+    else
+        postup="iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
+        postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
+    fi
 
     # IPv6 rules if not disabled
-    if [[ "${DISABLE_IPV6:-1}" -eq 0 ]]; then
+    if [[ "${DISABLE_IPV6:-1}" -eq 0 && "${AWG_ROLE:-single}" != "entry" ]]; then
         postup="${postup}; ip6tables -I FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
         postdown="${postdown}; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
@@ -551,10 +568,12 @@ EOF
 # ==============================================================================
 
 # Apply configuration changes
+# Arguments: [iface=awg0] — interface name (for multi-hop: awg1 etc.)
 # AWG_SKIP_APPLY=1: skip apply (for batch automation)
 # AWG_APPLY_MODE=syncconf|restart: apply method (config or --apply-mode CLI)
 # flock on .awg_apply.lock: prevents concurrent apply calls
 apply_config() {
+    local iface="${1:-awg0}"
     # Skip apply (AWG_SKIP_APPLY=1 manage add/remove ...)
     if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
         log_debug "apply_config skipped (AWG_SKIP_APPLY=1)."
@@ -574,30 +593,224 @@ apply_config() {
     local rc=0
 
     if [[ "${AWG_APPLY_MODE:-syncconf}" == "restart" ]]; then
-        log "Restarting service (apply-mode=restart)..."
-        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
-        [[ $rc -ne 0 ]] && log_warn "Service restart error."
+        log "Restarting service ${iface} (apply-mode=restart)..."
+        systemctl restart "awg-quick@${iface}" 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Service restart error (${iface})."
         exec {apply_fd}>&-
         return $rc
     fi
 
     local strip_out
-    strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || {
-        log_warn "awg-quick strip failed or timed out, falling back to full restart."
-        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
-        [[ $rc -ne 0 ]] && log_warn "Service restart error."
+    strip_out=$(timeout 10 awg-quick strip "${iface}" 2>/dev/null) || {
+        log_warn "awg-quick strip ${iface} failed or timed out, falling back to full restart."
+        systemctl restart "awg-quick@${iface}" 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Service restart error (${iface})."
         exec {apply_fd}>&-
         return $rc
     }
-    echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null || {
-        log_warn "awg syncconf failed or timed out, falling back to full restart."
-        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
-        [[ $rc -ne 0 ]] && log_warn "Service restart error."
+    echo "$strip_out" | timeout 10 awg syncconf "${iface}" /dev/stdin 2>/dev/null || {
+        log_warn "awg syncconf ${iface} failed or timed out, falling back to full restart."
+        systemctl restart "awg-quick@${iface}" 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Service restart error (${iface})."
         exec {apply_fd}>&-
         return $rc
     }
-    log_debug "Config applied (syncconf)."
+    log_debug "Config ${iface} applied (syncconf)."
     exec {apply_fd}>&-
+    return 0
+}
+
+# ==============================================================================
+# Multi-hop (cascade): upstream tunnel for role=entry
+# ==============================================================================
+#
+# On the entry node we bring up a second interface (default awg1) that acts as
+# a client to the upstream exit server. Client traffic (from
+# $AWG_TUNNEL_SUBNET) is policy-routed into that interface:
+#
+#   Table=<N>       — awg-quick places AllowedIPs routes in table N instead of
+#                     main (without touching the entry node's own egress)
+#   FwMark=<mark>   — distinct from 0xca6c (wg-quick default) to avoid clash
+#                     with awg0 policy rules
+#   ip rule from <subnet> table N  — sends only client packets into the
+#                                    cascade; entry's own traffic (SSH, awg1
+#                                    keepalive) goes via main table
+#   MASQUERADE -o %i — rewrites client src (10.X.X.X) to entry's awg1 IP,
+#                     otherwise the exit server would drop it on AllowedIPs
+#
+# Matching obfuscation params between awg1 (entry) and awg0 (exit) is required
+# for the cascade, but S/H/I may differ from the client-facing awg0 profile.
+#
+# Command-injection hardening: values extracted from the upstream conf (keys,
+# IP, Endpoint) go through an allowlist regex and are written to the output
+# via awg_mktemp + mv, never through eval.
+
+# Validate interface name (protect systemctl/iptables from injection)
+_validate_iface_name() {
+    local n="$1"
+    [[ "$n" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]]
+}
+
+# Extract a key's value from the [Interface] or [Peer] section of an upstream
+# config. _extract_upstream_field <file> <section: Interface|Peer> <key>
+# Prints the value to stdout; returns 1 if not found.
+_extract_upstream_field() {
+    local f="$1" sect="$2" key="$3"
+    [[ -f "$f" ]] || return 1
+    awk -v sect="$sect" -v key="$key" '
+        /^\[/ { in_sect = ($0 == "[" sect "]"); next }
+        in_sect && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "")
+            sub("[[:space:]]+$", "")
+            print; exit
+        }
+    ' "$f"
+}
+
+# Build and write the upstream (awg1) interface config for the cascade.
+# Expects env:
+#   AWG_UPSTREAM_CONF     — path to .conf from `manage add` on the exit node
+#   AWG_UPSTREAM_IFACE    — interface name (default awg1)
+#   AWG_UPSTREAM_TABLE    — routing table number (default 123)
+#   AWG_UPSTREAM_FWMARK   — fwmark (default 0xca6d, not 0xca6c like wg-quick)
+#   AWG_UPSTREAM_PRIORITY — ip rule priority (default 456)
+#   AWG_TUNNEL_SUBNET     — client subnet for the from-rule
+render_upstream_config() {
+    local src="${AWG_UPSTREAM_CONF:-}"
+    local iface="${AWG_UPSTREAM_IFACE:-awg1}"
+    local tbl="${AWG_UPSTREAM_TABLE:-123}"
+    local fwmark="${AWG_UPSTREAM_FWMARK:-0xca6d}"
+    local prio="${AWG_UPSTREAM_PRIORITY:-456}"
+    local client_subnet="${AWG_TUNNEL_SUBNET:-}"
+
+    if [[ -z "$src" || ! -f "$src" ]]; then
+        log_error "render_upstream_config: AWG_UPSTREAM_CONF not set or file missing: '$src'"
+        return 1
+    fi
+    if ! _validate_iface_name "$iface"; then
+        log_error "render_upstream_config: invalid interface name '$iface'"
+        return 1
+    fi
+    if ! [[ "$tbl" =~ ^[0-9]+$ && "$tbl" -ge 1 && "$tbl" -le 4294967295 ]]; then
+        log_error "render_upstream_config: invalid Table='$tbl'"
+        return 1
+    fi
+    if ! [[ "$fwmark" =~ ^(0x[0-9a-fA-F]{1,8}|[0-9]+)$ ]]; then
+        log_error "render_upstream_config: invalid FwMark='$fwmark'"
+        return 1
+    fi
+    if ! [[ "$prio" =~ ^[0-9]+$ ]]; then
+        log_error "render_upstream_config: invalid priority='$prio'"
+        return 1
+    fi
+    if [[ -z "$client_subnet" ]]; then
+        log_error "render_upstream_config: AWG_TUNNEL_SUBNET not set"
+        return 1
+    fi
+
+    # Extract fields from the upstream config
+    local u_priv u_addr u_pub u_psk u_endpoint u_keepalive
+    local u_jc u_jmin u_jmax u_s1 u_s2 u_s3 u_s4 u_h1 u_h2 u_h3 u_h4 u_i1
+    u_priv=$(_extract_upstream_field "$src" Interface PrivateKey)
+    u_addr=$(_extract_upstream_field "$src" Interface Address)
+    u_jc=$(_extract_upstream_field   "$src" Interface Jc)
+    u_jmin=$(_extract_upstream_field "$src" Interface Jmin)
+    u_jmax=$(_extract_upstream_field "$src" Interface Jmax)
+    u_s1=$(_extract_upstream_field   "$src" Interface S1)
+    u_s2=$(_extract_upstream_field   "$src" Interface S2)
+    u_s3=$(_extract_upstream_field   "$src" Interface S3)
+    u_s4=$(_extract_upstream_field   "$src" Interface S4)
+    u_h1=$(_extract_upstream_field   "$src" Interface H1)
+    u_h2=$(_extract_upstream_field   "$src" Interface H2)
+    u_h3=$(_extract_upstream_field   "$src" Interface H3)
+    u_h4=$(_extract_upstream_field   "$src" Interface H4)
+    u_i1=$(_extract_upstream_field   "$src" Interface I1)
+    u_pub=$(_extract_upstream_field      "$src" Peer PublicKey)
+    u_psk=$(_extract_upstream_field      "$src" Peer PresharedKey)
+    u_endpoint=$(_extract_upstream_field "$src" Peer Endpoint)
+    u_keepalive=$(_extract_upstream_field "$src" Peer PersistentKeepalive)
+
+    if [[ -z "$u_priv" || -z "$u_addr" || -z "$u_pub" || -z "$u_endpoint" ]]; then
+        log_error "render_upstream_config: $src is missing required fields"
+        log_error "  (Interface.PrivateKey/Address, Peer.PublicKey/Endpoint)"
+        return 1
+    fi
+    # All 11 AWG 2.0 fields must be in the upstream config (else handshake fails)
+    local f miss=0
+    for f in u_jc u_jmin u_jmax u_s1 u_s2 u_s3 u_s4 u_h1 u_h2 u_h3 u_h4; do
+        if [[ -z "${!f}" ]]; then
+            log_error "render_upstream_config: $src is missing ${f#u_}"
+            miss=1
+        fi
+    done
+    (( miss == 0 )) || return 1
+
+    # Reject newline/CR/quotes in extracted values — defence against injection
+    # into the output config via a forged upstream .conf
+    for f in u_priv u_addr u_pub u_psk u_endpoint u_keepalive \
+             u_jc u_jmin u_jmax u_s1 u_s2 u_s3 u_s4 u_h1 u_h2 u_h3 u_h4 u_i1; do
+        local v="${!f}"
+        if [[ "$v" == *$'\n'* || "$v" == *$'\r'* || "$v" == *\'* || "$v" == *\"* ]]; then
+            log_error "render_upstream_config: suspicious chars in ${f#u_}, rejected"
+            return 1
+        fi
+    done
+
+    # Address in a client config is a.b.c.d/32; leave as-is, but coerce a
+    # stray /24 from a hand-rolled example down to /32
+    if [[ "$u_addr" =~ ^([0-9.]+)/([0-9]+)$ ]]; then
+        u_addr="${BASH_REMATCH[1]}/32"
+    fi
+
+    local out_conf
+    out_conf="$(dirname "$SERVER_CONF_FILE")/${iface}.conf"
+
+    local conf_dir
+    conf_dir=$(dirname "$out_conf")
+    mkdir -p "$conf_dir" || { log_error "Failed to create $conf_dir"; return 1; }
+
+    local tmpfile
+    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
+
+    {
+        echo "[Interface]"
+        echo "PrivateKey = ${u_priv}"
+        echo "Address = ${u_addr}"
+        echo "MTU = 1380"
+        echo "Table = ${tbl}"
+        echo "FwMark = ${fwmark}"
+        echo "PostUp = ip rule add from ${client_subnet%/*}/${client_subnet##*/} table ${tbl} priority ${prio}"
+        echo "PostUp = iptables -t nat -A POSTROUTING -o %i -j MASQUERADE"
+        echo "PreDown = ip rule del from ${client_subnet%/*}/${client_subnet##*/} table ${tbl} priority ${prio}"
+        echo "PreDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE"
+        echo "Jc = ${u_jc}"
+        echo "Jmin = ${u_jmin}"
+        echo "Jmax = ${u_jmax}"
+        echo "S1 = ${u_s1}"
+        echo "S2 = ${u_s2}"
+        echo "S3 = ${u_s3}"
+        echo "S4 = ${u_s4}"
+        echo "H1 = ${u_h1}"
+        echo "H2 = ${u_h2}"
+        echo "H3 = ${u_h3}"
+        echo "H4 = ${u_h4}"
+        [[ -n "$u_i1" ]] && echo "I1 = ${u_i1}"
+        echo ""
+        echo "[Peer]"
+        echo "PublicKey = ${u_pub}"
+        [[ -n "$u_psk" ]] && echo "PresharedKey = ${u_psk}"
+        echo "Endpoint = ${u_endpoint}"
+        echo "AllowedIPs = 0.0.0.0/0"
+        echo "PersistentKeepalive = ${u_keepalive:-25}"
+    } > "$tmpfile"
+
+    if ! mv "$tmpfile" "$out_conf"; then
+        rm -f "$tmpfile"
+        log_error "Failed to write upstream config $out_conf"
+        return 1
+    fi
+    chmod 600 "$out_conf"
+    log "Upstream interface ${iface} written: $out_conf (table=${tbl}, fwmark=${fwmark})"
     return 0
 }
 

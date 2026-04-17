@@ -962,6 +962,8 @@ usage() {
     echo "  check | status        Проверить состояние сервера"
     echo "  show                  Показать статус \`awg show\`"
     echo "  restart               Перезапустить сервис AmneziaWG"
+    echo "  upstream <действие>   Управление каскадом (role=entry):"
+    echo "                        show | up | down | restart | apply"
     echo "  help                  Показать эту справку"
     echo ""
     exit 1
@@ -977,6 +979,15 @@ fi
 
 check_dependencies || exit 1
 cd "$AWG_DIR" || die "Ошибка перехода в $AWG_DIR"
+
+# Подтягиваем роль и upstream-поля из конфига (для команд restart/upstream/check).
+# load_awg_params внутри generate_client/regenerate_client перечитает эти же
+# значения — здесь безвредно предзагрузить для ранних веток диспетчера.
+if [[ -f "$CONFIG_FILE" ]]; then
+    safe_load_config "$CONFIG_FILE" 2>/dev/null || true
+fi
+AWG_ROLE="${AWG_ROLE:-single}"
+AWG_UPSTREAM_IFACE="${AWG_UPSTREAM_IFACE:-awg1}"
 
 log "Запуск команды '$COMMAND'..."
 _cmd_rc=0
@@ -1150,6 +1161,52 @@ case $COMMAND in
             exit 1
         else
             log "Сервис перезапущен."
+        fi
+        if [[ "$AWG_ROLE" == "entry" ]]; then
+            log "Перезапуск upstream-интерфейса ${AWG_UPSTREAM_IFACE}..."
+            if ! systemctl restart "awg-quick@${AWG_UPSTREAM_IFACE}"; then
+                log_warn "Ошибка перезапуска ${AWG_UPSTREAM_IFACE}. Клиенты могут потерять интернет."
+                _cmd_rc=1
+            else
+                log "Upstream ${AWG_UPSTREAM_IFACE} перезапущен."
+            fi
+        fi
+        ;;
+
+    upstream)
+        # Управление upstream-туннелем каскада (role=entry).
+        # Использование: upstream <show|up|down|restart|apply>
+        if [[ "$AWG_ROLE" != "entry" ]]; then
+            log_error "Команда 'upstream' доступна только на entry-ноде (role=entry)."
+            log_error "Текущая роль: $AWG_ROLE. Установите через install --role=entry --upstream-conf=..."
+            _cmd_rc=1
+        else
+            _up_action="${CLIENT_NAME:-show}"
+            _up="awg-quick@${AWG_UPSTREAM_IFACE}"
+            case "$_up_action" in
+                show|status)
+                    log "Статус upstream ${AWG_UPSTREAM_IFACE}:"
+                    awg show "${AWG_UPSTREAM_IFACE}" 2>/dev/null || log_warn "awg show ${AWG_UPSTREAM_IFACE}: интерфейс не поднят?"
+                    systemctl status "$_up" --no-pager 2>&1 | while IFS= read -r _ln; do log "  $_ln"; done
+                    ;;
+                up|start)
+                    if systemctl start "$_up"; then log "${AWG_UPSTREAM_IFACE} запущен."; else log_error "Ошибка запуска ${AWG_UPSTREAM_IFACE}."; _cmd_rc=1; fi
+                    ;;
+                down|stop)
+                    if ! confirm_action "остановить" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
+                    if systemctl stop "$_up"; then log "${AWG_UPSTREAM_IFACE} остановлен."; else log_error "Ошибка остановки."; _cmd_rc=1; fi
+                    ;;
+                restart)
+                    if systemctl restart "$_up"; then log "${AWG_UPSTREAM_IFACE} перезапущен."; else log_error "Ошибка перезапуска."; _cmd_rc=1; fi
+                    ;;
+                apply)
+                    apply_config "${AWG_UPSTREAM_IFACE}" || { log_error "apply_config ${AWG_UPSTREAM_IFACE} упал."; _cmd_rc=1; }
+                    ;;
+                *)
+                    log_error "Неизвестное действие upstream: '$_up_action'. Допустимо: show, up, down, restart, apply."
+                    _cmd_rc=1
+                    ;;
+            esac
         fi
         ;;
 

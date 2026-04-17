@@ -962,6 +962,8 @@ usage() {
     echo "  check | status        Check server status"
     echo "  show                  Show \`awg show\` status"
     echo "  restart               Restart AmneziaWG service"
+    echo "  upstream <action>     Manage the cascade (role=entry):"
+    echo "                        show | up | down | restart | apply"
     echo "  help                  Show this help"
     echo ""
     exit 1
@@ -977,6 +979,15 @@ fi
 
 check_dependencies || exit 1
 cd "$AWG_DIR" || die "Failed to change to $AWG_DIR"
+
+# Preload role and upstream fields from config (for restart/upstream/check).
+# load_awg_params inside generate_client/regenerate_client re-reads the same
+# values — preloading here is harmless for the early dispatcher branches.
+if [[ -f "$CONFIG_FILE" ]]; then
+    safe_load_config "$CONFIG_FILE" 2>/dev/null || true
+fi
+AWG_ROLE="${AWG_ROLE:-single}"
+AWG_UPSTREAM_IFACE="${AWG_UPSTREAM_IFACE:-awg1}"
 
 log "Running command '$COMMAND'..."
 _cmd_rc=0
@@ -1149,6 +1160,52 @@ case $COMMAND in
             exit 1
         else
             log "Service restarted."
+        fi
+        if [[ "$AWG_ROLE" == "entry" ]]; then
+            log "Restarting upstream interface ${AWG_UPSTREAM_IFACE}..."
+            if ! systemctl restart "awg-quick@${AWG_UPSTREAM_IFACE}"; then
+                log_warn "Failed to restart ${AWG_UPSTREAM_IFACE}. Clients may lose internet."
+                _cmd_rc=1
+            else
+                log "Upstream ${AWG_UPSTREAM_IFACE} restarted."
+            fi
+        fi
+        ;;
+
+    upstream)
+        # Manage the cascade upstream tunnel (role=entry).
+        # Usage: upstream <show|up|down|restart|apply>
+        if [[ "$AWG_ROLE" != "entry" ]]; then
+            log_error "The 'upstream' command is only available on an entry node (role=entry)."
+            log_error "Current role: $AWG_ROLE. Set via install --role=entry --upstream-conf=..."
+            _cmd_rc=1
+        else
+            _up_action="${CLIENT_NAME:-show}"
+            _up="awg-quick@${AWG_UPSTREAM_IFACE}"
+            case "$_up_action" in
+                show|status)
+                    log "Upstream ${AWG_UPSTREAM_IFACE} status:"
+                    awg show "${AWG_UPSTREAM_IFACE}" 2>/dev/null || log_warn "awg show ${AWG_UPSTREAM_IFACE}: interface not up?"
+                    systemctl status "$_up" --no-pager 2>&1 | while IFS= read -r _ln; do log "  $_ln"; done
+                    ;;
+                up|start)
+                    if systemctl start "$_up"; then log "${AWG_UPSTREAM_IFACE} started."; else log_error "Failed to start ${AWG_UPSTREAM_IFACE}."; _cmd_rc=1; fi
+                    ;;
+                down|stop)
+                    if ! confirm_action "stop" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
+                    if systemctl stop "$_up"; then log "${AWG_UPSTREAM_IFACE} stopped."; else log_error "Failed to stop."; _cmd_rc=1; fi
+                    ;;
+                restart)
+                    if systemctl restart "$_up"; then log "${AWG_UPSTREAM_IFACE} restarted."; else log_error "Failed to restart."; _cmd_rc=1; fi
+                    ;;
+                apply)
+                    apply_config "${AWG_UPSTREAM_IFACE}" || { log_error "apply_config ${AWG_UPSTREAM_IFACE} failed."; _cmd_rc=1; }
+                    ;;
+                *)
+                    log_error "Unknown upstream action: '$_up_action'. Allowed: show, up, down, restart, apply."
+                    _cmd_rc=1
+                    ;;
+            esac
         fi
         ;;
 

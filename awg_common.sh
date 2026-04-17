@@ -192,7 +192,9 @@ safe_load_config() {
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
-                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE)
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
+                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY)
                     export "$key=$value"
                     ;;
             esac
@@ -436,12 +438,50 @@ render_server_config() {
         return 1
     }
 
-    # PostUp/PostDown правила для маршрутизации
-    local postup="iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
-    local postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
+    # PostUp/PostDown правила для маршрутизации.
+    # Три режима:
+    #   role=entry          — FORWARD на $AWG_UPSTREAM_IFACE + TCPMSS clamp,
+    #                         MASQUERADE делается на upstream-стороне
+    #   egress=warp         — policy routing клиентской подсети в Cloudflare WARP
+    #                         (wg-quick@wgcf с Table=off) через отдельную таблицу;
+    #                         NIC остаётся для собственного egress ноды (SSH, apt)
+    #   обычный режим       — FORWARD + MASQUERADE на основном NIC
+    local postup postdown
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        local up_iface="${AWG_UPSTREAM_IFACE:-awg1}"
+        postup="iptables -I FORWARD -i %i -o ${up_iface} -j ACCEPT"
+        postup="${postup}; iptables -I FORWARD -i ${up_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postup="${postup}; iptables -t mangle -A FORWARD -o ${up_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="iptables -D FORWARD -i %i -o ${up_iface} -j ACCEPT"
+        postdown="${postdown}; iptables -D FORWARD -i ${up_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postdown="${postdown}; iptables -t mangle -D FORWARD -o ${up_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+    elif [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        local warp_iface="${AWG_WARP_IFACE:-wgcf}"
+        local warp_tbl="${AWG_WARP_TABLE:-2408}"
+        local warp_prio="${AWG_WARP_PRIORITY:-789}"
+        # Клиенты на exit-ноде приходят из AWG_TUNNEL_SUBNET (после MASQUERADE
+        # на entry в каскаде или напрямую в single-режиме). from-rule берёт
+        # только их, собственный трафик сервера идёт через main таблицу.
+        postup="ip route replace default dev ${warp_iface} table ${warp_tbl}"
+        postup="${postup}; ip rule add from ${server_ip%.*}.0/${subnet_mask} table ${warp_tbl} priority ${warp_prio}"
+        postup="${postup}; iptables -I FORWARD -i %i -o ${warp_iface} -j ACCEPT"
+        postup="${postup}; iptables -I FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postup="${postup}; iptables -t nat -A POSTROUTING -o ${warp_iface} -j MASQUERADE"
+        postup="${postup}; iptables -t mangle -A FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="iptables -t mangle -D FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="${postdown}; iptables -t nat -D POSTROUTING -o ${warp_iface} -j MASQUERADE"
+        postdown="${postdown}; iptables -D FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        postdown="${postdown}; iptables -D FORWARD -i %i -o ${warp_iface} -j ACCEPT"
+        postdown="${postdown}; ip rule del from ${server_ip%.*}.0/${subnet_mask} table ${warp_tbl} priority ${warp_prio}"
+        postdown="${postdown}; ip route del default dev ${warp_iface} table ${warp_tbl}"
+    else
+        postup="iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
+        postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
+    fi
 
-    # IPv6 правила если не отключен
-    if [[ "${DISABLE_IPV6:-1}" -eq 0 ]]; then
+    # IPv6 правила если не отключен (только для обычного режима; WARP и entry
+    # egress через v4, IPv6 forwarding на них осмысленно не настраивается)
+    if [[ "${DISABLE_IPV6:-1}" -eq 0 && "${AWG_ROLE:-single}" != "entry" && "${AWG_EGRESS:-direct}" != "warp" ]]; then
         postup="${postup}; ip6tables -I FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
         postdown="${postdown}; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
@@ -551,10 +591,12 @@ EOF
 # ==============================================================================
 
 # Применение изменений конфигурации
+# Аргументы: [iface=awg0] — имя интерфейса (для multi-hop: awg1 и т.п.)
 # AWG_SKIP_APPLY=1: пропустить apply (для batch-автоматизации)
 # AWG_APPLY_MODE=syncconf|restart: режим применения (конфиг или --apply-mode CLI)
 # flock на .awg_apply.lock: защита от параллельных вызовов
 apply_config() {
+    local iface="${1:-awg0}"
     # Пропуск apply (AWG_SKIP_APPLY=1 manage add/remove ...)
     if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
         log_debug "apply_config пропущен (AWG_SKIP_APPLY=1)."
@@ -574,31 +616,372 @@ apply_config() {
     local rc=0
 
     if [[ "${AWG_APPLY_MODE:-syncconf}" == "restart" ]]; then
-        log "Перезапуск сервиса (apply-mode=restart)..."
-        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
-        [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска."
+        log "Перезапуск сервиса ${iface} (apply-mode=restart)..."
+        systemctl restart "awg-quick@${iface}" 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска ${iface}."
         exec {apply_fd}>&-
         return $rc
     fi
 
     local strip_out
-    strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || {
-        log_warn "awg-quick strip не удался или timeout, использую полный перезапуск."
-        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
-        [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска."
+    strip_out=$(timeout 10 awg-quick strip "${iface}" 2>/dev/null) || {
+        log_warn "awg-quick strip ${iface} не удался или timeout, использую полный перезапуск."
+        systemctl restart "awg-quick@${iface}" 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска ${iface}."
         exec {apply_fd}>&-
         return $rc
     }
-    echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null || {
-        log_warn "awg syncconf не удался или timeout, использую полный перезапуск."
-        systemctl restart awg-quick@awg0 2>/dev/null; rc=$?
-        [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска."
+    echo "$strip_out" | timeout 10 awg syncconf "${iface}" /dev/stdin 2>/dev/null || {
+        log_warn "awg syncconf ${iface} не удался или timeout, использую полный перезапуск."
+        systemctl restart "awg-quick@${iface}" 2>/dev/null; rc=$?
+        [[ $rc -ne 0 ]] && log_warn "Ошибка перезапуска ${iface}."
         exec {apply_fd}>&-
         return $rc
     }
-    log_debug "Конфигурация применена (syncconf)."
+    log_debug "Конфигурация ${iface} применена (syncconf)."
     exec {apply_fd}>&-
     return 0
+}
+
+# ==============================================================================
+# Multi-hop (каскад): upstream-туннель для role=entry
+# ==============================================================================
+#
+# Логика: на entry-ноде поднимается второй интерфейс (по умолчанию awg1), который
+# является клиентом к вышестоящему exit-серверу. Трафик клиентов (из
+# $AWG_TUNNEL_SUBNET) заворачивается в этот интерфейс через policy routing:
+#
+#   Table=<N>       — awg-quick кладёт маршруты из AllowedIPs в таблицу N вместо
+#                     main (не затрагивая egress самой entry-ноды)
+#   FwMark=<mark>   — отличается от 0xca6c (дефолт wg-quick) чтобы избежать
+#                     коллизии с policy-рулзами awg0
+#   ip rule from <subnet> table N  — направляет в каскад только клиентские пакеты,
+#                                    собственный трафик entry (SSH, keepalive
+#                                    awg1) уходит через main таблицу
+#   MASQUERADE -o %i — перекрывает src клиента (10.X.X.X) на awg1-IP entry-ноды,
+#                     иначе exit-сервер отбросит пакет по AllowedIPs-проверке
+#
+# Совпадение obfuscation params между awg1 (entry) и awg0 (exit) — обязательное
+# условие каскада, но S/H/I могут отличаться от клиентского профиля awg0.
+#
+# Защита от command injection: извлекаемые из upstream-конфига значения (ключи,
+# IP, Endpoint) проходят через allowlist-регексп, потом интерполируются в файл
+# через awg_mktemp + mv, никогда не через eval.
+
+# Проверка имени интерфейса (защита от injection в systemctl/iptables)
+_validate_iface_name() {
+    local n="$1"
+    [[ "$n" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]]
+}
+
+# Извлечение значения ключа из секции [Interface] или [Peer] upstream-конфига.
+# _extract_upstream_field <file> <section: Interface|Peer> <key>
+# Пишет значение в stdout, возвращает 1 если не найдено.
+_extract_upstream_field() {
+    local f="$1" sect="$2" key="$3"
+    [[ -f "$f" ]] || return 1
+    awk -v sect="$sect" -v key="$key" '
+        /^\[/ { in_sect = ($0 == "[" sect "]"); next }
+        in_sect && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "")
+            sub("[[:space:]]+$", "")
+            print; exit
+        }
+    ' "$f"
+}
+
+# Формирование и запись конфига upstream-интерфейса (awg1) для каскада.
+# Ожидает env:
+#   AWG_UPSTREAM_CONF     — путь к .conf от manage add (на exit-ноде)
+#   AWG_UPSTREAM_IFACE    — имя интерфейса (по умолчанию awg1)
+#   AWG_UPSTREAM_TABLE    — номер routing table (по умолчанию 123)
+#   AWG_UPSTREAM_FWMARK   — fwmark (по умолчанию 0xca6d, не 0xca6c как у wg-quick)
+#   AWG_UPSTREAM_PRIORITY — приоритет ip rule (по умолчанию 456)
+#   AWG_TUNNEL_SUBNET     — клиентская подсеть для from-rule
+render_upstream_config() {
+    local src="${AWG_UPSTREAM_CONF:-}"
+    local iface="${AWG_UPSTREAM_IFACE:-awg1}"
+    local tbl="${AWG_UPSTREAM_TABLE:-123}"
+    local fwmark="${AWG_UPSTREAM_FWMARK:-0xca6d}"
+    local prio="${AWG_UPSTREAM_PRIORITY:-456}"
+    local client_subnet="${AWG_TUNNEL_SUBNET:-}"
+
+    if [[ -z "$src" || ! -f "$src" ]]; then
+        log_error "render_upstream_config: AWG_UPSTREAM_CONF не задан или файл не найден: '$src'"
+        return 1
+    fi
+    if ! _validate_iface_name "$iface"; then
+        log_error "render_upstream_config: недопустимое имя интерфейса '$iface'"
+        return 1
+    fi
+    if ! [[ "$tbl" =~ ^[0-9]+$ && "$tbl" -ge 1 && "$tbl" -le 4294967295 ]]; then
+        log_error "render_upstream_config: недопустимый Table='$tbl'"
+        return 1
+    fi
+    if ! [[ "$fwmark" =~ ^(0x[0-9a-fA-F]{1,8}|[0-9]+)$ ]]; then
+        log_error "render_upstream_config: недопустимый FwMark='$fwmark'"
+        return 1
+    fi
+    if ! [[ "$prio" =~ ^[0-9]+$ ]]; then
+        log_error "render_upstream_config: недопустимый priority='$prio'"
+        return 1
+    fi
+    if [[ -z "$client_subnet" ]]; then
+        log_error "render_upstream_config: AWG_TUNNEL_SUBNET не задан"
+        return 1
+    fi
+
+    # Извлекаем поля из upstream-конфига
+    local u_priv u_addr u_pub u_psk u_endpoint u_keepalive
+    local u_jc u_jmin u_jmax u_s1 u_s2 u_s3 u_s4 u_h1 u_h2 u_h3 u_h4 u_i1
+    u_priv=$(_extract_upstream_field "$src" Interface PrivateKey)
+    u_addr=$(_extract_upstream_field "$src" Interface Address)
+    u_jc=$(_extract_upstream_field   "$src" Interface Jc)
+    u_jmin=$(_extract_upstream_field "$src" Interface Jmin)
+    u_jmax=$(_extract_upstream_field "$src" Interface Jmax)
+    u_s1=$(_extract_upstream_field   "$src" Interface S1)
+    u_s2=$(_extract_upstream_field   "$src" Interface S2)
+    u_s3=$(_extract_upstream_field   "$src" Interface S3)
+    u_s4=$(_extract_upstream_field   "$src" Interface S4)
+    u_h1=$(_extract_upstream_field   "$src" Interface H1)
+    u_h2=$(_extract_upstream_field   "$src" Interface H2)
+    u_h3=$(_extract_upstream_field   "$src" Interface H3)
+    u_h4=$(_extract_upstream_field   "$src" Interface H4)
+    u_i1=$(_extract_upstream_field   "$src" Interface I1)
+    u_pub=$(_extract_upstream_field      "$src" Peer PublicKey)
+    u_psk=$(_extract_upstream_field      "$src" Peer PresharedKey)
+    u_endpoint=$(_extract_upstream_field "$src" Peer Endpoint)
+    u_keepalive=$(_extract_upstream_field "$src" Peer PersistentKeepalive)
+
+    if [[ -z "$u_priv" || -z "$u_addr" || -z "$u_pub" || -z "$u_endpoint" ]]; then
+        log_error "render_upstream_config: $src не содержит обязательных полей"
+        log_error "  (Interface.PrivateKey/Address, Peer.PublicKey/Endpoint)"
+        return 1
+    fi
+    # Все 11 AWG 2.0 полей должны быть в upstream-конфиге (иначе хендшейк упадёт)
+    local f miss=0
+    for f in u_jc u_jmin u_jmax u_s1 u_s2 u_s3 u_s4 u_h1 u_h2 u_h3 u_h4; do
+        if [[ -z "${!f}" ]]; then
+            log_error "render_upstream_config: $src отсутствует ${f#u_}"
+            miss=1
+        fi
+    done
+    (( miss == 0 )) || return 1
+
+    # Запрещаем newline/CR/quotes в извлечённых значениях — защита от injection
+    # в выходной файл конфига через подделанный upstream .conf
+    for f in u_priv u_addr u_pub u_psk u_endpoint u_keepalive \
+             u_jc u_jmin u_jmax u_s1 u_s2 u_s3 u_s4 u_h1 u_h2 u_h3 u_h4 u_i1; do
+        local v="${!f}"
+        if [[ "$v" == *$'\n'* || "$v" == *$'\r'* || "$v" == *\'* || "$v" == *\"* ]]; then
+            log_error "render_upstream_config: подозрительные символы в ${f#u_}, отклонено"
+            return 1
+        fi
+    done
+
+    # Address в клиентском конфиге — a.b.c.d/32, оставляем как есть; если /24
+    # попал из ручного примера — приводим к /32
+    if [[ "$u_addr" =~ ^([0-9.]+)/([0-9]+)$ ]]; then
+        u_addr="${BASH_REMATCH[1]}/32"
+    fi
+
+    local out_conf
+    out_conf="$(dirname "$SERVER_CONF_FILE")/${iface}.conf"
+
+    local conf_dir
+    conf_dir=$(dirname "$out_conf")
+    mkdir -p "$conf_dir" || { log_error "Ошибка создания $conf_dir"; return 1; }
+
+    local tmpfile
+    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; return 1; }
+
+    {
+        echo "[Interface]"
+        echo "PrivateKey = ${u_priv}"
+        echo "Address = ${u_addr}"
+        echo "MTU = 1380"
+        echo "Table = ${tbl}"
+        echo "FwMark = ${fwmark}"
+        echo "PostUp = ip rule add from ${client_subnet%/*}/${client_subnet##*/} table ${tbl} priority ${prio}"
+        echo "PostUp = iptables -t nat -A POSTROUTING -o %i -j MASQUERADE"
+        echo "PreDown = ip rule del from ${client_subnet%/*}/${client_subnet##*/} table ${tbl} priority ${prio}"
+        echo "PreDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE"
+        echo "Jc = ${u_jc}"
+        echo "Jmin = ${u_jmin}"
+        echo "Jmax = ${u_jmax}"
+        echo "S1 = ${u_s1}"
+        echo "S2 = ${u_s2}"
+        echo "S3 = ${u_s3}"
+        echo "S4 = ${u_s4}"
+        echo "H1 = ${u_h1}"
+        echo "H2 = ${u_h2}"
+        echo "H3 = ${u_h3}"
+        echo "H4 = ${u_h4}"
+        [[ -n "$u_i1" ]] && echo "I1 = ${u_i1}"
+        echo ""
+        echo "[Peer]"
+        echo "PublicKey = ${u_pub}"
+        [[ -n "$u_psk" ]] && echo "PresharedKey = ${u_psk}"
+        echo "Endpoint = ${u_endpoint}"
+        echo "AllowedIPs = 0.0.0.0/0"
+        echo "PersistentKeepalive = ${u_keepalive:-25}"
+    } > "$tmpfile"
+
+    if ! mv "$tmpfile" "$out_conf"; then
+        rm -f "$tmpfile"
+        log_error "Ошибка записи upstream-конфига $out_conf"
+        return 1
+    fi
+    chmod 600 "$out_conf"
+    log "Upstream-интерфейс ${iface} записан: $out_conf (table=${tbl}, fwmark=${fwmark})"
+    return 0
+}
+
+# ==============================================================================
+# WARP egress: вывод клиентского трафика через Cloudflare WARP
+# ==============================================================================
+#
+# Используется на role=exit / role=single когда пользователь хочет чтобы
+# внешние сайты видели IP Cloudflare вместо IP VPS. Реализация:
+#
+#   1. wgcf скачивается с github.com/ViRb3/wgcf (релизы с готовыми бинарями
+#      под amd64/arm64/armv7). TLS-проверка curl, SHA256-пин НЕ делаем —
+#      релизы wgcf подписаны автором и меняются часто; SHA потерял бы смысл.
+#   2. wgcf register создаёт Cloudflare-аккаунт бесплатного WARP (account.toml).
+#   3. wgcf generate собирает wg-quick-конфиг с реальными ключами аккаунта.
+#   4. Патчим конфиг: Table=off (НЕ трогаем дефолтный маршрут хоста — иначе SSH
+#      отвалится), убираем DNS=... (иначе resolv.conf перепишется на WARP).
+#   5. Включаем wg-quick@wgcf — поднимется wgcf интерфейс, маршрутов в main
+#      таблицу не добавится благодаря Table=off.
+#
+# Конкретные iptables/ip rule правила для заворота клиентов в wgcf ставятся
+# в PostUp/PostDown самого awg0 (см. render_server_config, ветка AWG_EGRESS=warp).
+# Эта функция готовит только wgcf-side.
+
+# Скачать бинарь wgcf с GitHub Releases для текущей архитектуры.
+# Идемпотентно: если /usr/local/bin/wgcf уже есть — ничего не делает.
+_download_wgcf_binary() {
+    if command -v wgcf >/dev/null 2>&1; then
+        log_debug "wgcf уже установлен: $(command -v wgcf)"
+        return 0
+    fi
+    local arch url
+    case "$(uname -m)" in
+        x86_64|amd64)   arch="amd64" ;;
+        aarch64|arm64)  arch="arm64" ;;
+        armv7l|armv7)   arch="armv7" ;;
+        *) log_error "Архитектура $(uname -m) не поддерживается wgcf"; return 1 ;;
+    esac
+    # GitHub API даёт JSON с assets; вытаскиваем browser_download_url для нужного arch
+    url=$(curl -fsSL --max-time 15 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
+        | grep '"browser_download_url"' \
+        | grep -E "linux_${arch}\"?$" \
+        | head -1 \
+        | sed -E 's/.*"(https[^"]+)".*/\1/')
+    if [[ -z "$url" ]]; then
+        log_error "Не удалось найти релиз wgcf для arch=${arch} через GitHub API"
+        return 1
+    fi
+    log "Скачивание wgcf: $url"
+    if ! curl -fsSL --max-time 60 --retry 2 -o /usr/local/bin/wgcf "$url"; then
+        log_error "Ошибка скачивания wgcf"
+        rm -f /usr/local/bin/wgcf
+        return 1
+    fi
+    chmod 0755 /usr/local/bin/wgcf || { log_error "chmod wgcf"; return 1; }
+    log "wgcf установлен: /usr/local/bin/wgcf"
+    return 0
+}
+
+# Зарегистрировать Cloudflare WARP-аккаунт и сгенерировать wgcf.conf с Table=off.
+# Идемпотентно: если оба файла уже есть — только проверяет/исправляет Table=off.
+setup_warp_egress() {
+    local warp_conf="/etc/wireguard/wgcf.conf"
+    local warp_account="/etc/wireguard/wgcf-account.toml"
+    local marker="${AWG_DIR}/.wgcf_enabled_by_installer"
+
+    if [[ "${AWG_EGRESS:-direct}" != "warp" ]]; then
+        log_debug "setup_warp_egress: AWG_EGRESS != warp, пропуск"
+        return 0
+    fi
+
+    _download_wgcf_binary || return 1
+
+    mkdir -p /etc/wireguard || { log_error "mkdir /etc/wireguard"; return 1; }
+    chmod 700 /etc/wireguard
+
+    # Регистрация аккаунта (только если ещё нет account.toml)
+    if [[ ! -f "$warp_account" ]]; then
+        log "Регистрация WARP-аккаунта через wgcf..."
+        # wgcf >=2.2 поддерживает --accept-tos; старые версии требуют yes на stdin.
+        # Оба варианта cov'ered одной цепочкой.
+        if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register --accept-tos >/dev/null 2>&1); then
+            if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register >/dev/null 2>&1); then
+                log_error "wgcf register не удался. Проверьте доступ к api.cloudflareclient.com"
+                return 1
+            fi
+        fi
+        [[ -f "$warp_account" ]] || {
+            log_error "wgcf register прошёл, но $warp_account не создан"
+            return 1
+        }
+        chmod 600 "$warp_account"
+    else
+        log_debug "WARP-аккаунт уже зарегистрирован ($warp_account)"
+    fi
+
+    # Генерация wgcf.conf (только если нет)
+    if [[ ! -f "$warp_conf" ]]; then
+        log "Генерация WARP-конфига..."
+        ( cd /etc/wireguard && rm -f wgcf-profile.conf && wgcf generate >/dev/null 2>&1 ) || {
+            log_error "wgcf generate не удался"
+            return 1
+        }
+        [[ -f /etc/wireguard/wgcf-profile.conf ]] || {
+            log_error "wgcf generate не создал wgcf-profile.conf"
+            return 1
+        }
+        mv /etc/wireguard/wgcf-profile.conf "$warp_conf"
+        chmod 600 "$warp_conf"
+    else
+        log_debug "WARP-конфиг уже существует ($warp_conf)"
+    fi
+
+    # Патч: Table=off (обязательно, иначе default route хоста уходит в wgcf и
+    # разрывает SSH) + убираем DNS=... (чтобы не перехватывало resolv.conf)
+    sed -i '/^DNS[[:space:]]*=/d' "$warp_conf" || log_warn "sed DNS удаление"
+    if ! grep -qE '^Table[[:space:]]*=[[:space:]]*off$' "$warp_conf"; then
+        # Вставляем Table=off сразу после [Interface]
+        local tmp
+        tmp=$(awg_mktemp) || { log_error "mktemp"; return 1; }
+        awk '/^\[Interface\]/{print; print "Table = off"; next} {print}' "$warp_conf" > "$tmp" \
+            && mv "$tmp" "$warp_conf" \
+            || { rm -f "$tmp"; log_error "не удалось добавить Table=off"; return 1; }
+        chmod 600 "$warp_conf"
+        log "Table=off добавлен в $warp_conf"
+    fi
+
+    # Маркер того что wgcf поднят нашим инсталлятором (нужен для uninstall —
+    # чтобы не снести wgcf пользователя если он был до нас)
+    touch "$marker" 2>/dev/null || log_warn "Не создан маркер $marker"
+
+    log "Запуск wg-quick@wgcf..."
+    if ! systemctl enable --now wg-quick@wgcf 2>/dev/null; then
+        log_error "systemctl enable --now wg-quick@wgcf упал"
+        return 1
+    fi
+
+    # Ждём появления интерфейса (до 5 сек)
+    local _i
+    for _i in 1 2 3 4 5; do
+        if ip link show wgcf >/dev/null 2>&1; then
+            log "Интерфейс wgcf поднят."
+            return 0
+        fi
+        sleep 1
+    done
+    log_error "Интерфейс wgcf так и не поднялся. Проверьте: systemctl status wg-quick@wgcf"
+    return 1
 }
 
 # ==============================================================================

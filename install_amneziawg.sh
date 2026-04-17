@@ -41,6 +41,11 @@ UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=
 _APT_UPDATED=0
 CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"
 CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0
+# Multi-hop / каскад: роль ноды и параметры upstream-туннеля (для role=entry)
+CLI_ROLE=""; CLI_UPSTREAM_CONF=""; CLI_UPSTREAM_IFACE=""
+CLI_UPSTREAM_TABLE=""; CLI_UPSTREAM_FWMARK=""
+# WARP egress: заворот клиентского трафика в Cloudflare WARP (для role=exit|single)
+CLI_EGRESS=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""
 
 # --- Автоочистка временных файлов ---
 _install_temp_files=()
@@ -74,6 +79,14 @@ while [[ $# -gt 0 ]]; do
         --jc=*)          CLI_JC="${1#*=}" ;;
         --jmin=*)        CLI_JMIN="${1#*=}" ;;
         --jmax=*)        CLI_JMAX="${1#*=}" ;;
+        --role=*)        CLI_ROLE="${1#*=}" ;;
+        --upstream-conf=*)    CLI_UPSTREAM_CONF="${1#*=}" ;;
+        --upstream-iface=*)   CLI_UPSTREAM_IFACE="${1#*=}" ;;
+        --upstream-table=*)   CLI_UPSTREAM_TABLE="${1#*=}" ;;
+        --upstream-fwmark=*)  CLI_UPSTREAM_FWMARK="${1#*=}" ;;
+        --egress=*)           CLI_EGRESS="${1#*=}" ;;
+        --warp-table=*)       CLI_WARP_TABLE="${1#*=}" ;;
+        --warp-priority=*)    CLI_WARP_PRIORITY="${1#*=}" ;;
         *) echo "Неизвестный аргумент: $1"; HELP=1 ;;
     esac
     shift
@@ -155,11 +168,33 @@ show_help() {
   --jmin=N             Задать Jmin вручную (0-1280, поверх preset)
   --jmax=N             Задать Jmax вручную (0-1280, поверх preset, должно быть >= Jmin)
 
+Multi-hop (каскад из двух AWG-серверов):
+  --role=РОЛЬ           single (умолч.) | exit | entry
+                        exit:  обычный сервер, к которому цепляется entry
+                        entry: дополнительно поднимает upstream-туннель к exit
+  --upstream-conf=ФАЙЛ  (для role=entry) путь к .conf от manage add на exit-ноде
+  --upstream-iface=ИМЯ  имя upstream-интерфейса (умолч. awg1)
+  --upstream-table=N    routing table для клиентского трафика (умолч. 123)
+  --upstream-fwmark=HEX fwmark для upstream-пакетов (умолч. 0xca6d)
+
+WARP egress (для role=exit или single — НЕ совместимо с role=entry):
+  --egress=РЕЖИМ        direct (умолч.) | warp
+                        warp: ставит wgcf (Cloudflare WARP WireGuard), поднимает
+                        wg-quick@wgcf с Table=off и заворачивает клиентский
+                        трафик AWG в WARP через policy routing. Внешние сайты
+                        видят IP Cloudflare, не IP VPS.
+  --warp-table=N        routing table для WARP-трафика (умолч. 2408)
+  --warp-priority=N     приоритет ip rule для WARP (умолч. 789)
+
 Примеры:
   sudo bash install_amneziawg.sh                             # Интерактивная установка
   sudo bash install_amneziawg.sh --port=51820 --route-all    # Неинтерактивная
   sudo bash install_amneziawg.sh --route-amnezia --yes       # Полностью автоматическая
   sudo bash install_amneziawg.sh --preset=mobile --yes       # Оптимизация для мобильных сетей
+  sudo bash install_amneziawg.sh --role=exit --yes           # Exit-нода каскада
+  sudo bash install_amneziawg.sh --role=entry --upstream-conf=/root/from_exit.conf --yes
+  sudo bash install_amneziawg.sh --egress=warp --yes         # Single-сервер с WARP egress
+  sudo bash install_amneziawg.sh --role=exit --egress=warp --yes   # Exit-нода каскада с WARP
   sudo bash install_amneziawg.sh --uninstall                 # Удаление
   sudo bash install_amneziawg.sh --diagnostic                # Диагностика
 
@@ -375,7 +410,9 @@ safe_load_config() {
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
-                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE)
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
+                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY)
                     export "$key=$value"
                     ;;
             esac
@@ -988,6 +1025,11 @@ setup_improved_firewall() {
                 || { log_warn "UFW: ошибка route rule"; ufw_errors=1; }
             log "Правило маршрутизации VPN добавлено (awg0 → ${main_nic})."
         fi
+        if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+            ufw route allow in on awg0 out on "${AWG_WARP_IFACE:-wgcf}" comment "AmneziaWG→WARP egress" \
+                || { log_warn "UFW: ошибка route awg0→${AWG_WARP_IFACE:-wgcf}"; ufw_errors=1; }
+            log "Правило маршрутизации WARP добавлено (awg0 → ${AWG_WARP_IFACE:-wgcf})."
+        fi
         if [[ "$ufw_errors" -ne 0 ]]; then
             log_error "Одна или несколько правил UFW не применились. Проверьте настройки вручную."
             return 1
@@ -1021,6 +1063,10 @@ setup_improved_firewall() {
         if [[ -n "$main_nic" ]]; then
             ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
                 || { log_warn "UFW: ошибка route rule"; ufw_errors=1; }
+        fi
+        if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+            ufw route allow in on awg0 out on "${AWG_WARP_IFACE:-wgcf}" comment "AmneziaWG→WARP egress" \
+                || { log_warn "UFW: ошибка route awg0→${AWG_WARP_IFACE:-wgcf}"; ufw_errors=1; }
         fi
         if [[ "$ufw_errors" -ne 0 ]]; then
             log_error "Одна или несколько правил UFW не применились. Проверьте настройки вручную."
@@ -1270,6 +1316,29 @@ step_uninstall() {
     log "Остановка сервиса..."
     systemctl stop awg-quick@awg0 2>/dev/null
     systemctl disable awg-quick@awg0 2>/dev/null
+    # Multi-hop: гасим и upstream-интерфейс если role=entry
+    local _up_iface=""
+    if [[ -f "$CONFIG_FILE" ]]; then
+        _up_iface=$(safe_read_config_key "AWG_UPSTREAM_IFACE" "$CONFIG_FILE" 2>/dev/null || echo "")
+    fi
+    _up_iface="${_up_iface:-awg1}"
+    if [[ "$_up_iface" != "awg0" ]] && systemctl list-unit-files "awg-quick@${_up_iface}.service" 2>/dev/null | grep -q "${_up_iface}"; then
+        log "Остановка upstream-интерфейса ${_up_iface}..."
+        systemctl stop "awg-quick@${_up_iface}" 2>/dev/null
+        systemctl disable "awg-quick@${_up_iface}" 2>/dev/null
+    fi
+    # WARP egress: гасим wgcf ТОЛЬКО если он был поднят нашим инсталлятором.
+    # Маркер $AWG_DIR/.wgcf_enabled_by_installer защищает уже существовавший
+    # у пользователя wgcf от destructive removal.
+    if [[ -f "$AWG_DIR/.wgcf_enabled_by_installer" ]]; then
+        log "Остановка Cloudflare WARP (wg-quick@wgcf)..."
+        systemctl stop wg-quick@wgcf 2>/dev/null
+        systemctl disable wg-quick@wgcf 2>/dev/null
+        rm -f /etc/wireguard/wgcf.conf /etc/wireguard/wgcf-account.toml
+        rm -f /usr/local/bin/wgcf
+        rm -f "$AWG_DIR/.wgcf_enabled_by_installer"
+        log "WARP удалён."
+    fi
     modprobe -r amneziawg 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
         log "Очистка правил UFW для AmneziaWG..."
@@ -1435,6 +1504,81 @@ initialize_setup() {
     fi
     if [[ "$CLI_NO_TWEAKS" -eq 1 ]]; then NO_TWEAKS=1; fi
 
+    # Multi-hop: роль ноды и параметры upstream-туннеля.
+    # CLI > сохранённый конфиг > дефолты. Значение 'single' не требует никаких
+    # upstream-полей; 'exit' тоже (это обычный сервер, просто маркируется ролью
+    # для манагера и документации); 'entry' требует upstream-конфига.
+    AWG_ROLE="${AWG_ROLE:-single}"
+    if [[ -n "$CLI_ROLE" ]]; then AWG_ROLE="$CLI_ROLE"; fi
+    case "$AWG_ROLE" in
+        single|exit|entry) ;;
+        *) die "Некорректная --role='$AWG_ROLE'. Допустимые: single, exit, entry." ;;
+    esac
+    AWG_UPSTREAM_IFACE="${CLI_UPSTREAM_IFACE:-${AWG_UPSTREAM_IFACE:-awg1}}"
+    AWG_UPSTREAM_TABLE="${CLI_UPSTREAM_TABLE:-${AWG_UPSTREAM_TABLE:-123}}"
+    AWG_UPSTREAM_FWMARK="${CLI_UPSTREAM_FWMARK:-${AWG_UPSTREAM_FWMARK:-0xca6d}}"
+    AWG_UPSTREAM_PRIORITY="${AWG_UPSTREAM_PRIORITY:-456}"
+    if [[ "$AWG_ROLE" == "entry" ]]; then
+        if [[ "$AWG_UPSTREAM_IFACE" == "awg0" ]]; then
+            die "--upstream-iface=awg0 конфликтует с основным интерфейсом. Используйте awg1."
+        fi
+        if ! [[ "$AWG_UPSTREAM_IFACE" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]]; then
+            die "Некорректное --upstream-iface='$AWG_UPSTREAM_IFACE'."
+        fi
+        if ! [[ "$AWG_UPSTREAM_TABLE" =~ ^[0-9]+$ ]] || [[ "$AWG_UPSTREAM_TABLE" -lt 1 ]] \
+           || [[ "$AWG_UPSTREAM_TABLE" -gt 4294967295 ]]; then
+            die "Некорректное --upstream-table='$AWG_UPSTREAM_TABLE'."
+        fi
+        if ! [[ "$AWG_UPSTREAM_FWMARK" =~ ^(0x[0-9a-fA-F]{1,8}|[0-9]+)$ ]]; then
+            die "Некорректное --upstream-fwmark='$AWG_UPSTREAM_FWMARK' (ожидается 0xHHHH или число)."
+        fi
+        # Upstream-конфиг: CLI обязателен только на первом запуске. Если
+        # awg1.conf уже лежит на диске (второй запуск после reboot) — считаем,
+        # что он был корректно создан ранее и не требуем --upstream-conf повторно.
+        local _up_iface_conf="/etc/amnezia/amneziawg/${AWG_UPSTREAM_IFACE}.conf"
+        if [[ -n "$CLI_UPSTREAM_CONF" ]]; then
+            if [[ ! -f "$CLI_UPSTREAM_CONF" ]]; then
+                die "--upstream-conf не найден: '$CLI_UPSTREAM_CONF'."
+            fi
+            AWG_UPSTREAM_CONF="$CLI_UPSTREAM_CONF"
+            export AWG_UPSTREAM_CONF
+        elif [[ ! -f "$_up_iface_conf" ]]; then
+            die "role=entry требует --upstream-conf=<файл.conf> (от manage add на exit-ноде)."
+        fi
+    fi
+    export AWG_ROLE AWG_UPSTREAM_IFACE AWG_UPSTREAM_TABLE AWG_UPSTREAM_FWMARK AWG_UPSTREAM_PRIORITY
+
+    # WARP egress: клиентский трафик уходит в Cloudflare WARP вместо прямого
+    # NAT на eth0. Доступен только на role=single или role=exit. На entry
+    # egress уже делегирован upstream-ноде — WARP там был бы третьей обёрткой
+    # без смысла, явно отвергаем.
+    AWG_EGRESS="${AWG_EGRESS:-direct}"
+    if [[ -n "$CLI_EGRESS" ]]; then AWG_EGRESS="$CLI_EGRESS"; fi
+    case "$AWG_EGRESS" in
+        direct|warp) ;;
+        *) die "Некорректный --egress='$AWG_EGRESS'. Допустимо: direct, warp." ;;
+    esac
+    if [[ "$AWG_EGRESS" == "warp" && "$AWG_ROLE" == "entry" ]]; then
+        die "--egress=warp несовместим с --role=entry. WARP ставится на exit-ноде (или single), не на entry."
+    fi
+    AWG_WARP_IFACE="${AWG_WARP_IFACE:-wgcf}"
+    AWG_WARP_TABLE="${CLI_WARP_TABLE:-${AWG_WARP_TABLE:-2408}}"
+    AWG_WARP_PRIORITY="${CLI_WARP_PRIORITY:-${AWG_WARP_PRIORITY:-789}}"
+    if [[ "$AWG_EGRESS" == "warp" ]]; then
+        if ! [[ "$AWG_WARP_TABLE" =~ ^[0-9]+$ ]] || [[ "$AWG_WARP_TABLE" -lt 1 ]] \
+           || [[ "$AWG_WARP_TABLE" -gt 4294967295 ]]; then
+            die "Некорректное --warp-table='$AWG_WARP_TABLE'."
+        fi
+        if ! [[ "$AWG_WARP_PRIORITY" =~ ^[0-9]+$ ]]; then
+            die "Некорректное --warp-priority='$AWG_WARP_PRIORITY'."
+        fi
+        # Коллизия с upstream-таблицей 123 (в single/exit её нет, но защитим)
+        if [[ "$AWG_WARP_TABLE" == "${AWG_UPSTREAM_TABLE:-123}" ]]; then
+            die "--warp-table не может совпадать с --upstream-table (${AWG_WARP_TABLE})."
+        fi
+    fi
+    export AWG_EGRESS AWG_WARP_IFACE AWG_WARP_TABLE AWG_WARP_PRIORITY
+
     # Валидация после CLI override
     validate_port "$AWG_PORT"
     validate_subnet "$AWG_TUNNEL_SUBNET"
@@ -1524,6 +1668,17 @@ export AWG_I1='${AWG_I1}'
 export AWG_PRESET='${AWG_PRESET:-default}'
 export NO_TWEAKS=${NO_TWEAKS}
 export AWG_APPLY_MODE='${AWG_APPLY_MODE:-syncconf}'
+# Multi-hop (каскад)
+export AWG_ROLE='${AWG_ROLE:-single}'
+export AWG_UPSTREAM_IFACE='${AWG_UPSTREAM_IFACE:-awg1}'
+export AWG_UPSTREAM_TABLE=${AWG_UPSTREAM_TABLE:-123}
+export AWG_UPSTREAM_FWMARK='${AWG_UPSTREAM_FWMARK:-0xca6d}'
+export AWG_UPSTREAM_PRIORITY=${AWG_UPSTREAM_PRIORITY:-456}
+# WARP egress (Cloudflare)
+export AWG_EGRESS='${AWG_EGRESS:-direct}'
+export AWG_WARP_IFACE='${AWG_WARP_IFACE:-wgcf}'
+export AWG_WARP_TABLE=${AWG_WARP_TABLE:-2408}
+export AWG_WARP_PRIORITY=${AWG_WARP_PRIORITY:-789}
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -2010,6 +2165,14 @@ step6_generate_configs() {
         log "Бэкап серверного конфига: $s_bak"
     fi
 
+    # WARP egress: поднимаем wgcf ДО рендера awg0.conf — PostUp в конфиге
+    # уже будет ссылаться на wgcf-интерфейс, а он должен существовать к
+    # моменту systemctl start awg-quick@awg0 в шаге 7.
+    if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        log "Установка WARP egress (Cloudflare)..."
+        setup_warp_egress || die "Ошибка setup_warp_egress. См. лог."
+    fi
+
     # Создание серверного конфига AWG 2.0
     log "Создание серверного конфига..."
     render_server_config || die "Ошибка создания серверного конфига."
@@ -2043,6 +2206,27 @@ step6_generate_configs() {
 
     # Валидация конфига
     validate_awg_config || log_warn "Валидация конфига выявила проблемы."
+
+    # Multi-hop: развёртываем upstream-интерфейс (awg1) для role=entry.
+    # Если --upstream-conf не передан на повторном запуске — сохраняем уже
+    # существующий ${AWG_UPSTREAM_IFACE}.conf как есть.
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        local _up_conf_out="/etc/amnezia/amneziawg/${AWG_UPSTREAM_IFACE:-awg1}.conf"
+        if [[ -n "${AWG_UPSTREAM_CONF:-}" ]]; then
+            log "Развёртывание upstream-интерфейса ${AWG_UPSTREAM_IFACE:-awg1} из ${AWG_UPSTREAM_CONF}..."
+            if [[ -f "$_up_conf_out" ]]; then
+                local _up_bak
+                _up_bak="${_up_conf_out}.bak-$(date +%F_%H%M%S)"
+                cp "$_up_conf_out" "$_up_bak" || log_warn "Ошибка бэкапа $_up_bak"
+                log "Бэкап upstream-конфига: $_up_bak"
+            fi
+            render_upstream_config || die "Ошибка создания upstream-конфига (${AWG_UPSTREAM_IFACE:-awg1})."
+        elif [[ ! -f "$_up_conf_out" ]]; then
+            die "role=entry: нет upstream-конфига ни в CLI, ни на диске ($_up_conf_out)."
+        else
+            log "Upstream-конфиг уже существует: $_up_conf_out — пропуск рендеринга."
+        fi
+    fi
 
     # Установка прав доступа
     secure_files
@@ -2082,6 +2266,23 @@ step7_start_service() {
         [[ $_attempt -lt 5 ]] && log_debug "Ожидание запуска сервиса... (попытка $_attempt/5)"
     done
     check_service_status || die "Проверка статуса сервиса не пройдена."
+
+    # Multi-hop: поднимаем upstream-интерфейс. Его отсутствие не критично для
+    # самого awg0 (клиентский хендшейк будет работать), но клиенты не получат
+    # интернет до включения каскада — предупреждаем.
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        local _up="${AWG_UPSTREAM_IFACE:-awg1}"
+        log "Включение и запуск awg-quick@${_up} (upstream-каскад)..."
+        if systemctl enable --now "awg-quick@${_up}"; then
+            log "Upstream-туннель ${_up} запущен."
+            if command -v ufw &>/dev/null && ! ufw status 2>/dev/null | grep -q inactive; then
+                ufw route allow in on awg0 out on "${_up}" comment "AmneziaWG cascade awg0->${_up}" \
+                    || log_warn "UFW: ошибка добавления route awg0→${_up}."
+            fi
+        else
+            log_warn "awg-quick@${_up} не стартовал. Проверьте: systemctl status awg-quick@${_up}"
+        fi
+    fi
 
     # Fail2Ban
     if [[ "$NO_TWEAKS" -eq 0 ]]; then
