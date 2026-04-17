@@ -96,9 +96,9 @@ Works on Ubuntu 24.04/25.10 and Debian 12/13. Any cheap VPS with 1 GB RAM is eno
 <a id="tldr"></a>
 ## ⚡ TL;DR — full recipe: two servers + WARP + mobile-DPI bypass
 
-> **The SNPR/amneziawg-installer fork** adds a multi-hop cascade, Cloudflare WARP egress on the exit node, and aggressive QUIC masquerading for mobile-carrier DPI. The recipe below is exactly the setup we brought up live: clients connect to **Node 2** on UDP 500, traffic is forwarded through **Node 1**, and from there out via **Cloudflare WARP** — external sites see a Cloudflare IP, not the VPS.
+> **The SNPR/amneziawg-installer fork** adds a multi-hop cascade, Cloudflare WARP egress on the exit node, and aggressive QUIC masquerading for mobile-carrier DPI. The recipe below brings up the full stack: clients connect to **Node 2** on UDP 500, traffic is forwarded through **Node 1**, and from there out via **Cloudflare WARP** — external sites see a Cloudflare IP, not the VPS.
 >
-> You need: **2 VPSes** (Ubuntu 24.04/25.10 or Debian 12/13), root over SSH. We'll call Node 1 (exit) `IP1` and Node 2 (entry) `IP2`.
+> Prerequisites: **2 VPSes** (Ubuntu 24.04/25.10 or Debian 12/13), root over SSH. Throughout the recipe Node 1 (exit) is referred to as `IP1` and Node 2 (entry) as `IP2`.
 
 ### 1. On both nodes — clone the fork
 
