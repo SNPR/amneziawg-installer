@@ -914,10 +914,21 @@ setup_warp_egress() {
     if [[ ! -f "$warp_account" ]]; then
         log "Регистрация WARP-аккаунта через wgcf..."
         # wgcf >=2.2 поддерживает --accept-tos; старые версии требуют yes на stdin.
-        # Оба варианта cov'ered одной цепочкой.
-        if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register --accept-tos >/dev/null 2>&1); then
-            if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register >/dev/null 2>&1); then
+        # Оба варианта cov'ered одной цепочкой. stderr захватываем в файл и
+        # при падении выводим построчно в log_error — иначе диагностика
+        # (блокировка API Cloudflare, rate-limit, TLS-проблема) теряется.
+        local _wgcf_err
+        _wgcf_err=$(awg_mktemp) || _wgcf_err="/tmp/wgcf_register.err.$$"
+        if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register --accept-tos >/dev/null 2>"$_wgcf_err"); then
+            if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register >/dev/null 2>"$_wgcf_err"); then
                 log_error "wgcf register не удался. Проверьте доступ к api.cloudflareclient.com"
+                if [[ -s "$_wgcf_err" ]]; then
+                    log_error "wgcf stderr:"
+                    while IFS= read -r _ln; do log_error "  $_ln"; done < "$_wgcf_err"
+                fi
+                # Удаляем частичный account.toml, если wgcf успел что-то записать
+                # до падения — иначе следующий запуск увидит файл и пропустит register.
+                rm -f "$warp_account"
                 return 1
             fi
         fi
