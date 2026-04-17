@@ -163,7 +163,8 @@ Options:
   --diagnostic          Generate diagnostic report and exit
   -v, --verbose         Verbose output for debugging (including DEBUG)
   --no-color            Disable colored terminal output
-  --port=NUMBER         Set UDP port (1024-65535) non-interactively
+  --port=NUMBER         Set UDP port (1-65535) non-interactively.
+                        Useful against mobile DPI: 500 (IKE/NAT-T), 443, 53.
   --subnet=SUBNET       Set tunnel subnet (x.x.x.x/yy) non-interactively
   --allow-ipv6          Keep IPv6 enabled non-interactively
   --disallow-ipv6       Force-disable IPv6 non-interactively
@@ -470,8 +471,12 @@ validate_junk_size() {
 
 validate_port() {
     local port="$1"
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1024 ]] || [[ "$port" -gt 65535 ]]; then
-        die "Invalid port: '$port'. Allowed range: 1024-65535."
+    # Lower bound 1, not 1024: wg-quick runs as root under systemd, so
+    # binding to privileged ports (500 IKE/NAT-T, 443, 53) is fine — and
+    # actually useful for defeating mobile-carrier DPI, which typically
+    # leaves "service" ports unfiltered.
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        die "Invalid port: '$port'. Allowed range: 1-65535."
     fi
 }
 
@@ -1606,7 +1611,7 @@ initialize_setup() {
     if [[ "$config_exists" -eq 0 ]]; then
         log "Requesting settings from user (first run)."
         if [[ "$AUTO_YES" -eq 0 ]]; then
-            read -rp "Enter AmneziaWG UDP port (1024-65535) [${AWG_PORT}]: " input_port < /dev/tty
+            read -rp "Enter AmneziaWG UDP port (1-65535) [${AWG_PORT}]: " input_port < /dev/tty
             if [[ -n "$input_port" ]]; then AWG_PORT=$input_port; fi
         fi
         validate_port "$AWG_PORT"
