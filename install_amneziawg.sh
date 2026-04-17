@@ -29,6 +29,16 @@ COMMON_SCRIPT_PATH="$AWG_DIR/awg_common.sh"
 MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/${AWG_BRANCH}/manage_amneziawg.sh"
 MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 
+# Путь к директории installer'а — фиксируем ДО первого cd. Нужен step5'у
+# чтобы обнаружить "запуск из клона" и взять awg_common.sh / manage_amneziawg.sh
+# локально, не качая их из CDN. Резолв через relative BASH_SOURCE[0] ПОСЛЕ
+# того, как initialize_setup сделала `cd "$AWG_DIR"`, давал $AWG_DIR и ломал
+# детекцию. Фиксируем здесь, пока cwd ещё равна пользовательской папке.
+INSTALLER_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || INSTALLER_DIR=""
+fi
+
 # SHA256 checksums скачиваемых скриптов. Обновляются при каждом релизе.
 # Проверяются в step5_download_scripts() после curl.
 # Если AWG_BRANCH переопределён (не v$SCRIPT_VERSION), проверка пропускается.
@@ -2112,10 +2122,13 @@ step5_download_scripts() {
     # рабочим для форков: без этого ветвления step5 тянул бы upstream-версии
     # из CDN, а наши локальные модификации в форке игнорировались бы.
     # CDN остаётся как fallback для `curl | bash` сценария.
-    local script_dir=""
-    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
-    fi
+    #
+    # $INSTALLER_DIR зафиксирован наверху скрипта ДО первого cd — поздний
+    # резолв BASH_SOURCE[0] с относительным путём давал AWG_DIR (потому что
+    # initialize_setup уже успела туда cd), и условие script_dir != AWG_DIR
+    # ложно срабатывало на любой инвокации вида `sudo bash install_amneziawg.sh`
+    # из папки клона.
+    local script_dir="${INSTALLER_DIR:-}"
     # basename'ы берём из URL — EN-инсталлятор ссылается на *_en.sh файлы,
     # и рядом с install_amneziawg_en.sh в клоне лежат именно они.
     local _common_basename="${COMMON_SCRIPT_URL##*/}"
@@ -2135,6 +2148,7 @@ step5_download_scripts() {
         update_state 6
         return 0
     fi
+    log_debug "Локальный клон не обнаружен (INSTALLER_DIR='${script_dir}', AWG_DIR='$AWG_DIR') — качаю из CDN."
 
     # Fallback: скачивание из CDN (upstream-релиз)
     log "Скачивание $COMMON_SCRIPT_PATH..."

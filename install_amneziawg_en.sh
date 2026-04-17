@@ -29,6 +29,17 @@ COMMON_SCRIPT_PATH="$AWG_DIR/awg_common.sh"
 MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/${AWG_BRANCH}/manage_amneziawg_en.sh"
 MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 
+# Installer's own directory — captured BEFORE any cd happens. step5 uses it
+# to detect "run from a clone" and pick up awg_common.sh / manage_amneziawg.sh
+# locally instead of fetching from the CDN. A late BASH_SOURCE[0] resolve
+# AFTER initialize_setup has cd'd to $AWG_DIR would return $AWG_DIR and break
+# the detection for any `sudo bash install_amneziawg.sh` invocation from the
+# clone directory.
+INSTALLER_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || INSTALLER_DIR=""
+fi
+
 # SHA256 checksums of downloaded scripts. Updated at each release.
 # Verified in step5_download_scripts() after curl.
 # Verification is skipped when AWG_BRANCH is overridden (test branch).
@@ -2123,10 +2134,13 @@ step5_download_scripts() {
     # versions from the CDN and our local fork modifications would be
     # silently discarded. The CDN path remains as a fallback for
     # `curl | bash` usage.
-    local script_dir=""
-    if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
-    fi
+    #
+    # $INSTALLER_DIR is captured at the top of the script, BEFORE any cd —
+    # a late BASH_SOURCE[0] resolve with a relative path used to return
+    # $AWG_DIR (because initialize_setup already cd'd there) and the
+    # "script_dir != AWG_DIR" guard would wrongly trip for every
+    # `sudo bash install_amneziawg.sh` invocation from the clone directory.
+    local script_dir="${INSTALLER_DIR:-}"
     # Derive basenames from the URLs — the EN installer references *_en.sh
     # files, and those are what sits next to install_amneziawg_en.sh in a clone.
     local _common_basename="${COMMON_SCRIPT_URL##*/}"
@@ -2146,6 +2160,7 @@ step5_download_scripts() {
         update_state 6
         return 0
     fi
+    log_debug "No local clone detected (INSTALLER_DIR='${script_dir}', AWG_DIR='$AWG_DIR') — fetching from CDN."
 
     # Fallback: download from CDN (upstream release)
     log "Downloading $COMMON_SCRIPT_PATH..."
