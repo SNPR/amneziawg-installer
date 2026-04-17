@@ -462,13 +462,26 @@ render_server_config() {
         # Клиенты на exit-ноде приходят из AWG_TUNNEL_SUBNET (после MASQUERADE
         # на entry в каскаде или напрямую в single-режиме). from-rule берёт
         # только их, собственный трафик сервера идёт через main таблицу.
+        #
+        # MASQUERADE на обоих исходящих путях:
+        #   -o wgcf  — основной case, клиентский трафик заворачивается в WARP,
+        #              src=10.9.0.2 превращается в src=172.16.0.2 (wgcf addr).
+        #   -o $nic  — bypass случаи: в table ${warp_tbl} могут быть более
+        #              специфичные маршруты `<CIDR> via <GW> dev $nic` (чтобы
+        #              обойти WARP для YouTube/Google/banking/etc. — WARP IP
+        #              у них бывает rate-limited). Longest-prefix-match такие
+        #              пакеты уходят через $nic. Без MASQUERADE на $nic они
+        #              выйдут с src=10.9.0.2 (приватный IP entry-ноды) →
+        #              ответ никогда не вернётся. SNAT приводит src к IP VPS.
         postup="ip route replace default dev ${warp_iface} table ${warp_tbl}"
         postup="${postup}; ip rule add from ${server_ip%.*}.0/${subnet_mask} table ${warp_tbl} priority ${warp_prio}"
         postup="${postup}; iptables -I FORWARD -i %i -o ${warp_iface} -j ACCEPT"
         postup="${postup}; iptables -I FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
         postup="${postup}; iptables -t nat -A POSTROUTING -o ${warp_iface} -j MASQUERADE"
+        postup="${postup}; iptables -t nat -A POSTROUTING -s ${server_ip%.*}.0/${subnet_mask} -o ${nic} -j MASQUERADE"
         postup="${postup}; iptables -t mangle -A FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
         postdown="iptables -t mangle -D FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="${postdown}; iptables -t nat -D POSTROUTING -s ${server_ip%.*}.0/${subnet_mask} -o ${nic} -j MASQUERADE"
         postdown="${postdown}; iptables -t nat -D POSTROUTING -o ${warp_iface} -j MASQUERADE"
         postdown="${postdown}; iptables -D FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
         postdown="${postdown}; iptables -D FORWARD -i %i -o ${warp_iface} -j ACCEPT"

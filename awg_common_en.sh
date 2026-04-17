@@ -462,13 +462,27 @@ render_server_config() {
         # Clients arrive from AWG_TUNNEL_SUBNET (after MASQUERADE on entry in
         # a cascade, or straight from the client in single mode). The from-rule
         # only catches them; the server's own traffic uses the main table.
+        #
+        # MASQUERADE on BOTH outbound paths:
+        #   -o wgcf  — the primary case; client traffic is routed into WARP,
+        #              src=10.9.0.2 becomes src=172.16.0.2 (wgcf addr).
+        #   -o $nic  — the bypass case: table ${warp_tbl} may contain more
+        #              specific routes `<CIDR> via <GW> dev $nic` so that
+        #              certain destinations (YouTube / Google / banking etc.)
+        #              skip WARP — WARP IPs are often rate-limited by those
+        #              services. Longest-prefix-match sends those packets via
+        #              $nic. Without MASQUERADE on $nic they'd leave with
+        #              src=10.9.0.2 (private entry IP), replies never come
+        #              back. SNAT rewrites src to the VPS public IP.
         postup="ip route replace default dev ${warp_iface} table ${warp_tbl}"
         postup="${postup}; ip rule add from ${server_ip%.*}.0/${subnet_mask} table ${warp_tbl} priority ${warp_prio}"
         postup="${postup}; iptables -I FORWARD -i %i -o ${warp_iface} -j ACCEPT"
         postup="${postup}; iptables -I FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
         postup="${postup}; iptables -t nat -A POSTROUTING -o ${warp_iface} -j MASQUERADE"
+        postup="${postup}; iptables -t nat -A POSTROUTING -s ${server_ip%.*}.0/${subnet_mask} -o ${nic} -j MASQUERADE"
         postup="${postup}; iptables -t mangle -A FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
         postdown="iptables -t mangle -D FORWARD -o ${warp_iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        postdown="${postdown}; iptables -t nat -D POSTROUTING -s ${server_ip%.*}.0/${subnet_mask} -o ${nic} -j MASQUERADE"
         postdown="${postdown}; iptables -t nat -D POSTROUTING -o ${warp_iface} -j MASQUERADE"
         postdown="${postdown}; iptables -D FORWARD -i ${warp_iface} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
         postdown="${postdown}; iptables -D FORWARD -i %i -o ${warp_iface} -j ACCEPT"
