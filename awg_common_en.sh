@@ -912,34 +912,48 @@ setup_warp_egress() {
     mkdir -p /etc/wireguard || { log_error "mkdir /etc/wireguard"; return 1; }
     chmod 700 /etc/wireguard
 
-    # Account registration (only if account.toml is missing)
+    # Account registration (only if account.toml is missing).
+    #
+    # Source of truth is the presence of a non-empty $warp_account, NOT
+    # wgcf's exit code: wgcf 2.2.30 `register --accept-tos` is observed to
+    # successfully write the file and then return non-zero (version quirk).
+    # If we relied on the exit code, the code would fall through to the
+    # `wgcf register` fallback (no flag), which sees the just-written file
+    # and errors out with "existing account detected, refusing to
+    # overwrite" — and the install fails even though the registration
+    # actually succeeded.
+    #
+    # Logic: try --accept-tos (modern wgcf); if the file still isn't there,
+    # try without the flag (ancient wgcf that expects `y` on stdin).
+    # stderr from both attempts accumulates in one file so we don't lose
+    # the diagnostic if both really did fail (API block, rate-limit, TLS).
     if [[ ! -f "$warp_account" ]]; then
         log "Registering WARP account via wgcf..."
-        # wgcf >=2.2 supports --accept-tos; older builds need "yes" on stdin.
-        # Cover both with a single fallback chain. Capture stderr to a file
-        # and dump it line-by-line on failure — otherwise the diagnostic
-        # (Cloudflare API block, rate-limit, TLS issue) is lost.
         local _wgcf_err
         _wgcf_err=$(awg_mktemp) || _wgcf_err="/tmp/wgcf_register.err.$$"
-        if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register --accept-tos >/dev/null 2>"$_wgcf_err"); then
-            if ! (cd /etc/wireguard && yes 2>/dev/null | wgcf register >/dev/null 2>"$_wgcf_err"); then
-                log_error "wgcf register failed. Check reachability of api.cloudflareclient.com"
-                if [[ -s "$_wgcf_err" ]]; then
-                    log_error "wgcf stderr:"
-                    while IFS= read -r _ln; do log_error "  $_ln"; done < "$_wgcf_err"
-                fi
-                # Remove any partial account.toml wgcf may have written before
-                # failing — otherwise the next run would see the file and skip
-                # the register step.
-                rm -f "$warp_account"
-                return 1
-            fi
+
+        ( cd /etc/wireguard && yes 2>/dev/null | wgcf register --accept-tos >/dev/null 2>>"$_wgcf_err" ) || true
+
+        if [[ ! -s "$warp_account" ]]; then
+            # --accept-tos didn't work (old wgcf, or a real network failure).
+            # Try the legacy variant without the flag.
+            ( cd /etc/wireguard && yes 2>/dev/null | wgcf register >/dev/null 2>>"$_wgcf_err" ) || true
         fi
-        [[ -f "$warp_account" ]] || {
-            log_error "wgcf register finished but $warp_account was not created"
+
+        if [[ ! -s "$warp_account" ]]; then
+            log_error "wgcf register failed. Check reachability of api.cloudflareclient.com"
+            if [[ -s "$_wgcf_err" ]]; then
+                log_error "wgcf stderr:"
+                while IFS= read -r _ln; do log_error "  $_ln"; done < "$_wgcf_err"
+            fi
+            # Clean up an empty account.toml wgcf may have created and then
+            # bailed on — otherwise the next run would see it and skip
+            # register.
+            rm -f "$warp_account"
             return 1
-        }
+        fi
         chmod 600 "$warp_account"
+        log "WARP account registered."
     else
         log_debug "WARP account already registered ($warp_account)"
     fi
