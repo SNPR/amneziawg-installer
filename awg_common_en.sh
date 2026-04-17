@@ -541,21 +541,6 @@ render_client_config() {
     local conf_file="$AWG_DIR/${name}.conf"
     local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
 
-    # IPv6 leak prevention. When the host has v6 disabled (DISABLE_IPV6=1 —
-    # our default) but the client connects from a mobile carrier / router
-    # that hands out IPv6, happy-eyeballs tries v6 first and goes out to
-    # the internet AROUND the tunnel — the external site sees the client's
-    # real v6 address, not our server / WARP. Appending ::/0 to AllowedIPs
-    # makes the client's kernel route ALL v6 traffic into the tunnel; since
-    # the tunnel is v4-only, those v6 packets are silently dropped on the
-    # client and never leave — so no leak. With DISABLE_IPV6=0 (v6 allowed)
-    # we don't touch it — the user manages v6 themselves.
-    # Idempotent: skip the append if AllowedIPs already contains a v6 route
-    # (a colon in the string uniquely marks an IPv6 CIDR).
-    if [[ "${DISABLE_IPV6:-1}" -eq 1 && "$allowed_ips" != *:* ]]; then
-        allowed_ips="${allowed_ips}, ::/0"
-    fi
-
     local tmpfile
     tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
 
