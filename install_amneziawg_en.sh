@@ -90,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --jc=*)          CLI_JC="${1#*=}" ;;
         --jmin=*)        CLI_JMIN="${1#*=}" ;;
         --jmax=*)        CLI_JMAX="${1#*=}" ;;
+        --i1-mode=*)     CLI_I1_MODE="${1#*=}" ;;
         --role=*)        CLI_ROLE="${1#*=}" ;;
         --upstream-conf=*)    CLI_UPSTREAM_CONF="${1#*=}" ;;
         --upstream-iface=*)   CLI_UPSTREAM_IFACE="${1#*=}" ;;
@@ -179,6 +180,13 @@ Options:
   --jc=N               Set Jc manually (1-128, overrides preset)
   --jmin=N             Set Jmin manually (0-1280, overrides preset)
   --jmax=N             Set Jmax manually (0-1280, overrides preset, must be >= Jmin)
+  --i1-mode=MODE       random (default) | quic
+                        random: <r N> random bytes (32-256) — uninformative noise.
+                        quic:   <b 0x...> ≈1100-1250 bytes shaped as a valid
+                                QUIC v1 Initial packet (RFC 9000 §17.2.2).
+                                Masks the AWG handshake as ordinary QUIC browser
+                                traffic. Strongest mode against mobile carrier
+                                DPI. Pair with --preset=mobile --port=500.
 
 Multi-hop (cascade of two AWG servers):
   --role=ROLE           single (default) | exit | entry
@@ -203,6 +211,7 @@ Examples:
   sudo bash install_amneziawg_en.sh --port=51820 --route-all    # Non-interactive
   sudo bash install_amneziawg_en.sh --route-amnezia --yes       # Fully automated
   sudo bash install_amneziawg_en.sh --preset=mobile --yes       # Optimized for mobile networks
+  sudo bash install_amneziawg_en.sh --preset=mobile --port=500 --i1-mode=quic --yes   # Max mobile-DPI bypass
   sudo bash install_amneziawg_en.sh --role=exit --yes           # Cascade exit node
   sudo bash install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --yes
   sudo bash install_amneziawg_en.sh --egress=warp --yes         # Standalone server with WARP egress
@@ -422,7 +431,7 @@ safe_load_config() {
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
-                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
                 AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY)
                     export "$key=$value"
@@ -663,6 +672,70 @@ generate_cps_i1() {
     echo "<r ${n}>"
 }
 
+# Generate I1 in "QUIC v1 Initial" mode — a literal `<b 0xHEX...>` whose HEX
+# body forms a valid QUIC Initial packet (RFC 9000 §17.2.2). Idea: a
+# mobile-carrier DPI looks at the first byte and a few bytes that follow,
+# sees 0xc? + version 0x00000001 + a plausible structure, and lets the
+# traffic through as "ordinary QUIC browser traffic". The real
+# AWG handshake starts AFTER this blob; the server strips the same I1 from
+# the incoming packet (it has the exact same I1 in its config).
+#
+# Layout:
+#   [0]       type byte   — bits 7-6 = 11 (long + fixed), 5-4 = 00 (Initial),
+#                           3-0 arbitrary (in real QUIC these are obscured by
+#                           header-protection XOR — we emulate that with a
+#                           random value in [0, 15]). Net: 0xc0..0xcf.
+#   [1-4]    version      — 0x00000001 (QUIC v1)
+#   [5]      dcid_len     — 16-20
+#   [6..]    dcid         — random
+#   [..]     scid_len     — 8-16
+#   [..]     scid         — random
+#   [..]     token_len    — 0 (1-byte varint 0x00)
+#   [..]     length       — 2-byte varint = 3 (PN) + payload_len
+#   [..]     packet_num   — 3 random bytes
+#   [..]     payload      — random bytes (~1 KiB, looks like AEAD output)
+#
+# Target total size ≈1100-1250 bytes, matching a typical QUIC Initial.
+generate_cps_i1_quic() {
+    local dcid_len scid_len total overhead payload_len enc_len
+    local type_byte version dcid scid enc_b1 enc_b2 pn payload
+    local dcid_len_h scid_len_h
+    dcid_len=$(rand_range 16 20)
+    scid_len=$(rand_range 8 16)
+    total=$(rand_range 1100 1250)
+    overhead=$(( 1 + 4 + 1 + dcid_len + 1 + scid_len + 1 + 2 + 3 ))
+    payload_len=$(( total - overhead ))
+    (( payload_len < 1 )) && payload_len=1
+    enc_len=$(( 3 + payload_len ))
+    if (( enc_len > 16383 )); then
+        enc_len=16383
+        payload_len=$(( enc_len - 3 ))
+    fi
+    # 2-byte varint (top 2 bits = 01, remaining 14 bits = value BE)
+    enc_b1=$(printf '%02x' $(( 0x40 | (enc_len >> 8) )))
+    enc_b2=$(printf '%02x' $(( enc_len & 0xFF )))
+    # First byte: 0xc0 | random(0..15). Emulates the header-protected bits.
+    type_byte=$(printf '%02x' $(( 0xc0 | $(rand_range 0 15) )))
+    version="00000001"
+    dcid=$(od -An -tx1 -N"$dcid_len" /dev/urandom 2>/dev/null | tr -d ' \n')
+    scid=$(od -An -tx1 -N"$scid_len" /dev/urandom 2>/dev/null | tr -d ' \n')
+    pn=$(od -An -tx1 -N3 /dev/urandom 2>/dev/null | tr -d ' \n')
+    payload=$(od -An -tx1 -N"$payload_len" /dev/urandom 2>/dev/null | tr -d ' \n')
+    if [[ -z "$dcid" || -z "$scid" || -z "$pn" || -z "$payload" ]]; then
+        log_error "generate_cps_i1_quic: failed to read /dev/urandom"
+        return 1
+    fi
+    dcid_len_h=$(printf '%02x' "$dcid_len")
+    scid_len_h=$(printf '%02x' "$scid_len")
+    printf '<b 0x%s%s%s%s%s%s00%s%s%s%s>\n' \
+        "$type_byte" "$version" \
+        "$dcid_len_h" "$dcid" \
+        "$scid_len_h" "$scid" \
+        "$enc_b1" "$enc_b2" \
+        "$pn" "$payload"
+    return 0
+}
+
 # Generate all AWG 2.0 parameters
 generate_awg_params() {
     local preset="${CLI_PRESET:-default}"
@@ -735,11 +808,30 @@ generate_awg_params() {
     AWG_H3="${_h_lines[2]}"
     AWG_H4="${_h_lines[3]}"
 
-    # I1: CPS concealment
-    AWG_I1=$(generate_cps_i1)
+    # I1: CPS concealment. Two modes:
+    #   random (default) — <r N>, N random bytes 32-256
+    #   quic             — <b 0x...>, ≈1100-1250 bytes shaped as a QUIC v1
+    #                      Initial packet. Strongest mode against mobile
+    #                      carrier DPI. Server and clients receive the SAME
+    #                      I1 via their configs; the AWG handshake follows
+    #                      these bytes.
+    local _i1_mode="${CLI_I1_MODE:-${AWG_I1_MODE:-random}}"
+    case "$_i1_mode" in
+        random)
+            AWG_I1=$(generate_cps_i1)
+            ;;
+        quic)
+            AWG_I1=$(generate_cps_i1_quic) || die "QUIC I1 generation failed"
+            log "  I1 mode: quic (fake QUIC v1 Initial, $(( (${#AWG_I1} - 6) / 2 )) bytes)"
+            ;;
+        *)
+            die "Invalid --i1-mode='$_i1_mode'. Allowed: random, quic."
+            ;;
+    esac
+    AWG_I1_MODE="$_i1_mode"
 
     export AWG_Jc AWG_Jmin AWG_Jmax AWG_S1 AWG_S2 AWG_S3 AWG_S4 AWG_PRESET
-    export AWG_H1 AWG_H2 AWG_H3 AWG_H4 AWG_I1
+    export AWG_H1 AWG_H2 AWG_H3 AWG_H4 AWG_I1 AWG_I1_MODE
 
     log "  Jc=$AWG_Jc, Jmin=$AWG_Jmin, Jmax=$AWG_Jmax"
     log "  S1=$AWG_S1, S2=$AWG_S2, S3=$AWG_S3, S4=$AWG_S4"
@@ -1682,6 +1774,7 @@ export AWG_H2='${AWG_H2}'
 export AWG_H3='${AWG_H3}'
 export AWG_H4='${AWG_H4}'
 export AWG_I1='${AWG_I1}'
+export AWG_I1_MODE='${AWG_I1_MODE:-random}'
 export AWG_PRESET='${AWG_PRESET:-default}'
 export NO_TWEAKS=${NO_TWEAKS}
 export AWG_APPLY_MODE='${AWG_APPLY_MODE:-syncconf}'

@@ -89,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --jc=*)          CLI_JC="${1#*=}" ;;
         --jmin=*)        CLI_JMIN="${1#*=}" ;;
         --jmax=*)        CLI_JMAX="${1#*=}" ;;
+        --i1-mode=*)     CLI_I1_MODE="${1#*=}" ;;
         --role=*)        CLI_ROLE="${1#*=}" ;;
         --upstream-conf=*)    CLI_UPSTREAM_CONF="${1#*=}" ;;
         --upstream-iface=*)   CLI_UPSTREAM_IFACE="${1#*=}" ;;
@@ -178,6 +179,13 @@ show_help() {
   --jc=N               Задать Jc вручную (1-128, поверх preset)
   --jmin=N             Задать Jmin вручную (0-1280, поверх preset)
   --jmax=N             Задать Jmax вручную (0-1280, поверх preset, должно быть >= Jmin)
+  --i1-mode=РЕЖИМ       random (умолч.) | quic
+                        random: <r N> случайных байт (32-256) — неинформативный шум.
+                        quic:   <b 0x...> ≈1100-1250 байт, сформированных как
+                                валидный QUIC v1 Initial-пакет (RFC 9000 §17.2.2).
+                                Маскирует AWG-handshake под обычный QUIC-трафик
+                                браузера. Самый сильный режим против DPI мобильных
+                                операторов. Парно с --preset=mobile --port=500.
 
 Multi-hop (каскад из двух AWG-серверов):
   --role=РОЛЬ           single (умолч.) | exit | entry
@@ -202,6 +210,7 @@ WARP egress (для role=exit или single — НЕ совместимо с rol
   sudo bash install_amneziawg.sh --port=51820 --route-all    # Неинтерактивная
   sudo bash install_amneziawg.sh --route-amnezia --yes       # Полностью автоматическая
   sudo bash install_amneziawg.sh --preset=mobile --yes       # Оптимизация для мобильных сетей
+  sudo bash install_amneziawg.sh --preset=mobile --port=500 --i1-mode=quic --yes   # Макс обход DPI мобильных
   sudo bash install_amneziawg.sh --role=exit --yes           # Exit-нода каскада
   sudo bash install_amneziawg.sh --role=entry --upstream-conf=/root/from_exit.conf --yes
   sudo bash install_amneziawg.sh --egress=warp --yes         # Single-сервер с WARP egress
@@ -421,7 +430,7 @@ safe_load_config() {
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
-                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
                 AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY)
                     export "$key=$value"
@@ -662,6 +671,69 @@ generate_cps_i1() {
     echo "<r ${n}>"
 }
 
+# Генерация I1 в режиме "QUIC v1 Initial" — литерал `<b 0xHEX...>`, где HEX
+# формирует валидный QUIC Initial-пакет (RFC 9000 §17.2.2). Идея: DPI
+# мобильных операторов смотрит на первый байт и несколько последующих,
+# видит 0xc? + version 0x00000001 + разумную структуру — и пропускает как
+# обычный QUIC-трафик браузера. AWG-handshake идёт ПОСЛЕ этих байт, сервер
+# их срезает (у него тот же I1 в конфиге).
+#
+# Структура:
+#   [0]       type byte   — биты 7-6 = 11 (long + fixed), 5-4 = 00 (Initial),
+#                          3-0 произвольные (в реальном QUIC защищены
+#                          header-protection XOR — мы эмулируем случайным
+#                          значением в [0, 15]). Итого 0xc0..0xcf.
+#   [1-4]    version      — 0x00000001 (QUIC v1)
+#   [5]      dcid_len     — 16-20
+#   [6..]    dcid         — random
+#   [..]     scid_len     — 8-16
+#   [..]     scid         — random
+#   [..]     token_len    — 0 (1-байтовый varint 0x00)
+#   [..]     length       — 2-байтовый varint = 3 (PN) + payload_len
+#   [..]     packet_num   — 3 random bytes
+#   [..]     payload      — random bytes (~1 KiB, "похоже на AEAD output")
+#
+# Итоговая длина блоба ≈1100-1250 байт, как у типичного QUIC Initial.
+generate_cps_i1_quic() {
+    local dcid_len scid_len total overhead payload_len enc_len
+    local type_byte version dcid scid enc_b1 enc_b2 pn payload
+    local dcid_len_h scid_len_h
+    dcid_len=$(rand_range 16 20)
+    scid_len=$(rand_range 8 16)
+    total=$(rand_range 1100 1250)
+    overhead=$(( 1 + 4 + 1 + dcid_len + 1 + scid_len + 1 + 2 + 3 ))
+    payload_len=$(( total - overhead ))
+    (( payload_len < 1 )) && payload_len=1
+    enc_len=$(( 3 + payload_len ))
+    if (( enc_len > 16383 )); then
+        enc_len=16383
+        payload_len=$(( enc_len - 3 ))
+    fi
+    # 2-byte varint (2MSB=01, остальные 14 бит — значение BE)
+    enc_b1=$(printf '%02x' $(( 0x40 | (enc_len >> 8) )))
+    enc_b2=$(printf '%02x' $(( enc_len & 0xFF )))
+    # Первый байт: 0xc0 | random(0..15). Эмулирует header-protected бит.
+    type_byte=$(printf '%02x' $(( 0xc0 | $(rand_range 0 15) )))
+    version="00000001"
+    dcid=$(od -An -tx1 -N"$dcid_len" /dev/urandom 2>/dev/null | tr -d ' \n')
+    scid=$(od -An -tx1 -N"$scid_len" /dev/urandom 2>/dev/null | tr -d ' \n')
+    pn=$(od -An -tx1 -N3 /dev/urandom 2>/dev/null | tr -d ' \n')
+    payload=$(od -An -tx1 -N"$payload_len" /dev/urandom 2>/dev/null | tr -d ' \n')
+    if [[ -z "$dcid" || -z "$scid" || -z "$pn" || -z "$payload" ]]; then
+        log_error "generate_cps_i1_quic: не удалось прочитать /dev/urandom"
+        return 1
+    fi
+    dcid_len_h=$(printf '%02x' "$dcid_len")
+    scid_len_h=$(printf '%02x' "$scid_len")
+    printf '<b 0x%s%s%s%s%s%s00%s%s%s%s>\n' \
+        "$type_byte" "$version" \
+        "$dcid_len_h" "$dcid" \
+        "$scid_len_h" "$scid" \
+        "$enc_b1" "$enc_b2" \
+        "$pn" "$payload"
+    return 0
+}
+
 # Генерация всех AWG 2.0 параметров
 # Поддерживает --preset=default|mobile и точечные --jc/--jmin/--jmax overrides
 generate_awg_params() {
@@ -735,11 +807,29 @@ generate_awg_params() {
     AWG_H3="${_h_lines[2]}"
     AWG_H4="${_h_lines[3]}"
 
-    # I1: CPS concealment
-    AWG_I1=$(generate_cps_i1)
+    # I1: CPS concealment. Два режима:
+    #   random (умолч.) — <r N>, N случайных байт 32-256
+    #   quic            — <b 0x...> ≈1100-1250 байт, маскированных под QUIC v1
+    #                     Initial. Самый сильный режим против DPI мобильных
+    #                     операторов. Сервер и клиенты получают ТОТ ЖЕ I1
+    #                     из конфига, AWG handshake идёт после этих байт.
+    local _i1_mode="${CLI_I1_MODE:-${AWG_I1_MODE:-random}}"
+    case "$_i1_mode" in
+        random)
+            AWG_I1=$(generate_cps_i1)
+            ;;
+        quic)
+            AWG_I1=$(generate_cps_i1_quic) || die "Ошибка генерации QUIC I1"
+            log "  I1 mode: quic (фейковый QUIC v1 Initial, $(( (${#AWG_I1} - 6) / 2 )) байт)"
+            ;;
+        *)
+            die "Некорректный --i1-mode='$_i1_mode'. Допустимо: random, quic."
+            ;;
+    esac
+    AWG_I1_MODE="$_i1_mode"
 
     export AWG_Jc AWG_Jmin AWG_Jmax AWG_S1 AWG_S2 AWG_S3 AWG_S4 AWG_PRESET
-    export AWG_H1 AWG_H2 AWG_H3 AWG_H4 AWG_I1
+    export AWG_H1 AWG_H2 AWG_H3 AWG_H4 AWG_I1 AWG_I1_MODE
 
     log "  Jc=$AWG_Jc, Jmin=$AWG_Jmin, Jmax=$AWG_Jmax"
     log "  S1=$AWG_S1, S2=$AWG_S2, S3=$AWG_S3, S4=$AWG_S4"
@@ -1680,6 +1770,7 @@ export AWG_H2='${AWG_H2}'
 export AWG_H3='${AWG_H3}'
 export AWG_H4='${AWG_H4}'
 export AWG_I1='${AWG_I1}'
+export AWG_I1_MODE='${AWG_I1_MODE:-random}'
 export AWG_PRESET='${AWG_PRESET:-default}'
 export NO_TWEAKS=${NO_TWEAKS}
 export AWG_APPLY_MODE='${AWG_APPLY_MODE:-syncconf}'
