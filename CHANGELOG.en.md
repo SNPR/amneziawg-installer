@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Client-side IPv6 leak when `DISABLE_IPV6=1`.** If the host is installed with IPv6 disabled (our default) but a client connects from a mobile carrier or router that hands out v6, happy-eyeballs would pick the v6 path **around the tunnel** — the external site saw the client's real mobile v6 address, not the VPS / WARP IP. `render_client_config` now appends `::/0` to the client's `AllowedIPs` when `DISABLE_IPV6=1` and no v6 route is already present. The client's kernel redirects all v6 traffic into the v4-only tunnel where it silently drops — nothing reaches the carrier, so no leak. Idempotent: `::/0` isn't appended if `AllowedIPs` already contains any v6 CIDR. For existing installs, a `manage_amneziawg.sh regen` applies the rule to all clients.
+
 ### Added
 
 - **Cloudflare WARP egress for exit- and single-nodes.** New flag `--egress=direct|warp` (default `direct`). With `--egress=warp` the installer:
