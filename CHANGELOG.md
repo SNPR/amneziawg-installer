@@ -14,6 +14,8 @@
 
 ### Добавлено
 
+- **`--warp-bypass=<SPEC>[,<SPEC>...]` — селективный обход WARP для конкретных dst.** Решает типовую проблему «WARP включили — YouTube перестал грузить видео» (Cloudflare IP рейт-лимитят CDN YouTube/Google/других крупных сервисов). SPEC: `none` (умолч.) | `google` (IP-диапазоны [goog.txt](https://www.gstatic.com/ipranges/goog.txt)) | `custom:<URL|/path>` (произвольный список по URL или локальному файлу). Через запятую — сколько угодно источников. В содержимом источника автоопределяется формат каждой строки: CIDR (`1.2.3.4[/N]`) или доменное имя (резолвится через `@1.1.1.1` и добавляется как `/32`); поддерживаются комментарии `#` и dnsmasq-стиль `full:`/`@tag`. Установщик ставит `/usr/local/sbin/awg-warp-bypass.sh` + systemd service + timer (автообновление раз в 6 часов), Настройки в `/etc/amnezia/amneziawg/warp-bypass.conf`, маркер `$AWG_DIR/.warp_bypass_enabled_by_installer`, uninstall всё сносит. Работает только с `--egress=warp`; на `role=entry` валидатор его не пропустит.
+- **Универсальный TCPMSS clamp на FORWARD при WARP egress** (не только `-o wgcf`): раньше crypto-роут `awg0 → eth0` (bypass) пропускал большие TCP-сегменты `MSS=1460` от YouTube/Google, а обратный поток через awg0 (MTU 1280) их дропал — PMTU discovery блокировался ICMP-фильтрами провайдеров → видео не грузились. Теперь clamp применяется без `-o`-матча и держит MSS в рамках MTU каждого пути.
 - **WARP egress (Cloudflare) для exit- и single-ноды.** Новый флаг `--egress=direct|warp` (по умолчанию `direct`). При `--egress=warp` установщик:
   1. Скачивает [wgcf](https://github.com/ViRb3/wgcf) (мультиарх: amd64 / arm64 / armv7) с GitHub Releases.
   2. Выполняет `wgcf register --accept-tos` и `wgcf generate`, размещает профиль в `/etc/wireguard/wgcf.conf`.

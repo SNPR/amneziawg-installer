@@ -56,7 +56,7 @@ CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS
 CLI_ROLE=""; CLI_UPSTREAM_CONF=""; CLI_UPSTREAM_IFACE=""
 CLI_UPSTREAM_TABLE=""; CLI_UPSTREAM_FWMARK=""
 # WARP egress: route client traffic through Cloudflare WARP (for role=exit|single)
-CLI_EGRESS=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""
+CLI_EGRESS=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""; CLI_WARP_BYPASS=""
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
@@ -99,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         --egress=*)           CLI_EGRESS="${1#*=}" ;;
         --warp-table=*)       CLI_WARP_TABLE="${1#*=}" ;;
         --warp-priority=*)    CLI_WARP_PRIORITY="${1#*=}" ;;
+        --warp-bypass=*)      CLI_WARP_BYPASS="${1#*=}" ;;
         *) echo "Unknown argument: $1"; HELP=1 ;;
     esac
     shift
@@ -205,6 +206,17 @@ WARP egress (for role=exit or single — NOT compatible with role=entry):
                         Cloudflare IP instead of the VPS IP.
   --warp-table=N        routing table for WARP traffic (default 2408)
   --warp-priority=N     ip rule priority for WARP (default 789)
+  --warp-bypass=SPEC    WARP exceptions (traffic exits via main NIC directly).
+                        Useful against CDNs that rate-limit or block WARP
+                        address ranges (the classic case is YouTube /
+                        googlevideo). SPEC = none (default) | google |
+                        custom:<URL|/path>, comma-separated. The list format
+                        is auto-detected: CIDR (1.2.3.4[/N]) or hostname
+                        (resolved via @1.1.1.1); `#` comments and dnsmasq-
+                        style `full:`/`@tag` decorations are accepted.
+                        Requires --egress=warp. Auto-refreshes every 6 hours
+                        through a systemd timer.
+                        Example: --warp-bypass=google,custom:https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt
 
 Examples:
   sudo bash install_amneziawg_en.sh                             # Interactive installation
@@ -216,6 +228,7 @@ Examples:
   sudo bash install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --yes
   sudo bash install_amneziawg_en.sh --egress=warp --yes         # Standalone server with WARP egress
   sudo bash install_amneziawg_en.sh --role=exit --egress=warp --yes   # Cascade exit with WARP egress
+  sudo bash install_amneziawg_en.sh --role=exit --egress=warp --warp-bypass=google,custom:https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt --yes
   sudo bash install_amneziawg_en.sh --uninstall                 # Uninstall
   sudo bash install_amneziawg_en.sh --diagnostic                # Diagnostics
 
@@ -433,7 +446,7 @@ safe_load_config() {
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
-                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY)
+                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS)
                     export "$key=$value"
                     ;;
             esac
@@ -1446,6 +1459,21 @@ step_uninstall() {
         rm -f "$AWG_DIR/.wgcf_enabled_by_installer"
         log "WARP removed."
     fi
+    if [[ -f "$AWG_DIR/.warp_bypass_enabled_by_installer" ]]; then
+        log "Removing WARP bypass (service + timer)..."
+        systemctl stop awg-warp-bypass.timer 2>/dev/null
+        systemctl disable awg-warp-bypass.timer 2>/dev/null
+        systemctl stop awg-warp-bypass.service 2>/dev/null
+        systemctl disable awg-warp-bypass.service 2>/dev/null
+        rm -f /etc/systemd/system/awg-warp-bypass.service \
+              /etc/systemd/system/awg-warp-bypass.timer \
+              /usr/local/sbin/awg-warp-bypass.sh \
+              /etc/amnezia/amneziawg/warp-bypass.conf \
+              /etc/default/awg-warp-bypass
+        rm -f "$AWG_DIR/.warp_bypass_enabled_by_installer"
+        systemctl daemon-reload 2>/dev/null
+        log "WARP bypass removed."
+    fi
     modprobe -r amneziawg 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
         log "Cleaning up AmneziaWG UFW rules..."
@@ -1686,7 +1714,30 @@ initialize_setup() {
             die "--warp-table must not equal --upstream-table (${AWG_WARP_TABLE})."
         fi
     fi
-    export AWG_EGRESS AWG_WARP_IFACE AWG_WARP_TABLE AWG_WARP_PRIORITY
+    # --warp-bypass: comma-separated list of sources for WARP exceptions.
+    # Each item: `google` | `custom:URL` | `custom:/path`.
+    # `none` (default) — nothing. Only meaningful with egress=warp.
+    AWG_WARP_BYPASS="${CLI_WARP_BYPASS:-${AWG_WARP_BYPASS:-none}}"
+    if [[ "$AWG_WARP_BYPASS" != "none" && "$AWG_EGRESS" != "warp" ]]; then
+        die "--warp-bypass only makes sense together with --egress=warp (no WARP to bypass otherwise)."
+    fi
+    if [[ "$AWG_WARP_BYPASS" != "none" ]]; then
+        local _OLDIFS="$IFS"
+        IFS=','
+        local _specs=( $AWG_WARP_BYPASS )
+        IFS="$_OLDIFS"
+        local _s
+        for _s in "${_specs[@]}"; do
+            _s="${_s## }"; _s="${_s%% }"
+            [[ -z "$_s" ]] && continue
+            case "$_s" in
+                google) ;;
+                custom:http://*|custom:https://*|custom:/*) ;;
+                *) die "Invalid --warp-bypass: '$_s'. Allowed: none, google, custom:URL, custom:/absolute/path — comma-separated." ;;
+            esac
+        done
+    fi
+    export AWG_EGRESS AWG_WARP_IFACE AWG_WARP_TABLE AWG_WARP_PRIORITY AWG_WARP_BYPASS
 
     # Validate after CLI override
     validate_port "$AWG_PORT"
@@ -1789,6 +1840,7 @@ export AWG_EGRESS='${AWG_EGRESS:-direct}'
 export AWG_WARP_IFACE='${AWG_WARP_IFACE:-wgcf}'
 export AWG_WARP_TABLE=${AWG_WARP_TABLE:-2408}
 export AWG_WARP_PRIORITY=${AWG_WARP_PRIORITY:-789}
+export AWG_WARP_BYPASS='${AWG_WARP_BYPASS:-none}'
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -2327,6 +2379,10 @@ step6_generate_configs() {
     if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
         log "Installing WARP egress (Cloudflare)..."
         setup_warp_egress || die "setup_warp_egress failed. See log."
+        if [[ "${AWG_WARP_BYPASS:-none}" != "none" ]]; then
+            log "Installing WARP bypass (${AWG_WARP_BYPASS})..."
+            setup_warp_bypass || log_warn "setup_warp_bypass failed (non-fatal: WARP egress works, the bypass wasn't applied)."
+        fi
     fi
 
     # Create AWG 2.0 server config
