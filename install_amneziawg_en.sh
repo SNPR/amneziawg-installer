@@ -990,6 +990,13 @@ setup_minimal_sysctl() {
     cat > "$f" << SYSEOF
 # AmneziaWG — minimal settings (--no-tweaks)
 net.ipv4.ip_forward = 1
+# PMTU black-hole detection — critical for VPN tunnels behind mobile
+# carriers or NATs that filter the ICMP "fragmentation needed" response.
+# Without it, large TCP segments get silently dropped and heavy sites
+# stall. Value 1 enables adaptive MSS probing only when a black-hole is
+# actually detected, which is safe in any mode — we keep it even in
+# --no-tweaks.
+net.ipv4.tcp_mtu_probing = 1
 SYSEOF
     if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
         cat >> "$f" << SYSEOF
@@ -1014,16 +1021,22 @@ setup_advanced_sysctl() {
     log "Configuring sysctl..."
     local f="/etc/sysctl.d/99-amneziawg-security.conf"
 
-    # Adaptive buffers based on RAM
-    local rmem_max wmem_max netdev_backlog
+    # Adaptive buffers and conntrack based on RAM.
+    # conntrack_max: each entry is ~300 B, 256K ≈ 80 MB RAM. The previous
+    # 65536 ceiling was tight on exit nodes running cascade + WARP bypass
+    # (many simultaneous flows — a YouTube CDN alone opens dozens in
+    # parallel).
+    local rmem_max wmem_max netdev_backlog conntrack_max
     if [[ ${TOTAL_RAM_MB:-1024} -ge 2048 ]]; then
         rmem_max=16777216    # 16MB
         wmem_max=16777216
         netdev_backlog=5000
+        conntrack_max=262144
     else
         rmem_max=4194304     # 4MB
         wmem_max=4194304
         netdev_backlog=2500
+        conntrack_max=131072
     fi
 
     cat > "$f" << EOF
@@ -1081,8 +1094,38 @@ net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
 net.core.netdev_max_backlog = ${netdev_backlog}
 
-# --- Conntrack ---
-net.netfilter.nf_conntrack_max = 65536
+# --- TCP Tuning ---
+# Explicit per-socket TCP buffer ranges (min default max) scaled to
+# rmem_max/wmem_max. Without these the individual sockets do not grow
+# to the full global maximum.
+net.ipv4.tcp_rmem = 4096 87380 ${rmem_max}
+net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
+
+# PMTU black-hole detection: when ICMP "fragmentation needed" is filtered
+# somewhere along the path (typical for mobile carriers, tunnel joins,
+# WARP bypass), classic Path MTU Discovery silently breaks, large TCP
+# segments go missing, and sites "hang". Value 1 enables adaptive MSS
+# probing ONLY when a black-hole is detected (not on every packet),
+# which is safe everywhere. Fixes the class of "YouTube / heavy sites
+# don't load through the cascade properly" issues.
+net.ipv4.tcp_mtu_probing = 1
+
+# Don't slow-start after idle: for long-lived VPN flows (persistent
+# connections) keep the congestion window between active bursts — no
+# speed drop on resume.
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Reuse TIME_WAIT sockets for outbound connections. Safe on modern
+# kernels (RFC 6191 timestamp-based validation); useful on exit nodes
+# with a high rate of egress flows through WARP or the primary NIC.
+net.ipv4.tcp_tw_reuse = 1
+
+# --- Conntrack (adaptive) ---
+# ~256K flow entries (≈80 MB RAM) on 2+ GB VPSes, 128K on smaller.
+# Cascade + WARP bypass create hundreds of concurrent TCP/UDP flows;
+# the previous 65536 ceiling saturated under load and new connections
+# started to be dropped.
+net.netfilter.nf_conntrack_max = ${conntrack_max}
 
 # --- Security ---
 vm.swappiness = 10

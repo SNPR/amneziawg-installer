@@ -988,6 +988,12 @@ setup_minimal_sysctl() {
     cat > "$f" << SYSEOF
 # AmneziaWG — минимальные настройки (--no-tweaks)
 net.ipv4.ip_forward = 1
+# PMTU black-hole detection — критично для VPN-туннелей за мобильным
+# оператором/NAT'ом, который фильтрует ICMP "needs-frag". Без этого
+# большие TCP-сегменты молча теряются, тяжёлые сайты не открываются.
+# Значение 1 активирует адаптивный MSS-пробинг только при детекте black-hole,
+# безопасно в любом режиме — оставляем даже в --no-tweaks.
+net.ipv4.tcp_mtu_probing = 1
 SYSEOF
     if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
         cat >> "$f" << SYSEOF
@@ -1012,16 +1018,21 @@ setup_advanced_sysctl() {
     log "Настройка sysctl..."
     local f="/etc/sysctl.d/99-amneziawg-security.conf"
 
-    # Адаптивные буферы по объёму RAM
-    local rmem_max wmem_max netdev_backlog
+    # Адаптивные буферы и conntrack по объёму RAM.
+    # conntrack_max: каждая запись ~300 байт, 256K ≈ 80 MB RAM. Прежний потолок
+    # 65536 становился узким на exit-нодах с каскадом + WARP bypass (много
+    # одновременных потоков — YouTube-CDN сам даёт десятки параллельных).
+    local rmem_max wmem_max netdev_backlog conntrack_max
     if [[ ${TOTAL_RAM_MB:-1024} -ge 2048 ]]; then
         rmem_max=16777216    # 16MB
         wmem_max=16777216
         netdev_backlog=5000
+        conntrack_max=262144
     else
         rmem_max=4194304     # 4MB
         wmem_max=4194304
         netdev_backlog=2500
+        conntrack_max=131072
     fi
 
     cat > "$f" << EOF
@@ -1079,8 +1090,36 @@ net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
 net.core.netdev_max_backlog = ${netdev_backlog}
 
-# --- Conntrack ---
-net.netfilter.nf_conntrack_max = 65536
+# --- TCP Tuning ---
+# Явные per-socket TCP-буферы (min default max) масштабируются под rmem_max/
+# wmem_max. Без этого отдельные сокеты не раскручиваются до полного max'а.
+net.ipv4.tcp_rmem = 4096 87380 ${rmem_max}
+net.ipv4.tcp_wmem = 4096 65536 ${wmem_max}
+
+# PMTU black-hole detection: если ICMP "needs-frag" фильтруется где-то по
+# пути (типично для мобильных операторов, туннельных стыков, WARP-bypass),
+# классический Path MTU Discovery молча ломается → большие TCP-сегменты
+# теряются → сайты «висят». Значение 1 включает адаптивный MSS-пробинг
+# ТОЛЬКО при детекте black-hole (не каждый пакет), это безопасно всегда.
+# Решает класс проблем «YouTube/heavy-сайты грузятся через каскад криво».
+net.ipv4.tcp_mtu_probing = 1
+
+# Не скатываться в slow-start после idle: для long-lived VPN-потоков
+# (постоянные соединения) держим congestion window между активными фазами,
+# нет просадки скорости при возобновлении.
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Реюз TIME_WAIT-сокетов для исходящих соединений. Безопасно на современных
+# ядрах (RFC 6191 timestamp-based validation); полезно на exit-нодах с
+# большим количеством egress-flows через WARP или прямой NIC.
+net.ipv4.tcp_tw_reuse = 1
+
+# --- Conntrack (adaptive) ---
+# ~256K flow entries (≈80 MB RAM) на 2+ GB VPS, 128K на меньших.
+# Каскад + WARP-bypass создают сотни одновременных TCP/UDP-потоков,
+# прежний потолок 65536 заполнялся под нагрузкой и новые соединения
+# начинали дропаться.
+net.netfilter.nf_conntrack_max = ${conntrack_max}
 
 # --- Security ---
 vm.swappiness = 10

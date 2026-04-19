@@ -14,6 +14,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Kernel TCP tuning: PMTU black-hole detection, TCP buffers, TIME_WAIT reuse.** `setup_advanced_sysctl` (the default install path) now sets:
+  - `net.ipv4.tcp_mtu_probing = 1` — enables adaptive MSS probing whenever the ISP / mobile carrier / NAT gateway filters ICMP "fragmentation needed". Without this, large TCP segments are silently dropped on VPN → cascade → WARP paths and sites "hang". Value 1 is safe: probing kicks in only when a black-hole is detected, not for every packet. This is the class of bugs "YouTube / heavy sites won't load through the cascade".
+  - `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem` — explicit per-socket `{min default max}` ranges, scaled to our adaptive `rmem_max`/`wmem_max` (16 MB on ≥ 2 GB RAM VPSes, 4 MB otherwise). Before this, individual TCP sockets did not grow to the full global maximum.
+  - `net.ipv4.tcp_slow_start_after_idle = 0` — do not slow-start after idle, keep the congestion window between active bursts: no speed drop when long-lived VPN connections resume.
+  - `net.ipv4.tcp_tw_reuse = 1` — reuse TIME_WAIT sockets for outbound connections (safe on modern kernels thanks to RFC 6191 timestamp-based validation); reduces pressure on the socket table on exit nodes with high egress rate through WARP/NIC.
+  - `net.netfilter.nf_conntrack_max` bumped from 65536 to an **adaptive value**: `262144` on ≥ 2 GB RAM VPSes (≈80 MB RAM for the table), `131072` on smaller. The old ceiling saturated under cascade + WARP bypass load (a YouTube CDN alone opens dozens of parallel flows) and new connections started to be dropped.
+- **`tcp_mtu_probing = 1` is also set in `setup_minimal_sysctl` (`--no-tweaks`):** the only setting from this batch that was added even to the minimal path — it's too significant for correct VPN behaviour behind mobile carriers / NATs to depend on `--tweaks`. The setting is safe in any mode.
+- Ideas sourced from the sysctl block in [denpiligrim/3dp-manager/forwarding_install.sh](https://github.com/denpiligrim/3dp-manager/blob/main/forwarding_install.sh), adapted to our adaptive-by-RAM approach and relevant to the cascade + WARP-bypass stack.
+
 - **Cloudflare WARP egress for exit- and single-nodes.** New flag `--egress=direct|warp` (default `direct`). With `--egress=warp` the installer:
   1. Downloads [wgcf](https://github.com/ViRb3/wgcf) (multi-arch: amd64 / arm64 / armv7) from GitHub Releases.
   2. Runs `wgcf register --accept-tos` and `wgcf generate`, placing the profile at `/etc/wireguard/wgcf.conf`.

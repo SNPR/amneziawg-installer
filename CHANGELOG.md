@@ -14,6 +14,15 @@
 
 ### Добавлено
 
+- **TCP-тюнинг ядра: PMTU black-hole detection, TCP-буферы, реюз TIME_WAIT.** В `setup_advanced_sysctl` (основной путь установки) добавлены:
+  - `net.ipv4.tcp_mtu_probing = 1` — активирует адаптивный MSS-пробинг когда провайдер/мобильный оператор/NAT-гейт фильтрует ICMP «needs-frag». Без этого большие TCP-сегменты молча теряются на путях VPN → каскад → WARP, и сайты «виснут». Значение 1 безопасно: пробинг включается только при детекте black-hole'а, не на каждый пакет. Это тот самый класс багов «YouTube/тяжёлые сайты не грузятся через каскад».
+  - `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem` — явные per-socket ranges `{min default max}`, масштабируются под наш adaptive `rmem_max`/`wmem_max` (16 MB на VPS ≥ 2 GB RAM, 4 MB иначе). До этого отдельные TCP-сокеты не раскручивались до полного глобального максимума.
+  - `net.ipv4.tcp_slow_start_after_idle = 0` — после idle не скатываемся в slow-start, держим congestion window между активными фазами: нет просадки скорости при возобновлении long-lived VPN-соединений.
+  - `net.ipv4.tcp_tw_reuse = 1` — реюз TIME_WAIT-сокетов для исходящих соединений (безопасно на современных ядрах благодаря timestamp-based validation RFC 6191); снижает давление на таблицу сокетов на exit-нодах с высоким egress rate через WARP/NIC.
+  - `net.netfilter.nf_conntrack_max` повышен с 65536 до **адаптивного значения**: `262144` на VPS ≥ 2 GB RAM (≈80 MB RAM на таблицу), `131072` на меньших. Прежний потолок заполнялся под нагрузкой каскад+WARP-bypass (YouTube CDN сам открывает десятки параллельных flow'ов) и новые соединения начинали дропаться.
+- **`tcp_mtu_probing = 1` также попал в `setup_minimal_sysctl` (`--no-tweaks`):** единственная настройка из этого набора, которую добавили даже в минимальный путь — слишком значимая для корректной работы VPN за мобильным оператором/NAT'ом, чтобы зависеть от `--tweaks`. Настройка безопасна в любом режиме.
+- Источник идей — sysctl-блок в [denpiligrim/3dp-manager/forwarding_install.sh](https://github.com/denpiligrim/3dp-manager/blob/main/forwarding_install.sh), адаптировано под наш adaptive-by-RAM подход и актуально для каскада + WARP-bypass.
+
 - **WARP egress (Cloudflare) для exit- и single-ноды.** Новый флаг `--egress=direct|warp` (по умолчанию `direct`). При `--egress=warp` установщик:
   1. Скачивает [wgcf](https://github.com/ViRb3/wgcf) (мультиарх: amd64 / arm64 / armv7) с GitHub Releases.
   2. Выполняет `wgcf register --accept-tos` и `wgcf generate`, размещает профиль в `/etc/wireguard/wgcf.conf`.
