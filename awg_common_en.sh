@@ -867,21 +867,46 @@ _download_wgcf_binary() {
         log_debug "wgcf already installed: $(command -v wgcf)"
         return 0
     fi
-    local arch url
+    local arch url=""
     case "$(uname -m)" in
         x86_64|amd64)   arch="amd64" ;;
         aarch64|arm64)  arch="arm64" ;;
         armv7l|armv7)   arch="armv7" ;;
         *) log_error "Architecture $(uname -m) is not supported by wgcf"; return 1 ;;
     esac
-    # GitHub API returns JSON with assets; grab browser_download_url for arch
-    url=$(curl -fsSL --max-time 15 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
-        | grep '"browser_download_url"' \
-        | grep -E "linux_${arch}\"?$" \
-        | head -1 \
-        | sed -E 's/.*"(https[^"]+)".*/\1/')
+
+    # Strategy 1 (primary): HTTP redirect `/releases/latest` →
+    # `/releases/tag/vX.Y.Z`. Doesn't use the GitHub API, no anonymous
+    # rate-limit (60 req/hour), and is immune to JSON format changes.
+    # curl -w '%{redirect_url}' returns the first Location target without
+    # following the whole redirect chain.
+    local redirect tag
+    redirect=$(curl -sI -o /dev/null -w '%{redirect_url}' \
+               --max-time 15 \
+               https://github.com/ViRb3/wgcf/releases/latest 2>/dev/null)
+    tag=$(echo "$redirect" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+    if [[ -n "$tag" ]]; then
+        url="https://github.com/ViRb3/wgcf/releases/download/${tag}/wgcf_${tag#v}_linux_${arch}"
+        log_debug "wgcf version resolved via HTTP redirect: $tag"
+    fi
+
+    # Strategy 2 (fallback): GitHub API, in case `releases/latest` stops
+    # redirecting (structural changes to github.com). Can fail with 403
+    # rate-limit for anonymous requests.
     if [[ -z "$url" ]]; then
-        log_error "Could not find a wgcf release for arch=${arch} via GitHub API"
+        log_debug "HTTP redirect did not yield a version — falling back to GitHub API"
+        url=$(curl -fsSL --max-time 15 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null \
+            | grep '"browser_download_url"' \
+            | grep -E "linux_${arch}\"?$" \
+            | head -1 \
+            | sed -E 's/.*"(https[^"]+)".*/\1/')
+    fi
+
+    if [[ -z "$url" ]]; then
+        log_error "Could not determine a wgcf release URL (neither redirect nor API worked)."
+        log_error "  Check manually:"
+        log_error "    curl -sI https://github.com/ViRb3/wgcf/releases/latest | grep -i location"
+        log_error "  Then download wgcf_<VER>_linux_${arch} into /usr/local/bin/wgcf and chmod +x."
         return 1
     fi
     log "Downloading wgcf: $url"
