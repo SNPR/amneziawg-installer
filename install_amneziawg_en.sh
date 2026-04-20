@@ -212,14 +212,15 @@ WARP egress (for role=exit or single — NOT compatible with role=entry):
   --warp-bypass=SPEC    WARP exceptions (traffic exits via main NIC directly).
                         Useful against CDNs that rate-limit or block WARP
                         address ranges (the classic case is YouTube /
-                        googlevideo). SPEC = none (default) | google |
-                        custom:<URL|/path>, comma-separated. The list format
-                        is auto-detected: CIDR (1.2.3.4[/N]) or hostname
-                        (resolved via @1.1.1.1); `#` comments and dnsmasq-
-                        style `full:`/`@tag` decorations are accepted.
-                        Requires --egress=warp. Auto-refreshes every 6 hours
-                        through a systemd timer.
-                        Example: --warp-bypass=google,custom:https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt
+                        googlevideo). SPEC = none (default) | youtube |
+                        custom:<URL|/path>, comma-separated. `youtube` is the
+                        CIDR list from touhidurrr/iplist-youtube (cidr4.txt).
+                        For custom sources the format is auto-detected:
+                        CIDR (1.2.3.4[/N]) or hostname (resolved via @1.1.1.1);
+                        `#` comments and dnsmasq-style `full:`/`@tag`
+                        decorations are accepted. Requires --egress=warp.
+                        Auto-refreshes every 6 hours through a systemd timer.
+                        Example: --warp-bypass=youtube,custom:https://example.com/list.txt
 
 AmneziaDNS (for the built-in site-based split tunneling UI in the Amnezia VPN client):
   --amnezia-dns=MODE    off (default) | on
@@ -243,7 +244,7 @@ Examples:
   sudo bash install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --yes
   sudo bash install_amneziawg_en.sh --egress=warp --yes         # Standalone server with WARP egress
   sudo bash install_amneziawg_en.sh --role=exit --egress=warp --yes   # Cascade exit with WARP egress
-  sudo bash install_amneziawg_en.sh --role=exit --egress=warp --warp-bypass=google,custom:https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt --yes
+  sudo bash install_amneziawg_en.sh --role=exit --egress=warp --warp-bypass=youtube --yes   # Exit + WARP, YouTube goes direct
   sudo bash install_amneziawg_en.sh --amnezia-dns=on --yes      # Standalone server + site-based split tunneling in the client
   sudo bash install_amneziawg_en.sh --role=entry --upstream-conf=/root/from_exit.conf --amnezia-dns=on --yes
   sudo bash install_amneziawg_en.sh --uninstall                 # Uninstall
@@ -1792,7 +1793,7 @@ initialize_setup() {
         fi
     fi
     # --warp-bypass: comma-separated list of sources for WARP exceptions.
-    # Each item: `google` | `custom:URL` | `custom:/path`.
+    # Each item: `youtube` | `custom:URL` | `custom:/path`.
     # `none` (default) — nothing. Only meaningful with egress=warp.
     AWG_WARP_BYPASS="${CLI_WARP_BYPASS:-${AWG_WARP_BYPASS:-none}}"
     if [[ "$AWG_WARP_BYPASS" != "none" && "$AWG_EGRESS" != "warp" ]]; then
@@ -1808,9 +1809,9 @@ initialize_setup() {
             _s="${_s## }"; _s="${_s%% }"
             [[ -z "$_s" ]] && continue
             case "$_s" in
-                google) ;;
+                youtube) ;;
                 custom:http://*|custom:https://*|custom:/*) ;;
-                *) die "Invalid --warp-bypass: '$_s'. Allowed: none, google, custom:URL, custom:/absolute/path — comma-separated." ;;
+                *) die "Invalid --warp-bypass: '$_s'. Allowed: none, youtube, custom:URL, custom:/absolute/path — comma-separated." ;;
             esac
         done
     fi

@@ -116,7 +116,7 @@ sudo bash install_amneziawg_en.sh \
   --role=exit \
   --subnet=10.9.0.1/24 \
   --egress=warp \
-  --warp-bypass=google,custom:https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt \
+  --warp-bypass=youtube \
   --yes
 ```
 
@@ -124,8 +124,8 @@ The installer fetches wgcf, registers a free Cloudflare WARP account and wires u
 
 `--warp-bypass` sends specific destinations **around** WARP (directly via the VPS):
 
-- `google` — Google's published IP ranges from the official [goog.txt](https://www.gstatic.com/ipranges/goog.txt),
-- `custom:https://...` — ready-made list of CIDRs or domains at a URL (the example points at [touhidurrr/iplist-youtube](https://github.com/touhidurrr/iplist-youtube) for the YouTube CDN, whose ranges WARP rate-limits — otherwise videos fail to load),
+- `youtube` — YouTube CIDR list from [touhidurrr/iplist-youtube](https://github.com/touhidurrr/iplist-youtube) (`cidr4.txt`); needed because WARP's Cloudflare IPs are rate-limited by the YouTube CDN and videos otherwise fail to load,
+- `custom:https://...` — ready-made list of CIDRs or domains at a URL,
 - `custom:/path/to/file.txt` — local file,
 - comma-separated combinations.
 

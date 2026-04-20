@@ -1153,10 +1153,10 @@ setup_warp_egress() {
     return 1
 }
 
-# Установка WARP bypass (обход WARP для специфичных dst — YouTube/Google/etc.).
+# Установка WARP bypass (обход WARP для специфичных dst — YouTube/CDN/etc.).
 # Пишет /usr/local/sbin/awg-warp-bypass.sh, systemd unit + timer, конфиг
 # /etc/amnezia/amneziawg/warp-bypass.conf по значению AWG_WARP_BYPASS
-# (comma-separated: google | custom:URL | custom:/path).
+# (comma-separated: youtube | custom:URL | custom:/path).
 # Вызывается из step6 установщика ПОСЛЕ setup_warp_egress и ДО
 # render_server_config — сервис должен уже существовать к моменту старта
 # awg-quick@awg0 в step7 (его PostUp дёргает start --no-block).
@@ -1182,7 +1182,7 @@ setup_warp_bypass() {
     if ! command -v dig >/dev/null 2>&1; then
         log "Установка dnsutils (dig) для резолва доменов в WARP bypass..."
         DEBIAN_FRONTEND=noninteractive apt install -y dnsutils >/dev/null 2>&1 \
-            || log_warn "apt install dnsutils не удался; CIDR-источники (goog.txt) работать будут, резолв доменов — нет."
+            || log_warn "apt install dnsutils не удался; CIDR-источники работать будут, резолв доменов — нет."
     fi
 
     # 1. Конфиг: список источников по одному на строку.
@@ -1191,7 +1191,7 @@ setup_warp_bypass() {
     {
         echo "# Источники WARP bypass (авто-генерация install_amneziawg.sh)"
         echo "# Один источник на строку. Допустимо:"
-        echo "#   google                         — Google IP-диапазоны (goog.txt)"
+        echo "#   youtube                        — YouTube CIDR (touhidurrr/iplist-youtube)"
         echo "#   https://example.com/list.txt   — удалённый URL"
         echo "#   /path/to/local/list.txt        — локальный файл"
         echo "# Содержимое каждого источника — CIDR (1.2.3.4/24) или домен"
@@ -1204,7 +1204,7 @@ setup_warp_bypass() {
             _s="${_s## }"; _s="${_s%% }"
             [[ -z "$_s" ]] && continue
             case "$_s" in
-                google)   echo "google" ;;
+                youtube)  echo "youtube" ;;
                 custom:*) echo "${_s#custom:}" ;;
             esac
         done
@@ -1229,7 +1229,7 @@ set -o pipefail
 
 CONFIG_FILE="/etc/amnezia/amneziawg/warp-bypass.conf"
 ENV_FILE="/etc/default/awg-warp-bypass"
-GOOG_URL="https://www.gstatic.com/ipranges/goog.txt"
+YOUTUBE_URL="https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt"
 LOCK_FILE="/run/awg-warp-bypass.lock"
 
 [[ -r "$ENV_FILE" ]] && . "$ENV_FILE"
@@ -1302,10 +1302,10 @@ while IFS= read -r src; do
     src="$(echo "$src" | xargs)"
     [[ -z "$src" ]] && continue
     case "$src" in
-        google)
-            log "source: google (goog.txt)"
-            if ! content=$(curl -fsSL --max-time 30 --retry 2 "$GOOG_URL"); then
-                log "fetch failed: $GOOG_URL"
+        youtube)
+            log "source: youtube (touhidurrr/iplist-youtube cidr4.txt)"
+            if ! content=$(curl -fsSL --max-time 30 --retry 2 "$YOUTUBE_URL"); then
+                log "fetch failed: $YOUTUBE_URL"
                 continue
             fi
             process_content "$content"
@@ -1341,7 +1341,7 @@ EOF_AWG_WARP_BYPASS
     # запускал ExecStart заново (нужно для timer + PostUp awg0 на restart).
     cat > "$bypass_svc" <<'EOF_BYPASS_SVC'
 [Unit]
-Description=Apply WARP bypass routes (goog.txt / custom CIDRs / domain list)
+Description=Apply WARP bypass routes (YouTube CIDRs / custom CIDRs / domain list)
 Documentation=https://github.com/SNPR/amneziawg-installer
 After=network-online.target awg-quick@awg0.service
 Wants=network-online.target
@@ -1355,9 +1355,9 @@ ExecStart=/usr/local/sbin/awg-warp-bypass.sh
 WantedBy=multi-user.target
 EOF_BYPASS_SVC
 
-    # 5. systemd timer — раз в 6 часов обновляем (IP-диапазоны и DNS-записи
-    # меняются быстрее чем goog.txt). Persistent=true: прогоняется после
-    # reboot если пропустили срабатывание.
+    # 5. systemd timer — раз в 6 часов обновляем (IP-диапазоны YouTube/CDN
+    # и DNS-записи меняются заметно чаще чем мы перекатываем установщик).
+    # Persistent=true: прогоняется после reboot если пропустили срабатывание.
     cat > "$bypass_timer" <<'EOF_BYPASS_TIMER'
 [Unit]
 Description=Refresh WARP bypass routes periodically

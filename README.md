@@ -116,7 +116,7 @@ sudo bash install_amneziawg.sh \
   --role=exit \
   --subnet=10.9.0.1/24 \
   --egress=warp \
-  --warp-bypass=google,custom:https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt \
+  --warp-bypass=youtube \
   --yes
 ```
 
@@ -124,8 +124,8 @@ sudo bash install_amneziawg.sh \
 
 Флаг `--warp-bypass` выводит выборочный трафик **мимо** WARP (напрямую через VPS):
 
-- `google` — IP-диапазоны Google из официального [goog.txt](https://www.gstatic.com/ipranges/goog.txt),
-- `custom:https://...` — готовый список CIDR или доменов по URL (в примере — [touhidurrr/iplist-youtube](https://github.com/touhidurrr/iplist-youtube) для YouTube-CDN, чьи диапазоны WARP рейт-лимитирует и ролики не грузятся),
+- `youtube` — CIDR-список YouTube из [touhidurrr/iplist-youtube](https://github.com/touhidurrr/iplist-youtube) (`cidr4.txt`): нужен потому что Cloudflare-IP у WARP рейт-лимитятся YouTube-CDN и видео висят,
+- `custom:https://...` — готовый список CIDR или доменов по URL,
 - `custom:/path/to/file.txt` — локальный файл,
 - сочетание через запятую.
 

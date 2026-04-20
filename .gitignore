@@ -25,3 +25,6 @@ Desktop.ini
 # Secrets
 .env
 .env.*
+
+# Local research artefacts (upstream repo clones, scratch notes)
+.research/
