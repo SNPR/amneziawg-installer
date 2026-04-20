@@ -569,16 +569,27 @@ render_client_config() {
     local conf_file="$AWG_DIR/${name}.conf"
     local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
 
-    # DNS в клиентском конфиге.
-    # AmneziaDNS=on: отдаём tunnel-gateway IP (напр. 10.8.0.1), там живёт наш
-    # dnsmasq. Клиент Amnezia VPN автоматически использует его как dns1, а в
-    # сайт-листе (split tunneling) DNS для «в обход VPN» имён резолвится
-    # локально на устройстве → сайт видит реальный IP пользователя.
-    # Иначе: обычный Cloudflare 1.1.1.1.
+    # DNS + AllowedIPs для режима AmneziaDNS=on.
+    # 1) DNS: отдаём tunnel-gateway IP (напр. 10.9.9.1), там живёт наш dnsmasq.
+    #    Клиент Amnezia VPN автоматически использует его как dns1, а в сайт-
+    #    листе (split tunneling) DNS для «в обход VPN» имён резолвится локально
+    #    на устройстве → сайт видит реальный IP пользователя.
+    # 2) AllowedIPs: обязан быть РОВНО "0.0.0.0/0, ::/0" (с пробелом!). Иначе
+    #    гейт в Amnezia-клиенте (servers_model.cpp::isDefaultServerDefault-
+    #    ContainerHasSplitTunneling, dev-ветка, строки 837-863) сработает:
+    #    любой более конкретный AllowedIPs клиент интерпретирует как «сервер
+    #    уже делает split tunneling сам» и отключает свой UI с тостом
+    #    «Default server does not support split tunneling function».
+    #    Route-all в клиенте — это НЕ про «весь трафик в VPN по факту»,
+    #    а про «доверяй клиенту самому решать что куда роутить через UI
+    #    site-list». Сайты из bypass-списка клиент снимет с маршрута
+    #    динамически, через резолв в dnsmasq и NotAllowedIPs.
+    # Иначе (amnezia-dns=off): DNS=1.1.1.1, AllowedIPs из ALLOWED_IPS.
     local client_dns="1.1.1.1"
     if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" && -n "${AWG_TUNNEL_SUBNET:-}" ]]; then
         client_dns=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
         [[ -z "$client_dns" ]] && client_dns="1.1.1.1"
+        allowed_ips="0.0.0.0/0, ::/0"
     fi
 
     local tmpfile

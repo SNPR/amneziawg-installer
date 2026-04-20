@@ -570,16 +570,27 @@ render_client_config() {
     local conf_file="$AWG_DIR/${name}.conf"
     local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
 
-    # DNS in the client config.
-    # AmneziaDNS=on: we hand out the tunnel-gateway IP (e.g. 10.8.0.1) — our
-    # dnsmasq lives there. The Amnezia VPN client picks it up as dns1 and
-    # resolves "bypass-VPN" sites from the site-list locally on the device
-    # → the destination site sees the user's real IP, not the VPS IP.
-    # Otherwise: plain Cloudflare 1.1.1.1.
+    # DNS + AllowedIPs when AmneziaDNS=on.
+    # 1) DNS: we hand out the tunnel-gateway IP (e.g. 10.9.9.1) — our dnsmasq
+    #    lives there. The Amnezia VPN client picks it up as dns1 and resolves
+    #    "bypass-VPN" sites from the site-list locally on the device → the
+    #    destination site sees the user's real IP, not the VPS IP.
+    # 2) AllowedIPs MUST be exactly "0.0.0.0/0, ::/0" (with the space!). If
+    #    anything more specific leaks through, the gate in the Amnezia client
+    #    (servers_model.cpp::isDefaultServerDefaultContainerHasSplitTunneling,
+    #    dev branch, lines 837-863) treats the server as "already doing split
+    #    tunneling by itself" and disables its own UI with the toast
+    #    "Default server does not support split tunneling function".
+    #    Route-all in the client config is NOT "send all traffic through the
+    #    VPN no matter what" — it's "trust the client to route per its site
+    #    list UI". Sites on the bypass list get dropped from the route
+    #    dynamically, via dnsmasq resolution and NotAllowedIPs.
+    # Otherwise (amnezia-dns=off): DNS=1.1.1.1, AllowedIPs from ALLOWED_IPS.
     local client_dns="1.1.1.1"
     if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" && -n "${AWG_TUNNEL_SUBNET:-}" ]]; then
         client_dns=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
         [[ -z "$client_dns" ]] && client_dns="1.1.1.1"
+        allowed_ips="0.0.0.0/0, ::/0"
     fi
 
     local tmpfile
