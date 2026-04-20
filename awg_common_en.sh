@@ -194,7 +194,8 @@ safe_load_config() {
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
-                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS)
+                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS|\
+                AWG_AMNEZIA_DNS)
                     export "$key=$value"
                     ;;
             esac
@@ -569,6 +570,18 @@ render_client_config() {
     local conf_file="$AWG_DIR/${name}.conf"
     local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
 
+    # DNS in the client config.
+    # AmneziaDNS=on: we hand out the tunnel-gateway IP (e.g. 10.8.0.1) — our
+    # dnsmasq lives there. The Amnezia VPN client picks it up as dns1 and
+    # resolves "bypass-VPN" sites from the site-list locally on the device
+    # → the destination site sees the user's real IP, not the VPS IP.
+    # Otherwise: plain Cloudflare 1.1.1.1.
+    local client_dns="1.1.1.1"
+    if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" && -n "${AWG_TUNNEL_SUBNET:-}" ]]; then
+        client_dns=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
+        [[ -z "$client_dns" ]] && client_dns="1.1.1.1"
+    fi
+
     local tmpfile
     tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
 
@@ -576,7 +589,7 @@ render_client_config() {
 [Interface]
 PrivateKey = ${client_privkey}
 Address = ${client_ip}/32
-DNS = 1.1.1.1
+DNS = ${client_dns}
 MTU = 1280
 Jc = ${AWG_Jc}
 Jmin = ${AWG_Jmin}
@@ -1371,6 +1384,128 @@ EOF_BYPASS_TIMER
 }
 
 # ==============================================================================
+# AmneziaDNS (dnsmasq on the tunnel gateway)
+# ==============================================================================
+#
+# Why. A default Amnezia VPN client tunnels everything (AllowedIPs=0.0.0.0/0),
+# and the site-based split tunneling UI (include/exclude per site) only lights
+# up when the client was handed "a vpn:// URI from a real Amnezia server" —
+# the URI with `isThirdPartyConfig:false` and an `amnezia-dns` container
+# inside. Without that flag Amnezia's UI greys site-lists out with
+# "Default server does not support split tunneling function".
+#
+# What we do. Bring up dnsmasq on the tunnel gateway (first address of
+# $AWG_TUNNEL_SUBNET — e.g. 10.8.0.1) and emit the client vpn:// URI as a
+# "real Amnezia server" (isThirdPartyConfig:false + amnezia-dns container).
+# The client UI opens up the site-list: the user manually marks `youtube.com`,
+# `vk.com`, etc. as "bypass VPN" and the DNS for those names is resolved
+# locally on the device (not through our dnsmasq), traffic leaves the device
+# straight to the ISP. The destination site sees the user's real IP.
+#
+# role=single or role=entry only. On the exit node it has no meaning: exit
+# does not serve AWG clients directly, so its DNS would never reach a config.
+#
+# Conflict with systemd-resolved: we do NOT touch the 127.0.0.53:53 stub
+# listener (we bind to the tunnel gateway IP, not 0.0.0.0). Only collide
+# when someone ran a system with DNSStubListener pinned to 0.0.0.0. On stock
+# Ubuntu 24.04 the stub is on 127.0.0.53 and we're on 10.x.x.1 — no clash.
+# bind-interfaces is mandatory so dnsmasq doesn't wildcard-bind.
+setup_amnezia_dns() {
+    [[ "${AWG_AMNEZIA_DNS:-off}" == "on" ]] || return 0
+
+    case "${AWG_ROLE:-single}" in
+        single|entry) ;;
+        *) log_error "setup_amnezia_dns: role=${AWG_ROLE} (need single or entry)"; return 1 ;;
+    esac
+
+    if [[ -z "${AWG_TUNNEL_SUBNET:-}" ]]; then
+        log_error "setup_amnezia_dns: AWG_TUNNEL_SUBNET is not set"
+        return 1
+    fi
+
+    local server_ip
+    server_ip=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
+    if [[ -z "$server_ip" ]]; then
+        log_error "setup_amnezia_dns: cannot extract tunnel-gateway IP from '$AWG_TUNNEL_SUBNET'"
+        return 1
+    fi
+
+    local conf_file="/etc/dnsmasq.d/amneziawg.conf"
+    local marker="${AWG_DIR}/.amnezia_dns_enabled_by_installer"
+
+    if ! command -v dnsmasq >/dev/null 2>&1; then
+        log "Installing dnsmasq for AmneziaDNS..."
+        DEBIAN_FRONTEND=noninteractive apt install -y dnsmasq >/dev/null 2>&1 \
+            || { log_error "apt install dnsmasq failed"; return 1; }
+        # apt install dnsmasq may autostart the service with the default
+        # config (listen on 0.0.0.0:53). Stop it right away; we'll configure
+        # and bring it up again afterwards.
+        systemctl stop dnsmasq 2>/dev/null || true
+    fi
+
+    # systemd-resolved on Ubuntu 24.04 keeps its stub on 127.0.0.53 (not the
+    # wildcard). We bind to $server_ip, so ports do not clash. But on some
+    # minimal images DNSStubListener=yes + ListenAddress=0.0.0.0 grabs port 53
+    # entirely — in that case we slip a drop-in with DNSStubListener=no.
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        if ss -uln 2>/dev/null | awk '/:53 /{print $5}' | grep -qE '(^|[^0-9])(0\.0\.0\.0|\*):53$'; then
+            log "systemd-resolved listens on 0.0.0.0:53 — disabling its stub listener for AmneziaDNS."
+            mkdir -p /etc/systemd/resolved.conf.d || {
+                log_error "mkdir /etc/systemd/resolved.conf.d"; return 1;
+            }
+            cat > /etc/systemd/resolved.conf.d/amneziawg.conf <<'EOF'
+# Disables systemd-resolved's stub listener on 0.0.0.0:53 so dnsmasq can
+# take port 53. Managed by install_amneziawg.sh (--amnezia-dns=on); removed
+# on uninstall.
+[Resolve]
+DNSStubListener=no
+EOF
+            systemctl restart systemd-resolved 2>/dev/null || log_warn "systemd-resolved restart failed"
+        fi
+    fi
+
+    mkdir -p "$(dirname "$conf_file")" || { log_error "mkdir $(dirname "$conf_file")"; return 1; }
+    cat > "$conf_file" <<EOF
+# AmneziaDNS — local resolver for AWG clients.
+# Auto-generated by install_amneziawg_en.sh (--amnezia-dns=on).
+# We bind ONLY to the tunnel gateway $server_ip (bind-interfaces) so we
+# don't clash with the systemd-resolved stub on 127.0.0.53:53 and don't
+# poke outwards. Upstream is Cloudflare 1.1.1.1 / 1.0.0.1 (no recursion
+# back into ourselves).
+listen-address=$server_ip
+bind-interfaces
+no-resolv
+no-poll
+server=1.1.1.1
+server=1.0.0.1
+cache-size=1000
+domain-needed
+bogus-priv
+EOF
+    chmod 644 "$conf_file"
+
+    # UFW: open 53/udp on the tunnel gateway IP only. On role=entry clients
+    # arrive from AWG_TUNNEL_SUBNET over awg0 — INPUT rules on awg0 are
+    # already implied (UFW default allow-forward is unrelated; dnsmasq is
+    # listening on the awg0 address). Add an explicit rule for clarity.
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow in on awg0 to "$server_ip" port 53 proto udp >/dev/null 2>&1 || true
+        ufw allow in on awg0 to "$server_ip" port 53 proto tcp >/dev/null 2>&1 || true
+    fi
+
+    systemctl enable --now dnsmasq >/dev/null 2>&1 \
+        || { log_error "dnsmasq: enable --now failed (see systemctl status dnsmasq / journalctl -u dnsmasq)"; return 1; }
+    # Restart in case it was already running with the pre-existing config.
+    systemctl restart dnsmasq >/dev/null 2>&1 || log_warn "dnsmasq: restart failed"
+
+    echo "gateway=$server_ip" > "$marker" 2>/dev/null || log_warn "Failed to write marker $marker"
+    chmod 600 "$marker" 2>/dev/null || true
+
+    log "AmneziaDNS configured: dnsmasq listens on ${server_ip}:53, upstream 1.1.1.1 / 1.0.0.1."
+    return 0
+}
+
+# ==============================================================================
 # Peer management
 # ==============================================================================
 
@@ -1615,12 +1750,29 @@ generate_vpn_uri() {
     fi
     allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0"
 
+    # AmneziaDNS: "real Amnezia server" mode (isThirdPartyConfig:false +
+    # amnezia-dns container + dns1=tunnel-gateway). This unlocks the
+    # site-based split tunneling UI in the client.
+    local amnezia_dns_flag="0" dns1="1.1.1.1" dns2="1.0.0.1"
+    if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" && -n "${AWG_TUNNEL_SUBNET:-}" ]]; then
+        local _gw
+        _gw=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
+        if [[ -n "$_gw" ]]; then
+            amnezia_dns_flag="1"
+            dns1="$_gw"
+            # dns2 stays public as a fallback — when the VPN is not up or
+            # the client hasn't installed the route to $_gw yet.
+            dns2="1.1.1.1"
+        fi
+    fi
+
     local vpn_uri perl_err
     perl_err=$(awg_mktemp) || perl_err="/tmp/awg_perl_err.$$"
     # shellcheck disable=SC2016
     vpn_uri=$(perl -MCompress::Zlib -MMIME::Base64 -e '
         my ($conf_path, $h1,$h2,$h3,$h4, $jc,$jmin,$jmax,
-            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cpk, $spk, $aips) = @ARGV;
+            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cpk, $spk, $aips,
+            $adns, $dns1, $dns2) = @ARGV;
 
         open my $fh, "<", $conf_path or die;
         local $/; my $raw = <$fh>; close $fh;
@@ -1652,14 +1804,19 @@ generate_vpn_uri() {
         $inner .= qq("server_pub_key":"$spk"});
 
         my $einner = je($inner);
+        my $is_tpc = ($adns eq "1") ? "false" : "true";
+        my $containers = qq({"awg":{"isThirdPartyConfig":$is_tpc,"last_config":"$einner","port":"$port","protocol_version":"2","transport_proto":"udp"\},"container":"amnezia-awg"\});
+        if ($adns eq "1") {
+            # amnezia-dns container — signal to the client that this server
+            # understands split tunneling. dns1 is handed in as the
+            # tunnel-gateway IP.
+            $containers .= qq(,{"dns":{},"container":"amnezia-dns"\});
+        }
         my $outer = "{";
-        $outer .= qq("containers":[{"awg":{"isThirdPartyConfig":true,);
-        $outer .= qq("last_config":"$einner",);
-        $outer .= qq("port":"$port","protocol_version":"2",);
-        $outer .= qq("transport_proto":"udp"\},"container":"amnezia-awg"\}],);
+        $outer .= qq("containers":[$containers],);
         $outer .= qq("defaultContainer":"amnezia-awg",);
         $outer .= qq("description":"AWG Server",);
-        $outer .= qq("dns1":"1.1.1.1","dns2":"1.0.0.1",);
+        $outer .= qq("dns1":"$dns1","dns2":"$dns2",);
         $outer .= qq("hostName":"$ep"});
 
         my $compressed = compress($outer);
@@ -1673,7 +1830,8 @@ generate_vpn_uri() {
         "$AWG_Jc" "$AWG_Jmin" "$AWG_Jmax" \
         "$AWG_S1" "$AWG_S2" "$AWG_S3" "$AWG_S4" \
         "$AWG_I1" "$AWG_PORT" "$endpoint" \
-        "$client_ip" "$client_privkey" "$server_pubkey" "$allowed_ips" 2>"$perl_err"
+        "$client_ip" "$client_privkey" "$server_pubkey" "$allowed_ips" \
+        "$amnezia_dns_flag" "$dns1" "$dns2" 2>"$perl_err"
     )
 
     if [[ -z "$vpn_uri" ]]; then

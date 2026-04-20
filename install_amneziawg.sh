@@ -56,6 +56,8 @@ CLI_ROLE=""; CLI_UPSTREAM_CONF=""; CLI_UPSTREAM_IFACE=""
 CLI_UPSTREAM_TABLE=""; CLI_UPSTREAM_FWMARK=""
 # WARP egress: заворот клиентского трафика в Cloudflare WARP (для role=exit|single)
 CLI_EGRESS=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""; CLI_WARP_BYPASS=""
+# AmneziaDNS: локальный dnsmasq на tunnel-gateway + «родной» Amnezia vpn://-URI
+CLI_AMNEZIA_DNS=""
 
 # --- Автоочистка временных файлов ---
 _install_temp_files=()
@@ -99,6 +101,7 @@ while [[ $# -gt 0 ]]; do
         --warp-table=*)       CLI_WARP_TABLE="${1#*=}" ;;
         --warp-priority=*)    CLI_WARP_PRIORITY="${1#*=}" ;;
         --warp-bypass=*)      CLI_WARP_BYPASS="${1#*=}" ;;
+        --amnezia-dns=*)      CLI_AMNEZIA_DNS="${1#*=}" ;;
         *) echo "Неизвестный аргумент: $1"; HELP=1 ;;
     esac
     shift
@@ -216,6 +219,17 @@ WARP egress (для role=exit или single — НЕ совместимо с rol
                         Работает только с --egress=warp. Автообновление раз
                         в 6 часов через systemd timer.
 
+AmneziaDNS (для встроенного site-based split tunneling в Amnezia VPN клиенте):
+  --amnezia-dns=РЕЖИМ   off (умолч.) | on
+                        on: ставит dnsmasq на tunnel-gateway IP (напр. 10.8.0.1),
+                        генерит клиентский vpn:// URI как «полноценный
+                        Amnezia-сервер» (isThirdPartyConfig:false + контейнер
+                        amnezia-dns). В UI Amnezia VPN открывается сайт-список
+                        split tunneling — сайты «в обход VPN» резолвятся
+                        локально на устройстве и уходят напрямую к ISP
+                        (сайт видит реальный IP пользователя, не IP VPS).
+                        Доступно на --role=single и --role=entry (не exit).
+
 Примеры:
   sudo bash install_amneziawg.sh                             # Интерактивная установка
   sudo bash install_amneziawg.sh --port=51820 --route-all    # Неинтерактивная
@@ -227,6 +241,8 @@ WARP egress (для role=exit или single — НЕ совместимо с rol
   sudo bash install_amneziawg.sh --egress=warp --yes         # Single-сервер с WARP egress
   sudo bash install_amneziawg.sh --role=exit --egress=warp --yes   # Exit-нода каскада с WARP
   sudo bash install_amneziawg.sh --role=exit --egress=warp --warp-bypass=google,custom:https://raw.githubusercontent.com/touhidurrr/iplist-youtube/main/lists/cidr4.txt --yes
+  sudo bash install_amneziawg.sh --amnezia-dns=on --yes      # Single-сервер + site-based split tunneling в клиенте
+  sudo bash install_amneziawg.sh --role=entry --upstream-conf=/root/from_exit.conf --amnezia-dns=on --yes
   sudo bash install_amneziawg.sh --uninstall                 # Удаление
   sudo bash install_amneziawg.sh --diagnostic                # Диагностика
 
@@ -444,7 +460,8 @@ safe_load_config() {
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
-                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS)
+                AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS|\
+                AWG_AMNEZIA_DNS)
                     export "$key=$value"
                     ;;
             esac
@@ -1510,6 +1527,22 @@ step_uninstall() {
         systemctl daemon-reload 2>/dev/null
         log "WARP bypass удалён."
     fi
+    if [[ -f "$AWG_DIR/.amnezia_dns_enabled_by_installer" ]]; then
+        log "Снятие AmneziaDNS (dnsmasq-конфиг на tunnel-gateway)..."
+        rm -f /etc/dnsmasq.d/amneziawg.conf
+        # systemd-resolved drop-in ставился только при реальном конфликте порта.
+        # Снимаем без проверок: файл под нашим именем — наш.
+        if [[ -f /etc/systemd/resolved.conf.d/amneziawg.conf ]]; then
+            rm -f /etc/systemd/resolved.conf.d/amneziawg.conf
+            systemctl restart systemd-resolved 2>/dev/null || true
+        fi
+        systemctl restart dnsmasq 2>/dev/null || true
+        # Пакет dnsmasq НЕ удаляем: мог быть установлен пользователем для
+        # других нужд ДО нашего инсталлятора. Если после нашего uninstall
+        # остался пустой dnsmasq без конфига — это штатно.
+        rm -f "$AWG_DIR/.amnezia_dns_enabled_by_installer"
+        log "AmneziaDNS снят (пакет dnsmasq оставлен, конфиг /etc/dnsmasq.d/amneziawg.conf удалён)."
+    fi
     modprobe -r amneziawg 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
         log "Очистка правил UFW для AmneziaWG..."
@@ -1773,6 +1806,22 @@ initialize_setup() {
     fi
     export AWG_EGRESS AWG_WARP_IFACE AWG_WARP_TABLE AWG_WARP_PRIORITY AWG_WARP_BYPASS
 
+    # AmneziaDNS: локальный dnsmasq на tunnel-gateway IP + vpn:// URI с
+    # isThirdPartyConfig=false, чтобы Amnezia VPN клиент включил встроенный
+    # site-based split tunneling (сайты из списка «в обход VPN» → трафик
+    # уходит через реальное подключение устройства; сайт видит реальный IP).
+    # Доступно на role=single и role=entry. На exit не имеет смысла: exit
+    # не отдаёт конфиги клиентам напрямую.
+    AWG_AMNEZIA_DNS="${CLI_AMNEZIA_DNS:-${AWG_AMNEZIA_DNS:-off}}"
+    case "$AWG_AMNEZIA_DNS" in
+        on|off) ;;
+        *) die "Некорректный --amnezia-dns='$AWG_AMNEZIA_DNS'. Допустимо: on, off." ;;
+    esac
+    if [[ "$AWG_AMNEZIA_DNS" == "on" && "$AWG_ROLE" == "exit" ]]; then
+        die "--amnezia-dns=on несовместим с --role=exit. AmneziaDNS поднимается на ноде, которая отдаёт конфиги клиентам (single или entry)."
+    fi
+    export AWG_AMNEZIA_DNS
+
     # Валидация после CLI override
     validate_port "$AWG_PORT"
     validate_subnet "$AWG_TUNNEL_SUBNET"
@@ -1875,6 +1924,8 @@ export AWG_WARP_IFACE='${AWG_WARP_IFACE:-wgcf}'
 export AWG_WARP_TABLE=${AWG_WARP_TABLE:-2408}
 export AWG_WARP_PRIORITY=${AWG_WARP_PRIORITY:-789}
 export AWG_WARP_BYPASS='${AWG_WARP_BYPASS:-none}'
+# AmneziaDNS
+export AWG_AMNEZIA_DNS='${AWG_AMNEZIA_DNS:-off}'
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -2407,6 +2458,14 @@ step6_generate_configs() {
             log "Настройка WARP bypass (${AWG_WARP_BYPASS})..."
             setup_warp_bypass || log_warn "setup_warp_bypass упал (не фатально: WARP-egress работает, bypass не применился)."
         fi
+    fi
+
+    # AmneziaDNS: ставим dnsmasq на tunnel-gateway IP ДО рендера клиентов —
+    # клиентские конфиги получают DNS=${gateway}, но сам резолвер должен
+    # существовать к моменту первого подключения клиента в step7.
+    if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" ]]; then
+        log "Настройка AmneziaDNS (dnsmasq на tunnel-gateway)..."
+        setup_amnezia_dns || die "Ошибка setup_amnezia_dns. См. лог."
     fi
 
     # Создание серверного конфига AWG 2.0
