@@ -1401,7 +1401,8 @@ EOF_BYPASS_TIMER
 # (мы биндимся на tunnel-gateway IP, не на 0.0.0.0), — conflict только если
 # кто-то поставил систему с DNSStubListener=на 0.0.0.0. На стандартной Ubuntu
 # 24.04 stub слушает на 127.0.0.53, а мы на 10.x.x.1 — без коллизии. Но
-# bind-interfaces обязателен чтобы dnsmasq не пытался забиндить wildcard.
+# bind-dynamic обязателен чтобы dnsmasq не пытался забиндить wildcard и
+# переживал ситуацию «awg0 поднимется позже» (см. комментарий у конфига).
 setup_amnezia_dns() {
     [[ "${AWG_AMNEZIA_DNS:-off}" == "on" ]] || return 0
 
@@ -1458,11 +1459,17 @@ EOF
     cat > "$conf_file" <<EOF
 # AmneziaDNS — локальный резолвер для AWG-клиентов.
 # Автогенерация install_amneziawg.sh (--amnezia-dns=on).
-# Биндимся ТОЛЬКО на tunnel-gateway $server_ip (bind-interfaces), чтобы
-# не конфликтовать с systemd-resolved stub на 127.0.0.53:53 и не торчать
-# наружу. upstream — Cloudflare 1.1.1.1 / 1.0.0.1 (без рекурсии внутрь).
+# Биндимся ТОЛЬКО на tunnel-gateway $server_ip, чтобы не конфликтовать с
+# systemd-resolved stub на 127.0.0.53:53 и не торчать наружу.
+# bind-dynamic (а не bind-interfaces!): dnsmasq стартует даже если awg0
+# ещё не поднят (установщик делает setup_amnezia_dns в step6, а
+# awg-quick@awg0 — только в step7; и на reboot порядок запуска тот же).
+# bind-dynamic отслеживает появление/исчезновение адресов на интерфейсах
+# и перепривязывается автоматически. bind-interfaces требует наличия IP
+# на момент старта и падает с "Cannot assign requested address".
+# upstream — Cloudflare 1.1.1.1 / 1.0.0.1 (без рекурсии внутрь).
 listen-address=$server_ip
-bind-interfaces
+bind-dynamic
 no-resolv
 no-poll
 server=1.1.1.1
