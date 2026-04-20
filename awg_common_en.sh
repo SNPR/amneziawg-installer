@@ -1811,7 +1811,15 @@ generate_vpn_uri() {
 
         my $einner = je($inner);
         my $is_tpc = ($adns eq "1") ? "false" : "true";
-        my $containers = qq({"awg":{"isThirdPartyConfig":$is_tpc,"last_config":"$einner","port":"$port","protocol_version":"2","transport_proto":"udp"\},"container":"amnezia-awg"\});
+        # Container: "amnezia-awg" maps in the Amnezia-Client classifier to
+        # DockerContainer::Awg → label "AmneziaWG Legacy", site-based split
+        # tunneling UI stays hidden. "amnezia-awg2" → DockerContainer::Awg2
+        # → label "AmneziaWG (version 2)", the UI is unlocked. Both
+        # containers share the same "awg" protocol key and last_config —
+        # the only difference is labeling, and that the Legacy branch
+        # disables the UI. We use amnezia-awg2 only in Amnezia mode (adns=1).
+        my $cname = ($adns eq "1") ? "amnezia-awg2" : "amnezia-awg";
+        my $containers = qq({"awg":{"isThirdPartyConfig":$is_tpc,"last_config":"$einner","port":"$port","protocol_version":"2","transport_proto":"udp"\},"container":"$cname"\});
         if ($adns eq "1") {
             # amnezia-dns container — signal to the client that this server
             # understands split tunneling. dns1 is handed in as the
@@ -1820,7 +1828,7 @@ generate_vpn_uri() {
         }
         my $outer = "{";
         $outer .= qq("containers":[$containers],);
-        $outer .= qq("defaultContainer":"amnezia-awg",);
+        $outer .= qq("defaultContainer":"$cname",);
         $outer .= qq("description":"AWG Server",);
         $outer .= qq("dns1":"$dns1","dns2":"$dns2",);
         $outer .= qq("hostName":"$ep"});
