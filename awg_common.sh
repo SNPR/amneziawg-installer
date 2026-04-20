@@ -2028,6 +2028,18 @@ regenerate_client() {
         [[ -n "$_v" ]] && current_allowed_ips="$_v"
     fi
 
+    # В режиме AmneziaDNS клиентский AllowedIPs жёстко фиксирован в
+    # "0.0.0.0/0, ::/0" (требование гейта Amnezia-Client split-tunnel UI —
+    # см. render_client_config). «Сохранённое» старое значение из .conf
+    # вернуло бы инсталл в сломанное состояние при первом же regen/modify.
+    # Аналогично DNS: всегда tunnel-gateway IP, а не 1.1.1.1 из прошлого .conf.
+    if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" ]]; then
+        current_allowed_ips="0.0.0.0/0, ::/0"
+        if [[ -n "${AWG_TUNNEL_SUBNET:-}" ]]; then
+            current_dns=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
+        fi
+    fi
+
     # Перегенерация конфига
     render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" || return 1
 
