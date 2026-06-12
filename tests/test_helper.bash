@@ -82,7 +82,8 @@ CONF
 
 # Helper: add a peer block to server config
 add_test_peer() {
-    local name="$1" ip="$2" pubkey="${3:-TESTPUBKEY_${name}}"
+    local name="$1" ip="$2"
+    local pubkey="${3:-TESTPUBKEY_${name}}"
     cat >> "$SERVER_CONF_FILE" << EOF
 
 [Peer]

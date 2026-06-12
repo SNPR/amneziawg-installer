@@ -3,8 +3,8 @@
 # ==============================================================================
 # Shared function library for AmneziaWG 2.0
 # Author: @bivlked
-# Version: 5.10.0
-# Date: 2026-04-16
+# Version: 5.15.6
+# Date: 2026-06-08
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 #
@@ -23,19 +23,44 @@ KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # NOTE: trap is NOT set here to avoid overwriting the caller's trap handler.
 # The calling script must invoke _awg_cleanup() in its own EXIT handler.
 _AWG_TEMP_FILES=()
+# File-backed temp registry: awg_mktemp is usually called via $(...) (a
+# subshell), where the _AWG_TEMP_FILES array mutation is lost in the parent. A
+# file survives the subshell, so _awg_cleanup can reliably remove even a temp
+# created inside command substitution (e.g. an interrupted config write between
+# mktemp and mv). $$ is the calling script's PID, stable across its subshells.
+_AWG_TEMP_REGISTRY="${TMPDIR:-/tmp}/.awg_temp_registry.$$"
 
 _awg_cleanup() {
     local f
     for f in "${_AWG_TEMP_FILES[@]}"; do
         [[ -f "$f" ]] && rm -f "$f"
     done
+    if [[ -n "${_AWG_TEMP_REGISTRY:-}" && -f "$_AWG_TEMP_REGISTRY" ]]; then
+        while IFS= read -r f; do
+            [[ -n "$f" && -f "$f" ]] && rm -f "$f"
+        done < "$_AWG_TEMP_REGISTRY"
+        rm -f "$_AWG_TEMP_REGISTRY"
+    fi
 }
 
-# mktemp wrapper with auto-cleanup
+# mktemp wrapper with auto-cleanup.
+# Optional 1st argument - target directory: the temp file is created in the same
+# directory where the final file will live, so the subsequent mv is an atomic
+# rename within one filesystem rather than a cross-fs copy+unlink (matters when
+# /tmp is mounted as tmpfs). With no argument the behaviour is unchanged (/tmp
+# or $TMPDIR) - backward compatible.
 awg_mktemp() {
-    local f
-    f=$(mktemp) || return 1
+    local dir="${1:-}" f
+    if [[ -n "$dir" ]]; then
+        mkdir -p "$dir" 2>/dev/null
+        f=$(mktemp -p "$dir") || return 1
+    else
+        f=$(mktemp) || return 1
+    fi
     _AWG_TEMP_FILES+=("$f")
+    # Mirror the path into the file registry - it survives a subshell
+    # ($(awg_mktemp ...)), unlike the array above.
+    [[ -n "${_AWG_TEMP_REGISTRY:-}" ]] && printf '%s\n' "$f" >> "$_AWG_TEMP_REGISTRY" 2>/dev/null
     echo "$f"
 }
 
@@ -51,12 +76,103 @@ fi
 # Utilities
 # ==============================================================================
 
+# --- IP / CIDR validators (shared by install and manage) ---
+# These check numeric ranges, not just shape: IPv4 octets 0-255, IPv4 prefix
+# 0-32, IPv6 0-128. A bare address (no prefix) is valid (wireguard-tools treats
+# a bare IPv4 as /32 and a bare IPv6 as /128 - a host route).
+
+# _valid_ipv4 <addr> : exactly 4 octets, each 0-255 (10# avoids a leading-zero
+# octet being read as octal inside (( )) ).
+_valid_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o
+    for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        (( 10#$o <= 255 )) || return 1
+    done
+    return 0
+}
+
+# _valid_ipv6 <addr> : structural check (not just charset). Allows one "::"
+# compression; without it requires exactly 8 groups of 1-4 hex digits, with it
+# at most 7. Embedded IPv4 (::ffff:1.2.3.4) is intentionally unsupported - it
+# does not occur in tunnel AllowedIPs and the dots are rejected by the charset.
+_valid_ipv6() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    case "$ip" in
+        *:::*)   return 1 ;;                     # three or more ":" in a row
+        *::*::*) return 1 ;;                     # more than one "::"
+    esac
+    [[ "$ip" == :* && "$ip" != ::* ]] && return 1   # lone leading ":"
+    [[ "$ip" == *: && "$ip" != *:: ]] && return 1   # lone trailing ":"
+    local has_dcolon=0
+    [[ "$ip" == *::* ]] && has_dcolon=1
+    local IFS=':' parts=() p ngroups=0
+    read -ra parts <<< "$ip"
+    for p in "${parts[@]}"; do
+        [[ -z "$p" ]] && continue                 # empty fields from "::"
+        [[ "$p" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        (( ngroups++ ))
+    done
+    if [[ $has_dcolon -eq 1 ]]; then
+        (( ngroups <= 7 )) || return 1            # "::" stands for >=1 group
+    else
+        (( ngroups == 8 )) || return 1
+    fi
+    return 0
+}
+
+# _valid_cidr <token> : IPv4/IPv6 address with an optional prefix. If present,
+# the prefix must be a number in range (IPv4 0-32, IPv6 0-128). An empty prefix
+# after "/" (e.g. "1.2.3.4/") is rejected.
+_valid_cidr() {
+    local tok="$1" addr prefix
+    if [[ "$tok" == */* ]]; then
+        addr="${tok%/*}"; prefix="${tok##*/}"
+        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    else
+        addr="$tok"; prefix=""
+    fi
+    if _valid_ipv4 "$addr"; then
+        [[ -z "$prefix" ]] && return 0
+        (( 10#$prefix <= 32 )) || return 1
+        return 0
+    elif _valid_ipv6 "$addr"; then
+        [[ -z "$prefix" ]] && return 0
+        (( 10#$prefix <= 128 )) || return 1
+        return 0
+    fi
+    return 1
+}
+
+# _valid_host_or_ipv4 <host> : for Endpoint - a valid IPv4 OR an FQDN.
+_valid_host_or_ipv4() {
+    local host="$1"
+    _valid_ipv4 "$host" && return 0
+    [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] || return 1
+    # An all-numeric last label is not a real TLD (RFC 3696) but more likely a
+    # malformed IPv4 (e.g. "999.1.1.1"); reject it so a typo'd IP is not accepted.
+    local last="${host##*.}"
+    [[ "$last" =~ ^[0-9]+$ ]] && return 1
+    return 0
+}
+
 # Detect primary network interface
 get_main_nic() {
     ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}'
 }
 
-# Detect server public IP (with caching)
+# Detect server public IP (with caching).
+#
+# The 6-service list covers common NAT and cloud scenarios without
+# hard ranking by uptime: ifconfig.me has been historically stable on
+# regular VPS (Hetzner, Vultr, OVH), checkip.amazonaws.com remains
+# reachable from AWS / GCP / OCI private subnets behind a NAT Gateway,
+# ipinfo.io / icanhazip / ifconfig.io are extra fallbacks against
+# rate-limit on any single endpoint. Order is alphabetical (deterministic
+# for tests and diffs). First-wins: when one service returns a valid IP,
+# the rest are skipped.
 _CACHED_PUBLIC_IP=""
 get_server_public_ip() {
     if [[ -n "$_CACHED_PUBLIC_IP" ]]; then
@@ -64,17 +180,57 @@ get_server_public_ip() {
         return 0
     fi
     local ip="" svc
-    for svc in https://ifconfig.me https://api.ipify.org https://icanhazip.com https://ipinfo.io/ip; do
+    for svc in \
+        https://api.ipify.org \
+        https://checkip.amazonaws.com \
+        https://icanhazip.com \
+        https://ifconfig.io \
+        https://ifconfig.me \
+        https://ipinfo.io/ip
+    do
         ip=$(curl -4 -sf --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]')
-        if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ -n "$ip" ]] && _valid_ipv4 "$ip"; then
             _CACHED_PUBLIC_IP="$ip"
+            # Observability: write trace to LOG_FILE directly. Never to stdout
+            # (the function's stdout IS the IP; any extra bytes corrupt the
+            # caller's $(get_server_public_ip) capture and the generated
+            # client Endpoint line).
+            if [[ -n "${LOG_FILE:-}" && -w "$(dirname "${LOG_FILE}")" ]]; then
+                printf '[%s] DEBUG: public IP detected: %s (via %s)\n' \
+                    "$(date +'%F %T')" "$ip" "$svc" >>"$LOG_FILE" 2>/dev/null || true
+            fi
             echo "$ip"
             return 0
         fi
     done
+    if [[ -n "${LOG_FILE:-}" && -w "$(dirname "${LOG_FILE}")" ]]; then
+        printf '[%s] DEBUG: public IP detection failed (all 6 services unreachable or invalid)\n' \
+            "$(date +'%F %T')" >>"$LOG_FILE" 2>/dev/null || true
+    fi
     echo ""
     return 1
 }
+
+# Fallback: first non-loopback IPv4 on a network interface.
+# Used when curl to ifconfig.me / ipify / ... does not go through
+# (LXC without egress, outbound firewall, etc.). On bare metal / regular
+# VPS this usually matches the public IP; on a NAT'd host it returns a
+# private address — in that case the caller must emit log_warn so the
+# user can hand-edit the Endpoint in the client .conf files.
+_try_local_ip() {
+    local ip
+    ip=$(ip -4 -o addr show scope global 2>/dev/null \
+        | awk '{print $4}' \
+        | cut -d/ -f1 \
+        | grep -v '^127\.' \
+        | head -1)
+    { [[ -n "$ip" ]] && _valid_ipv4 "$ip"; } || return 1
+    echo "$ip"
+    return 0
+}
+
+# Note: apt_update_tolerant() is defined inline in install_amneziawg_en.sh
+# (needed in steps 1-2 before this file is downloaded). Not duplicated here.
 
 # ==============================================================================
 # AWG 2.0 parameter generation (used in tests + manage)
@@ -159,6 +315,277 @@ generate_awg_h_ranges() {
 }
 
 # ==============================================================================
+# DKMS / amneziawg kernel module auto-recovery
+# ==============================================================================
+#
+# After an apt kernel upgrade the DKMS module must be rebuilt for the new
+# kernel. If that did not happen automatically (or the module was unbound),
+# the 4 functions below perform an idempotent recovery:
+#
+#   _sanitize_awg_dkms_conf       — strip the deprecated REMAKE_INITRD= directive
+#   _install_kernel_headers       — distro-aware fallback chain (Ubuntu/Debian)
+#   _ensure_awg_quick_running     — start awg-quick@awg0 if inactive
+#   ensure_amneziawg_kernel_module — master, public entry point
+#
+# === Use context and safety contract ===
+#
+# Master ensure_amneziawg_kernel_module() assumes that the running kernel
+# (uname -r) is the target kernel — i.e. it is suited for post-reboot
+# contexts only: manage repair-module, manage add/remove (after the user
+# rebooted), the systemd unit (which fires at boot when the new kernel is
+# already running). From a DPkg::Post-Invoke hook uname -r still returns the
+# OLD kernel — for that case the Phase 3 apt-hook helper will use a separate
+# wrapper that iterates target kernels via /lib/modules/*/build.
+#
+# Master does NOT call apt-get install by default (deadlock in any context
+# where a parent process holds /var/lib/dpkg/lock-frontend). The apt step is
+# gated by the AWG_ALLOW_APT_IN_ENSURE=1 environment variable, which is set
+# only by install_amneziawg step 2 / manage repair-module. The apt hook
+# helper and the systemd unit do NOT set it; master skips the headers step.
+#
+# Headers must be set up separately at install time via a meta-package
+# (linux-headers-$(arch) on Debian, linux-headers-generic on Ubuntu) — apt
+# then pulls matching headers automatically on apt kernel upgrade.
+
+# Strip the deprecated REMAKE_INITRD= directive from the amneziawg dkms.conf.
+# Modern DKMS versions consider it deprecated and print noisy warnings.
+_sanitize_awg_dkms_conf() {
+    local conf
+    for conf in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
+        [[ -f "$conf" ]] && sed -i '/^REMAKE_INITRD=/d' "$conf"
+    done
+}
+
+# Install a kernel headers package via a distro-aware fallback chain.
+# Argument: kernel version (defaults to $(uname -r)).
+# Returns: 0 if at least one candidate installed successfully, 1 if all failed.
+#
+# IMPORTANT: only call from contexts where the apt lock is available
+# (install_amneziawg step 2 or manage repair-module). MUST NOT be called from
+# the DPkg::Post-Invoke hook.
+#
+# Recognises Raspberry Pi Foundation kernels (+rpt/-rpi suffix):
+# linux-headers-rpi-2712 (Pi 5 / Cortex-A76) or linux-headers-rpi-v8 (Pi 3/4 arm64).
+_install_kernel_headers() {
+    # Defense-in-depth: this function calls apt-get install and must never
+    # run from a hook context (deadlock on dpkg lock). Master already gates
+    # it via AWG_ALLOW_APT_IN_ENSURE, but the _ prefix is not enforced — the
+    # same gate is added here so an accidental direct call from a third-party
+    # script still cannot bypass the protection.
+    if [[ "${AWG_ALLOW_APT_IN_ENSURE:-0}" != "1" ]]; then
+        log_error "_install_kernel_headers: AWG_ALLOW_APT_IN_ENSURE is not set — apt invocation forbidden in this context."
+        return 1
+    fi
+
+    local kernel_ver="${1:-$(uname -r)}"
+    local candidates=()
+
+    # RPi Foundation kernel (suffix +rpt or -rpi) — separate meta-package
+    # regardless of distro. Pattern check order: 2712 → v7l → v7 → v8 (default).
+    if [[ "$kernel_ver" == *+rpt* || "$kernel_ver" == *-rpi* ]]; then
+        if [[ "$kernel_ver" == *2712* ]]; then
+            candidates+=("linux-headers-rpi-2712")  # Pi 5 / Cortex-A76
+        elif [[ "$kernel_ver" == *-rpi-v7l* ]]; then
+            candidates+=("linux-headers-rpi-v7l")   # armhf 32-bit (LPAE)
+        elif [[ "$kernel_ver" == *-rpi-v7* ]]; then
+            candidates+=("linux-headers-rpi-v7")    # armhf 32-bit older
+        else
+            candidates+=("linux-headers-rpi-v8")    # Pi 3/4 arm64 default
+        fi
+    fi
+
+    case "${OS_ID:-}" in
+        ubuntu)
+            candidates+=(
+                "linux-headers-${kernel_ver}"
+                "linux-headers-generic"
+                "raspberrypi-kernel-headers"
+            )
+            ;;
+        debian)
+            local arch
+            arch=$(dpkg --print-architecture 2>/dev/null)
+            candidates+=("linux-headers-${kernel_ver}")
+            if [[ -n "$arch" ]]; then
+                # Debian cloud images use a dedicated meta-package
+                # linux-headers-cloud-${arch} instead of the generic
+                # linux-headers-${arch} (different kernel ABI — sched/IRQ
+                # timers trimmed for VMs). Prefer cloud-meta when the
+                # running kernel is explicitly a cloud build — otherwise
+                # repair-module fails on AWS/Azure/GCP/cloud-Hetzner after
+                # a kernel upgrade, even though headers are available via
+                # the cloud meta-package.
+                if [[ "$kernel_ver" == *-cloud-* ]]; then
+                    candidates+=("linux-headers-cloud-${arch}")
+                fi
+                candidates+=("linux-headers-${arch}")
+            fi
+            ;;
+        *)
+            log_error "Installing kernel headers: unknown OS_ID='${OS_ID:-}' (only ubuntu/debian are supported)."
+            return 1
+            ;;
+    esac
+
+    local pkg
+    for pkg in "${candidates[@]}"; do
+        if apt-get install -y "$pkg" >/dev/null 2>&1; then
+            log "Installed kernel headers: $pkg"
+            return 0
+        fi
+        log_warn "Failed to install $pkg, trying next candidate..."
+    done
+    log_error "Failed to install any kernel headers package (${candidates[*]})."
+    return 1
+}
+
+# Start awg-quick@<iface> if the service is inactive.
+# Argument: interface name (defaults to awg0).
+# Returns: 0 on successful start or if already active, 1 on failure.
+_ensure_awg_quick_running() {
+    local iface="${1:-awg0}"
+    local svc="awg-quick@${iface}.service"
+
+    if systemctl is-active --quiet "$svc"; then
+        return 0
+    fi
+
+    log "Starting $svc (was inactive)..."
+    if systemctl start "$svc"; then
+        log "$svc started."
+        return 0
+    fi
+    log_error "Failed to start $svc. Details: systemctl status $svc"
+    return 1
+}
+
+# Master: ensure that the amneziawg kernel module is built and loaded for the running kernel.
+# Idempotent: fast-path returns 0 if the module is already loaded.
+#
+# Argument: mode — "full" (default: module + start awg-quick) or
+#                  "module-only" (module only, no service start).
+#
+# IMPORTANT: master is intended for post-reboot contexts (manage repair-module,
+# manage add/remove after a reboot, the systemd unit at boot). Apt/dpkg hook
+# code MUST NOT call master — uname -r inside Post-Invoke still returns the
+# OLD kernel, so the hook must use a separate wrapper that iterates target
+# kernels via /lib/modules/*/build (Phase 3 helper).
+#
+# Environment: AWG_ALLOW_APT_IN_ENSURE=1 enables the kernel-headers install step
+# via apt-get install (dangerous in hook context — deadlock on dpkg lock).
+# When unset → headers step is skipped with a warning (assumes headers are
+# already on disk via the linux-headers-$(arch) meta-package).
+#
+# When needed, runs a 5-step recovery:
+#   headers → sanitize → dkms autoinstall → depmod → modprobe.
+#
+# Returns:
+#   0 — module loaded successfully (and in "full" mode awg-quick is active).
+#   1 — final modprobe failed, or invalid mode argument
+#       (with a 4-step manual recovery printed to the log).
+ensure_amneziawg_kernel_module() {
+    local mode="${1:-full}"
+    case "$mode" in
+        full|module-only) ;;
+        *)
+            log_error "ensure_amneziawg_kernel_module: invalid mode '$mode' (expected 'full' or 'module-only')."
+            return 1
+            ;;
+    esac
+    local kernel_ver
+    kernel_ver="$(uname -r)"
+
+    # Fast-path: module already loaded.
+    if lsmod 2>/dev/null | awk '{print $1}' | grep -qx 'amneziawg'; then
+        if [[ "$mode" == "full" ]]; then
+            _ensure_awg_quick_running awg0 || \
+                log_warn "Module is active but awg-quick@awg0 did not start (module OK, this is a service issue)."
+        fi
+        return 0
+    fi
+
+    # Module on disk for the running kernel — try modprobe before full repair.
+    if find "/lib/modules/${kernel_ver}" -name 'amneziawg.ko*' -print -quit 2>/dev/null | grep -q .; then
+        if modprobe amneziawg 2>/dev/null && \
+           lsmod 2>/dev/null | awk '{print $1}' | grep -qx 'amneziawg'; then
+            log "amneziawg module found on disk and loaded successfully."
+            if [[ "$mode" == "full" ]]; then
+                _ensure_awg_quick_running awg0 || \
+                    log_warn "Module loaded but awg-quick@awg0 did not start (module OK, this is a service issue)."
+            fi
+            return 0
+        fi
+    fi
+
+    log_warn "amneziawg module is not loaded and not built for kernel ${kernel_ver}."
+    log_warn "Starting automatic recovery..."
+
+    # Step 1: kernel headers — only when apt is allowed by the calling context.
+    if [[ "${AWG_ALLOW_APT_IN_ENSURE:-0}" == "1" ]]; then
+        case "${OS_ID:-}" in
+            ubuntu|debian)
+                local headers_pkg="linux-headers-${kernel_ver}"
+                if ! dpkg-query -W -f='${Status}' "$headers_pkg" 2>/dev/null | grep -q 'install ok installed'; then
+                    log "Kernel headers ($headers_pkg) are not installed. Installing..."
+                    _install_kernel_headers "$kernel_ver" || \
+                        log_warn "Failed to install kernel headers. The DKMS module build may fail."
+                fi
+                ;;
+        esac
+    elif [[ ! -d "/lib/modules/${kernel_ver}/build" ]]; then
+        log_warn "/lib/modules/${kernel_ver}/build is missing, headers are not installed."
+        log_warn "Apt install skipped (context does not allow apt). The DKMS build will most likely fail."
+    fi
+
+    # Step 2: strip the deprecated REMAKE_INITRD from dkms.conf
+    _sanitize_awg_dkms_conf
+
+    # Step 3: dkms autoinstall for the running kernel.
+    # If this step reports an error, still try modprobe below — that's the definitive check.
+    if command -v dkms >/dev/null 2>&1; then
+        log "Running: dkms autoinstall -k ${kernel_ver}"
+        if ! dkms autoinstall -k "${kernel_ver}" >/dev/null 2>&1; then
+            log_warn "dkms autoinstall reported an error for kernel ${kernel_ver}."
+            local dkms_log
+            dkms_log=$(find /var/lib/dkms/amneziawg -name 'make.log' -path "*${kernel_ver}*" 2>/dev/null | head -n 1)
+            if [[ -n "$dkms_log" ]]; then
+                log_warn "Last 20 lines of the DKMS build log (${dkms_log}):"
+                tail -20 "$dkms_log" | while IFS= read -r line; do log_warn "  $line"; done
+            else
+                log_warn "Build log not found. Details under /var/lib/dkms/amneziawg/."
+            fi
+        fi
+    else
+        log_warn "The dkms package is not installed. Cannot rebuild the kernel module."
+    fi
+
+    # Step 4: rebuild module dependency cache for the specific kernel.
+    if command -v depmod >/dev/null 2>&1; then
+        depmod -a "$kernel_ver" 2>/dev/null || \
+            log_warn "depmod -a $kernel_ver reported an error; modprobe below will give the final diagnosis."
+    fi
+
+    # Step 5: final modprobe attempt.
+    if ! modprobe amneziawg 2>/dev/null; then
+        log_error "amneziawg kernel module could not be loaded for kernel ${kernel_ver}."
+        log_error "The module is not present in /lib/modules/${kernel_ver}/."
+        log_error "Manual recovery:"
+        log_error "  1. apt install -y \"linux-headers-${kernel_ver}\""
+        log_error "  2. dkms autoinstall -k \"${kernel_ver}\" && depmod -a"
+        log_error "  3. modprobe amneziawg"
+        log_error "  4. systemctl start \"awg-quick@awg0\""
+        return 1
+    fi
+
+    log "amneziawg module loaded successfully for kernel ${kernel_ver}."
+    if [[ "$mode" == "full" ]]; then
+        _ensure_awg_quick_running awg0 || \
+            log_warn "Module loaded but awg-quick@awg0 did not start (module OK, this is a service issue)."
+    fi
+    return 0
+}
+
+# ==============================================================================
 # Loading / saving parameters
 # ==============================================================================
 
@@ -190,9 +617,10 @@ safe_load_config() {
             fi
             case "$key" in
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
-                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
+                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|AWG_MTU|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                ALLOW_IPV6_TUNNEL|IPV6_SUBNET|SERVER_HAS_NATIVE_IPV6|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
                 AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS|\
                 AWG_AMNEZIA_DNS)
@@ -220,7 +648,7 @@ load_awg_params_from_server_conf() {
     local _Jc="" _Jmin="" _Jmax=""
     local _S1="" _S2="" _S3="" _S4=""
     local _H1="" _H2="" _H3="" _H4=""
-    local _I1="" _Port=""
+    local _I1="" _Port="" _MTU=""
 
     local in_iface=0 line key value
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -248,6 +676,7 @@ load_awg_params_from_server_conf() {
                 H4)         _H4="$value" ;;
                 I1)         _I1="$value" ;;
                 ListenPort) _Port="$value" ;;
+                MTU)        _MTU="$value" ;;
             esac
         fi
     done < "$conf"
@@ -263,6 +692,9 @@ load_awg_params_from_server_conf() {
     export AWG_H1="$_H1" AWG_H2="$_H2" AWG_H3="$_H3" AWG_H4="$_H4"
     [[ -n "$_I1"   ]] && export AWG_I1="$_I1"
     [[ -n "$_Port" ]] && export AWG_PORT="$_Port"
+    if _validate_mtu "${_MTU:-}"; then
+        export AWG_MTU="$_MTU"
+    fi
     return 0
 }
 
@@ -403,9 +835,68 @@ generate_server_keys() {
     return 0
 }
 
+# Ensure $AWG_DIR/server_public.key is present.
+# If missing — tries to reconstruct it from the PrivateKey in awg0.conf
+# (useful for manual setups outside my installer, where the cached
+# server pubkey from install step 6 does not exist). Returns 0 if the
+# key is already there or has been reconstructed, 1 otherwise.
+_ensure_server_public_key() {
+    [[ -f "$AWG_DIR/server_public.key" ]] && return 0
+
+    [[ -f "$SERVER_CONF_FILE" ]] || {
+        log_error "Cannot reconstruct server_public.key — $SERVER_CONF_FILE is missing"
+        return 1
+    }
+    local _srv_priv
+    _srv_priv=$(awk '
+        /^\[Interface\]/ {in_iface=1; next}
+        in_iface && /^[ \t]*PrivateKey[ \t]*=/ {
+            sub(/^[ \t]*PrivateKey[ \t]*=[ \t]*/, "")
+            gsub(/[[:space:]]/, "")
+            print
+            exit
+        }
+        /^\[/ && !/^\[Interface\]/ {in_iface=0}
+    ' "$SERVER_CONF_FILE")
+    if [[ -z "$_srv_priv" ]]; then
+        log_error "PrivateKey not found in $SERVER_CONF_FILE — cannot reconstruct server_public.key"
+        return 1
+    fi
+    mkdir -p "$AWG_DIR"
+    local _tmp
+    _tmp=$(awg_mktemp "$AWG_DIR") || return 1
+    if ! echo "$_srv_priv" | awg pubkey > "$_tmp"; then
+        rm -f "$_tmp"
+        log_error "awg pubkey failed to compute the public key"
+        return 1
+    fi
+    if ! mv -f "$_tmp" "$AWG_DIR/server_public.key"; then
+        rm -f "$_tmp"
+        log_error "Failed to move to $AWG_DIR/server_public.key"
+        return 1
+    fi
+    chmod 600 "$AWG_DIR/server_public.key" 2>/dev/null || true
+    log "server_public.key reconstructed from awg0.conf PrivateKey."
+    return 0
+}
+
 # ==============================================================================
 # Config rendering
 # ==============================================================================
+
+# Derive the server IPv6 address (host ::1) from the tunnel subnet.
+# Input: PREFIX::/MASK (e.g. fddd:2c4:2c4:2c4::/64).
+# Output: PREFIX::1/MASK (e.g. fddd:2c4:2c4:2c4::1/64).
+# Assumption: subnet always ends with ::/MASK (that is how the installer writes it).
+# If no trailing ::/ is present I return the input unchanged (defensive fallback).
+_derive_ipv6_server_addr() {
+    local subnet="$1"
+    if [[ "$subnet" == *"::/"* ]]; then
+        echo "${subnet/::\//::1\/}"
+    else
+        echo "$subnet"
+    fi
+}
 
 # Render server config for AWG 2.0
 # Uses global variables from load_awg_params()
@@ -431,6 +922,18 @@ render_server_config() {
     local server_ip subnet_mask
     server_ip=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
     subnet_mask=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f2)
+
+    # [Interface] Address: IPv4 always, IPv6 only when the tunnel is enabled.
+    # The server takes host ::1 in the tunnel IPv6 subnet.
+    # IPV6_SUBNET has the form PREFIX::/MASK (default fddd:2c4:2c4:2c4::/64),
+    # so I derive the server address by replacing trailing ::/MASK with ::1/MASK.
+    local address_line="${server_ip}/${subnet_mask}"
+    if [[ "${ALLOW_IPV6_TUNNEL:-0}" -eq 1 ]]; then
+        local ipv6_subnet="${IPV6_SUBNET:-fddd:2c4:2c4:2c4::/64}"
+        local ipv6_server_addr
+        ipv6_server_addr=$(_derive_ipv6_server_addr "$ipv6_subnet")
+        address_line="${address_line}, ${ipv6_server_addr}"
+    fi
 
     local conf_dir
     conf_dir=$(dirname "$SERVER_CONF_FILE")
@@ -508,22 +1011,31 @@ render_server_config() {
         postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
 
-    # IPv6 rules if not disabled (only in plain mode; WARP and entry egress
-    # go via v4, IPv6 forwarding there makes no real sense)
-    if [[ "${DISABLE_IPV6:-1}" -eq 0 && "${AWG_ROLE:-single}" != "entry" && "${AWG_EGRESS:-direct}" != "warp" ]]; then
+    # IPv6 rules: enabled when the IPv6 tunnel is on (--allow-ipv6-tunnel) OR when
+    # host IPv6 is not disabled (FORWARD inside the tunnel + MASQUERADE to the
+    # public interface). MASQUERADE is harmless without native IPv6 on the VPS -
+    # it is a no-op while there is no IPv6 default route, while peer-to-peer traffic
+    # inside the tunnel still works. I reuse the same nic as the IPv4 MASQUERADE.
+    # The DISABLE_IPV6=0 condition is kept for byte-identical compatibility with v5.14.x.
+    # BUT: on a cascade entry node and with WARP egress, traffic leaves over v4, so
+    # IPv6 forwarding there makes no real sense (exclude those roles).
+    if [[ ( "${ALLOW_IPV6_TUNNEL:-0}" -eq 1 || "${DISABLE_IPV6:-1}" -eq 0 ) \
+          && "${AWG_ROLE:-single}" != "entry" && "${AWG_EGRESS:-direct}" != "warp" ]]; then
         postup="${postup}; ip6tables -I FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
         postdown="${postdown}; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
 
-    # Build config via temp file (atomic write)
+    # Build config via temp file (atomic write).
+    # Create temp in the target config's directory so mv is an atomic rename on
+    # the same filesystem (not a cross-fs copy+unlink when /tmp is tmpfs).
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
+    tmpfile=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "mktemp failed"; return 1; }
 
     cat > "$tmpfile" << EOF
 [Interface]
 PrivateKey = ${server_privkey}
-Address = ${server_ip}/${subnet_mask}
-MTU = 1280
+Address = ${address_line}
+MTU = ${AWG_MTU:-1280}
 ListenPort = ${AWG_PORT}
 PostUp = ${postup}
 PostDown = ${postdown}
@@ -555,8 +1067,51 @@ EOF
     return 0
 }
 
+# Acceptable MTU range for AWG / WireGuard.
+# Lower bound 576 (classic IPv4 minimum), upper bound 9100 (just under jumbo).
+# Values outside the range are treated as invalid and dropped (fallback to 1280).
+_validate_mtu() {
+    local v="$1"
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    (( v >= 576 && v <= 9100 )) || return 1
+    return 0
+}
+
+# Extract MTU from the [Interface] section of server awg0.conf (if the file
+# exists). Prints the integer on stdout, or nothing if MTU is missing or the
+# file is unreadable. Last-wins: if [Interface] holds several MTU = ... lines,
+# the last one is returned (matching the way awg-quick applies the final
+# assignment). Used by render_client_config to sync the client MTU with the
+# server (v5.14.0 bug: manual MTU edit in awg0.conf was not picked up by regen).
+_extract_mtu_from_server_conf() {
+    local conf="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
+    [[ -r "$conf" ]] || return 1
+    local val
+    val=$(awk '
+        /^\[Interface\]/ {in_iface=1; next}
+        /^\[/ {in_iface=0}
+        in_iface && /^[[:space:]]*MTU[[:space:]]*=/ {
+            gsub(/^[[:space:]]*MTU[[:space:]]*=[[:space:]]*/, "")
+            gsub(/[[:space:]].*$/, "")
+            if ($0 ~ /^[0-9]+$/) { mtu=$0 }
+        }
+        END { if (mtu != "") print mtu }
+    ' "$conf")
+    _validate_mtu "$val" || return 1
+    echo "$val"
+}
+
 # Render client config for AWG 2.0
-# render_client_config <name> <client_ip> <client_privkey> <server_pubkey> <endpoint> <port>
+# render_client_config <name> <client_ip> <client_privkey> <server_pubkey> <endpoint> <port> [client_ipv6]
+#
+# client_ipv6 (optional 7th argument): client IPv6 address without prefix
+# length (e.g. fddd:2c4:2c4:2c4::5). If non-empty and ALLOW_IPV6_TUNNEL=1:
+#   - Address = <ipv4>/32, <ipv6>/128
+#   - AllowedIPs (mirror the IPv4 routing mode into IPv6, intent-mirroring):
+#       full tunnel (ALLOWED_IPS=0.0.0.0/0): + ::/0 (native) or + <IPV6_SUBNET> (no-native)
+#       split tunnel (custom ALLOWED_IPS):   IPv4 list UNCHANGED + ONLY <IPV6_SUBNET>,
+#         NEVER ::/0 - there is no IPv6 split-list, hijacking all IPv6 breaks split-tunnel.
+# If empty (legacy client): Address = <ipv4>/32, AllowedIPs unchanged.
 render_client_config() {
     local name="$1"
     local client_ip="$2"
@@ -564,11 +1119,33 @@ render_client_config() {
     local server_pubkey="$4"
     local endpoint="$5"
     local port="$6"
+    local client_ipv6="${7:-}"
 
     load_awg_params || return 1
 
     local conf_file="$AWG_DIR/${name}.conf"
-    local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
+    local allowed_ips
+    if [[ -n "$client_ipv6" ]]; then
+        # Dual-stack: mirror the IPv4 routing intent into IPv6.
+        # full tunnel (IPv4=0.0.0.0/0) -> ::/0 (native) or tunnel ULA (no-native).
+        # split tunnel (custom ALLOWED_IPS) -> IPv4 split AS-IS + ONLY tunnel ULA,
+        # never ::/0 (no IPv6 split-list, must not hijack all IPv6).
+        local ipv4_part ipv6_part
+        ipv4_part="${ALLOWED_IPS:-0.0.0.0/0}"
+        if [[ "$ipv4_part" == "0.0.0.0/0" && "${SERVER_HAS_NATIVE_IPV6:-0}" == "1" ]]; then
+            ipv6_part="::/0"
+        else
+            ipv6_part="${IPV6_SUBNET:-fddd:2c4:2c4:2c4::/64}"
+        fi
+        # Defensive de-dup: ALLOWED_IPS is IPv4-only by construction, but do not
+        # duplicate ipv6_part if it is already present as a token in the list.
+        case ",${ipv4_part// /}," in
+            *",${ipv6_part},"*) allowed_ips="$ipv4_part" ;;
+            *)                  allowed_ips="${ipv4_part}, ${ipv6_part}" ;;
+        esac
+    else
+        allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
+    fi
 
     # DNS + AllowedIPs when AmneziaDNS=on.
     # 1) DNS: we hand out the tunnel-gateway IP (e.g. 10.9.9.1) — our dnsmasq
@@ -593,15 +1170,38 @@ render_client_config() {
         allowed_ips="0.0.0.0/0, ::/0"
     fi
 
+    # MTU resolution order: server awg0.conf > AWG_MTU from awgsetup_cfg.init >
+    # 1280 fallback. Server config is the source of truth for a running server -
+    # the user could have hand-edited MTU in /etc/amnezia/amneziawg/awg0.conf
+    # and regen has to pick that up (MyAI-sdge, Discussion #38). Out-of-range
+    # values (outside 576..9100) at any stage roll back to 1280.
+    local mtu
+    mtu=$(_extract_mtu_from_server_conf) || mtu=""
+    if [[ -z "$mtu" ]]; then
+        if _validate_mtu "${AWG_MTU:-}"; then
+            mtu="$AWG_MTU"
+        else
+            mtu=1280
+        fi
+    fi
+
+    # temp in the client config dir ($AWG_DIR) -> mv = atomic rename.
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
+    tmpfile=$(awg_mktemp "$AWG_DIR") || { log_error "mktemp failed"; return 1; }
+
+    local address_line
+    if [[ -n "$client_ipv6" ]]; then
+        address_line="${client_ip}/32, ${client_ipv6}/128"
+    else
+        address_line="${client_ip}/32"
+    fi
 
     cat > "$tmpfile" << EOF
 [Interface]
 PrivateKey = ${client_privkey}
-Address = ${client_ip}/32
+Address = ${address_line}
 DNS = ${client_dns}
-MTU = 1280
+MTU = ${mtu}
 Jc = ${AWG_Jc}
 Jmin = ${AWG_Jmin}
 Jmax = ${AWG_Jmax}
@@ -623,6 +1223,14 @@ EOF
 
 [Peer]
 PublicKey = ${server_pubkey}
+EOF
+    # Optional PresharedKey — extra layer on top of AWG 2.0 obfuscation
+    # (enabled via `manage add --psk`). Must match on server peer and
+    # client [Peer].
+    if [[ -n "${CLIENT_PSK:-}" ]]; then
+        echo "PresharedKey = ${CLIENT_PSK}" >> "$tmpfile"
+    fi
+    cat >> "$tmpfile" << EOF
 Endpoint = ${endpoint}:${port}
 AllowedIPs = ${allowed_ips}
 PersistentKeepalive = 33
@@ -1553,6 +2161,27 @@ get_next_client_ip() {
     return 1
 }
 
+# Derive the IPv6 address for a client from its IPv4 address (deterministic
+# by last octet). Used only when ALLOW_IPV6_TUNNEL=1. Allocation mirrors IPv4:
+# client 10.9.9.N gets fddd:2c4:2c4:2c4::N (same index N, /128).
+# Argument: client IPv4 address, e.g. 10.9.9.5 -> fddd:2c4:2c4:2c4::5
+# Returns the address string without a prefix length.
+#
+# get_next_client_ipv6 <ipv4_addr>
+get_next_client_ipv6() {
+    local ipv4="$1"
+    if [[ -z "$ipv4" ]]; then
+        log_error "get_next_client_ipv6: no IPv4 address supplied"
+        return 1
+    fi
+    local n="${ipv4##*.}"
+    local subnet="${IPV6_SUBNET:-fddd:2c4:2c4:2c4::/64}"
+    local prefix="${subnet%%::*}"
+    [[ "$prefix" == *:* ]] || { log_error "get_next_client_ipv6: IPV6_SUBNET does not contain :: (value: $subnet)"; return 1; }
+    echo "${prefix}::${n}"
+    return 0
+}
+
 # [Peer] addition to server config (atomic via tmpfile + mv).
 #
 # LOCKING CONTRACT: the caller MUST hold an exclusive flock on
@@ -1570,11 +2199,16 @@ get_next_client_ip() {
 # the sub-function uses the SAME fd as the parent (via inheritance),
 # which would require passing the fd as an argument.
 #
-# add_peer_to_server <name> <pubkey> <client_ip>
+# add_peer_to_server <name> <pubkey> <client_ip> [client_ipv6]
+#
+# client_ipv6 (optional 4th argument): IPv6 address without prefix length.
+# If non-empty: AllowedIPs = <ipv4>/32, <ipv6>/128
+# If empty (legacy): AllowedIPs = <ipv4>/32
 add_peer_to_server() {
     local name="$1"
     local pubkey="$2"
     local client_ip="$3"
+    local client_ipv6="${4:-}"
 
     if [[ -z "$name" || -z "$pubkey" || -z "$client_ip" ]]; then
         log_error "add_peer_to_server: insufficient arguments"
@@ -1586,9 +2220,10 @@ add_peer_to_server() {
         return 1
     fi
 
-    # Add peer via temp file (atomic)
+    # Add peer via temp file (atomic).
+    # temp in the server config dir -> mv = atomic rename on the same filesystem.
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
+    tmpfile=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "mktemp failed"; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
@@ -1601,8 +2236,17 @@ add_peer_to_server() {
 [Peer]
 #_Name = ${name}
 PublicKey = ${pubkey}
-AllowedIPs = ${client_ip}/32
 EOF
+    # PresharedKey — optional, written if passed via CLIENT_PSK env.
+    # Must match the server peer and client [Peer].
+    if [[ -n "${CLIENT_PSK:-}" ]]; then
+        echo "PresharedKey = ${CLIENT_PSK}" >> "$tmpfile"
+    fi
+    if [[ -n "$client_ipv6" ]]; then
+        echo "AllowedIPs = ${client_ip}/32, ${client_ipv6}/128" >> "$tmpfile"
+    else
+        echo "AllowedIPs = ${client_ip}/32" >> "$tmpfile"
+    fi
 
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
@@ -1640,8 +2284,9 @@ remove_peer_from_server() {
         return 1
     fi
 
+    # temp in the server config dir -> the final mv is an atomic rename.
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; exec {lock_fd}>&-; return 1; }
+    tmpfile=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "mktemp failed"; exec {lock_fd}>&-; return 1; }
 
     # Remove [Peer] block containing #_Name = name
     # Logic: buffer each [Peer] block, check name, print only if not matching
@@ -1675,9 +2320,10 @@ remove_peer_from_server() {
     }
     ' "$SERVER_CONF_FILE" > "$tmpfile"
 
-    # Normalize: squeeze multiple blank lines into one
+    # Normalize: squeeze multiple blank lines into one.
+    # tmpclean lives on the same filesystem as tmpfile (mv tmpclean->tmpfile atomic).
     local tmpclean
-    tmpclean=$(awg_mktemp) || { log_error "mktemp failed"; exec {lock_fd}>&-; return 1; }
+    tmpclean=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "mktemp failed"; exec {lock_fd}>&-; return 1; }
     if cat -s "$tmpfile" > "$tmpclean" 2>/dev/null; then
         mv "$tmpclean" "$tmpfile"
     else
@@ -1717,12 +2363,24 @@ generate_qr() {
         return 1
     fi
 
-    qrencode -t png -o "$png_file" < "$conf_file" || {
+    # C4: generate into a temp file and move it into place atomically, so an
+    # interrupted qrencode cannot leave a partial/corrupt PNG over the working one.
+    # awg_mktemp "$AWG_DIR" puts the tmp in the same directory (mv = atomic rename
+    # on one filesystem) AND registers it in the shared cleanup registry, so a
+    # SIGKILL between qrencode and mv leaves no orphan tmp.
+    local tmp_png
+    tmp_png=$(awg_mktemp "$AWG_DIR") || { log_error "mktemp error for QR '$name'"; return 1; }
+    if ! qrencode -t png -o "$tmp_png" < "$conf_file"; then
         log_error "Failed to generate QR code for '$name'"
+        rm -f "$tmp_png"
         return 1
-    }
-
-    chmod 600 "$png_file"
+    fi
+    chmod 600 "$tmp_png" 2>/dev/null
+    if ! mv -f "$tmp_png" "$png_file"; then
+        log_error "Failed to save QR code for '$name'"
+        rm -f "$tmp_png"
+        return 1
+    fi
     log_debug "QR code for '$name' created: $png_file"
     return 0
 }
@@ -1751,10 +2409,40 @@ generate_vpn_uri() {
 
     load_awg_params || return 1
 
-    local client_privkey client_ip server_pubkey endpoint allowed_ips
+    local client_privkey client_ip client_ipv6 server_pubkey endpoint allowed_ips client_psk
     client_privkey=$(grep -oP 'PrivateKey\s*=\s*\K\S+' "$conf_file") || return 1
-    client_ip=$(grep -oP 'Address\s*=\s*\K[0-9./]+' "$conf_file") || return 1
+    # Extract IPv4 from Address (first field before comma, without /prefix).
+    # Regex stops at digits and dots - does not capture IPv6 in dual-stack configs.
+    client_ip=$(awk '/^Address[[:space:]]*=/{
+        sub(/^Address[[:space:]]*=[[:space:]]*/, "")
+        sub(/\r$/, "")
+        n = split($0, parts, /[[:space:]]*,[[:space:]]*/)
+        sub(/\/[0-9]+$/, "", parts[1])
+        print parts[1]; exit
+    }' "$conf_file") || return 1
+    # Extract IPv6 from Address (second field, if present), without /prefix.
+    client_ipv6=$(awk '/^Address[[:space:]]*=/{
+        sub(/^Address[[:space:]]*=[[:space:]]*/, "")
+        sub(/\r$/, "")
+        n = split($0, parts, /[[:space:]]*,[[:space:]]*/)
+        if (n >= 2) {
+            sub(/\/[0-9]+$/, "", parts[2])
+            gsub(/[[:space:]]/, "", parts[2])
+            print parts[2]
+        }
+        exit
+    }' "$conf_file" 2>/dev/null)
+    client_ipv6="${client_ipv6:-}"
+    _ensure_server_public_key || return 1
     server_pubkey=$(cat "$AWG_DIR/server_public.key" 2>/dev/null) || return 1
+    # PresharedKey is optional. awk instead of grep so an empty result is not
+    # treated as failure (grep -P without a match → rc=1, not what we want here).
+    # Also strip a trailing CR (CRLF from Windows editors) and trailing spaces
+    # — leaking them into the JSON psk_key would break the handshake just as
+    # cleanly as the missing field. Without psk_key in inner JSON AmneziaVPN
+    # import via vpn:// loses the PSK and the handshake fails (issue #67,
+    # fix v5.11.4).
+    client_psk=$(awk '/^[[:space:]]*PresharedKey[[:space:]]*=/{sub(/^[[:space:]]*PresharedKey[[:space:]]*=[[:space:]]*/, ""); sub(/\r$/, ""); sub(/[ \t]+$/, ""); print; exit}' "$conf_file" 2>/dev/null)
     local raw_endpoint
     raw_endpoint=$(grep -oP 'Endpoint\s*=\s*\K\S+' "$conf_file") || return 1
     if [[ "$raw_endpoint" == \[* ]]; then
@@ -1765,12 +2453,29 @@ generate_vpn_uri() {
         # IPv4/hostname: addr:port
         endpoint="${raw_endpoint%:*}"
     fi
-    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0"
+    # tr -d ' \r' — strips spaces AND CR (on CRLF configs '.+' greedily
+    # captures \r into the value, which breaks JSON.allowed_ips).
+    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' \r') || allowed_ips="0.0.0.0/0"
+
+    # MTU/PersistentKeepalive/DNS from .conf - these can be changed via manage modify.
+    # On vpn:// import the Amnezia client uses the structured inner-JSON fields
+    # (awgConfigurator takes mtu from the structured field, not the embedded config),
+    # so hardcoding them would desync from .conf - same class as issue #67 (the
+    # structured psk_key field was authoritative).
+    local mtu keepalive dns_line dns1 dns2
+    mtu=$(grep -oP '^MTU\s*=\s*\K[0-9]+' "$conf_file" | head -n1); mtu="${mtu:-1280}"
+    keepalive=$(grep -oP '^PersistentKeepalive\s*=\s*\K[0-9]+' "$conf_file" | head -n1); keepalive="${keepalive:-33}"
+    dns_line=$(grep -oP '^DNS\s*=\s*\K.+' "$conf_file" | head -n1 | tr -d ' \r')
+    dns1="${dns_line%%,*}"; dns1="${dns1:-1.1.1.1}"
+    if [[ "$dns_line" == *,* ]]; then dns2="${dns_line#*,}"; dns2="${dns2%%,*}"; else dns2="$dns1"; fi
 
     # AmneziaDNS: "real Amnezia server" mode (isThirdPartyConfig:false +
     # amnezia-dns container + dns1=tunnel-gateway). This unlocks the
     # site-based split tunneling UI in the client.
-    local amnezia_dns_flag="0" dns1="1.1.1.1" dns2="1.0.0.1"
+    # dns1/dns2 are already derived from the .conf above (respecting manage modify);
+    # here we only override them in adns=on mode — we must NOT clobber the .conf
+    # values when adns=off.
+    local amnezia_dns_flag="0"
     if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" && -n "${AWG_TUNNEL_SUBNET:-}" ]]; then
         local _gw
         _gw=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
@@ -1788,8 +2493,8 @@ generate_vpn_uri() {
     # shellcheck disable=SC2016
     vpn_uri=$(perl -MCompress::Zlib -MMIME::Base64 -e '
         my ($conf_path, $h1,$h2,$h3,$h4, $jc,$jmin,$jmax,
-            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cpk, $spk, $aips,
-            $adns, $dns1, $dns2) = @ARGV;
+            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cipv6, $cpk, $spk, $aips, $psk,
+            $mtu, $keepalive, $adns, $dns1, $dns2) = @ARGV;
 
         open my $fh, "<", $conf_path or die;
         local $/; my $raw = <$fh>; close $fh;
@@ -1814,10 +2519,17 @@ generate_vpn_uri() {
         my @ips = split(/,/, $aips);
         my $ips_json = join(",", map { qq("$_") } @ips);
         $inner .= qq("allowed_ips":[$ips_json],);
-        $inner .= qq("client_ip":"$cip","client_priv_key":"$cpk",);
+        $inner .= qq("client_ip":"$cip",);
+        $cipv6 //= "";
+        $inner .= qq("client_ipv6":"$cipv6",);
+        $inner .= qq("client_priv_key":"$cpk",);
+        if (defined $psk && $psk ne "") {
+            my $epsk = je($psk);
+            $inner .= qq("psk_key":"$epsk",);
+        }
         $inner .= qq("config":"$eraw",);
-        $inner .= qq("hostName":"$ep","mtu":"1280",);
-        $inner .= qq("persistent_keep_alive":"33","port":$port,);
+        $inner .= qq("hostName":"$ep","mtu":"$mtu",);
+        $inner .= qq("persistent_keep_alive":"$keepalive","port":$port,);
         $inner .= qq("server_pub_key":"$spk"});
 
         my $einner = je($inner);
@@ -1841,7 +2553,8 @@ generate_vpn_uri() {
         $outer .= qq("containers":[$containers],);
         $outer .= qq("defaultContainer":"$cname",);
         $outer .= qq("description":"AWG Server",);
-        $outer .= qq("dns1":"$dns1","dns2":"$dns2",);
+        my $ed1 = je($dns1); my $ed2 = je($dns2);
+        $outer .= qq("dns1":"$ed1","dns2":"$ed2",);
         $outer .= qq("hostName":"$ep"});
 
         my $compressed = compress($outer);
@@ -1855,8 +2568,8 @@ generate_vpn_uri() {
         "$AWG_Jc" "$AWG_Jmin" "$AWG_Jmax" \
         "$AWG_S1" "$AWG_S2" "$AWG_S3" "$AWG_S4" \
         "$AWG_I1" "$AWG_PORT" "$endpoint" \
-        "$client_ip" "$client_privkey" "$server_pubkey" "$allowed_ips" \
-        "$amnezia_dns_flag" "$dns1" "$dns2" 2>"$perl_err"
+        "$client_ip" "$client_ipv6" "$client_privkey" "$server_pubkey" "$allowed_ips" "$client_psk" \
+        "$mtu" "$keepalive" "$amnezia_dns_flag" "$dns1" "$dns2" 2>"$perl_err"
     )
 
     if [[ -z "$vpn_uri" ]]; then
@@ -1867,15 +2580,103 @@ generate_vpn_uri() {
     fi
     rm -f "$perl_err"
 
-    echo "$vpn_uri" > "$uri_file"
-    chmod 600 "$uri_file"
+    # Write via tmp + atomic mv (like .conf/.png) so an interrupted write never
+    # leaves an empty/truncated .vpnuri on top of a working one.
+    local _uri_tmp
+    _uri_tmp=$(awg_mktemp "$AWG_DIR") || { log_error "mktemp error for vpn:// URI '$name'"; return 1; }
+    printf '%s\n' "$vpn_uri" > "$_uri_tmp" || { rm -f "$_uri_tmp"; log_error "Error writing vpn:// URI for '$name'"; return 1; }
+    chmod 600 "$_uri_tmp"
+    if ! mv -f "$_uri_tmp" "$uri_file"; then
+        rm -f "$_uri_tmp"
+        log_error "Error saving vpn:// URI for '$name'"
+        return 1
+    fi
     log_debug "vpn:// URI for '$name' created: $uri_file"
     return 0
+}
+
+# Generate QR code from vpn:// URI (for one-tap import into Amnezia VPN app Android/iOS/Desktop)
+# generate_qr_vpnuri <name>
+#
+# Writes via a temp file in the same directory + atomic mv so that on
+# qrencode or chmod failure the user never sees a truncated `.vpnuri.png`:
+# the previous version stays intact and the new one only appears whole.
+generate_qr_vpnuri() {
+    local name="$1"
+    local uri_file="$AWG_DIR/${name}.vpnuri"
+    local png_file="$AWG_DIR/${name}.vpnuri.png"
+    local tmp_png
+
+    if [[ ! -f "$uri_file" ]]; then
+        log_error "vpn:// URI for '$name' not found: $uri_file"
+        return 1
+    fi
+
+    if ! command -v qrencode &>/dev/null; then
+        log_warn "qrencode is not installed, vpn:// QR not created for '$name'."
+        return 1
+    fi
+
+    # tmp via awg_mktemp (shared cleanup registry + atomic mv on the same FS).
+    tmp_png=$(awg_mktemp "$AWG_DIR") || { log_error "mktemp error for vpn:// QR '$name'"; return 1; }
+
+    # qrencode flags for long vpn:// URIs with PSK (issue #72):
+    #   -s 6  module size of 6 pixels instead of the default 3 - this is the real fix.
+    #         At the default scale modules were too small for the iPhone camera to
+    #         distinguish when scanning the PNG off a computer screen, producing
+    #         error 900 ImportInvalidConfigError in AmneziaVPN iOS for @haritos90
+    #         in issue #72.
+    #   -l L  lowest error correction level - this is already the qrencode default,
+    #         pinned explicitly to guard against future default changes in libqrencode.
+    #   -m 4  standard quiet zone of 4 modules - also the default, pinned explicitly.
+    if ! qrencode -t png -l L -s 6 -m 4 -o "$tmp_png" < "$uri_file"; then
+        log_error "Failed to generate vpn:// QR for '$name'"
+        rm -f "$tmp_png"
+        return 1
+    fi
+
+    if ! chmod 600 "$tmp_png"; then
+        log_error "Failed to chmod 600 $tmp_png"
+        rm -f "$tmp_png"
+        return 1
+    fi
+
+    if ! mv -f "$tmp_png" "$png_file"; then
+        log_error "Failed to save vpn:// QR for '$name'"
+        rm -f "$tmp_png"
+        return 1
+    fi
+    log_debug "vpn:// QR for '$name' created: $png_file"
+    return 0
+}
+
+# Removes partially created client artifacts (keys + .conf). Used by the
+# early-error paths of generate_client - C10: do not leave orphan keys when a
+# step fails before the peer is committed to the server config.
+_rollback_client_artifacts() {
+    rm -f "$KEYS_DIR/$1.private" "$KEYS_DIR/$1.public" "$AWG_DIR/$1.conf"
+}
+
+# Full set of client artifacts (conf/png/vpnuri/vpnuri.png + keys). A single
+# list for `manage remove` and expired-client auto-removal so the paths do not
+# diverge (expiry-cleanup used to forget .vpnuri.png). Does NOT touch the expiry
+# marker or cron - the caller does that (remove_client_expiry / rm "$efile").
+_remove_client_files() {
+    local name="$1"
+    rm -f "$AWG_DIR/${name}.conf" "$AWG_DIR/${name}.png" \
+        "$AWG_DIR/${name}.vpnuri" "$AWG_DIR/${name}.vpnuri.png" \
+        "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
 }
 
 # Full client creation cycle:
 # keypair -> next IP -> client config -> add peer -> QR
 # generate_client <name> [endpoint]
+#
+# Env var contract:
+#   CLIENT_PSK — optional. If set to "auto", a fresh PSK is generated via
+#     `awg genpsk` and written to both the server [Peer] and the client
+#     [Peer]. If set to a concrete value (32-byte base64), it is used as
+#     is without regenerating. Empty/unset — no PSK is added (default).
 generate_client() {
     local name="$1"
     local endpoint="${2:-}"
@@ -1888,6 +2689,19 @@ generate_client() {
     # Load parameters
     load_awg_params || return 1
 
+    # Optional PresharedKey: "auto" -> `awg genpsk`, otherwise use the
+    # given value as-is. Empty/unset -> no PSK.
+    if [[ "${CLIENT_PSK:-}" == "auto" ]]; then
+        # --psk was requested explicitly: on awg genpsk failure do NOT silently
+        # degrade to a PSK-less client (that would weaken the requested security).
+        # Fail-closed; no artifacts exist yet (keys/config are created below), so
+        # no rollback is needed.
+        CLIENT_PSK=$(awg genpsk) || {
+            log_error "awg genpsk failed - client with PresharedKey (--psk) NOT created. Please retry."
+            return 1
+        }
+    fi
+
     # Inter-process lock: atomicity of IP allocation + peer addition
     local lockfile="${AWG_DIR}/.awg_config.lock"
     local lock_fd
@@ -1898,26 +2712,45 @@ generate_client() {
         return 1
     fi
 
-    # Generate keys
-    generate_keypair "$name" || { exec {lock_fd}>&-; return 1; }
-
-    # Next free IP
-    local client_ip
-    client_ip=$(get_next_client_ip) || { exec {lock_fd}>&-; return 1; }
-
-    # Read keys
-    local client_privkey client_pubkey server_pubkey
-    client_privkey=$(cat "$KEYS_DIR/${name}.private") || { exec {lock_fd}>&-; return 1; }
-    client_pubkey=$(cat "$KEYS_DIR/${name}.public") || { exec {lock_fd}>&-; return 1; }
-
-    if [[ ! -f "$AWG_DIR/server_public.key" ]]; then
-        log_error "Server public key not found"
+    # C6: the client must not already exist. Check UNDER the lock, BEFORE
+    # generating keys - otherwise `add <existing_name>` would silently overwrite
+    # a live client's keys (generate_keypair overwrites unconditionally), and a
+    # concurrent same-name add would race to overwrite.
+    if [[ -e "$KEYS_DIR/${name}.private" || -e "$KEYS_DIR/${name}.public" || -e "$AWG_DIR/${name}.conf" ]]; then
+        log_error "Client '$name' already exists. Use 'remove' or a different name."
         exec {lock_fd}>&-
         return 1
     fi
-    server_pubkey=$(cat "$AWG_DIR/server_public.key") || { exec {lock_fd}>&-; return 1; }
 
-    # Endpoint: from argument, config, or auto-detect
+    # Generate keys. From here on, any early failure must remove the freshly
+    # created keys/conf (C10) via _rollback_client_artifacts.
+    generate_keypair "$name" || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # Next free IP
+    local client_ip
+    client_ip=$(get_next_client_ip) || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # IPv6 address for client (when ALLOW_IPV6_TUNNEL=1)
+    local client_ipv6=""
+    if [[ "${ALLOW_IPV6_TUNNEL:-0}" == "1" ]]; then
+        client_ipv6=$(get_next_client_ipv6 "$client_ip") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+        log_debug "Allocated IPv6 address ${client_ipv6} for client ${name}"
+    fi
+
+    # Read keys
+    local client_privkey client_pubkey server_pubkey
+    client_privkey=$(cat "$KEYS_DIR/${name}.private") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+    client_pubkey=$(cat "$KEYS_DIR/${name}.public") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # Try to reconstruct server_public.key from awg0.conf when the cache
+    # is missing (supports manual setups without the installer step 6).
+    _ensure_server_public_key || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+    server_pubkey=$(cat "$AWG_DIR/server_public.key") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # Endpoint: argument → AWG_ENDPOINT (awgsetup_cfg.init) → curl to
+    # external services → local IP on a network interface.
+    # The last fallback targets LXC / egress-restricted setups: it may be a
+    # NAT address, so we warn the user via the log.
     if [[ -z "$endpoint" ]]; then
         endpoint="${AWG_ENDPOINT:-}"
     fi
@@ -1925,23 +2758,27 @@ generate_client() {
         endpoint=$(get_server_public_ip)
     fi
     if [[ -z "$endpoint" ]]; then
+        endpoint=$(_try_local_ip) && log_warn "Using local server IP as Endpoint ('$endpoint') — curl to external services did not go through. If the server is behind NAT, hand-edit the Endpoint in the client .conf files."
+    fi
+    if [[ -z "$endpoint" ]]; then
         log_error "Failed to determine server public IP. Use --endpoint=IP"
+        _rollback_client_artifacts "$name"
         exec {lock_fd}>&-
         return 1
     fi
 
     # Client config
-    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" || {
-        log_error "Rollback: deleting keys for '$name'"
-        rm -f "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" "$client_ipv6" || {
+        log_error "Rollback: removing artifacts for '$name'"
+        _rollback_client_artifacts "$name"
         exec {lock_fd}>&-
         return 1
     }
 
     # Add peer to server config
-    if ! add_peer_to_server "$name" "$client_pubkey" "$client_ip"; then
-        log_error "Rollback: deleting files for '$name'"
-        rm -f "$AWG_DIR/${name}.conf" "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+    if ! add_peer_to_server "$name" "$client_pubkey" "$client_ip" "$client_ipv6"; then
+        log_error "Rollback: removing artifacts for '$name'"
+        _rollback_client_artifacts "$name"
         exec {lock_fd}>&-
         return 1
     fi
@@ -1954,9 +2791,12 @@ generate_client() {
         log_warn "QR code not created. Config: $AWG_DIR/${name}.conf"
     fi
 
-    # vpn:// URI for Amnezia Client (optional)
+    # vpn:// URI and QR for Amnezia VPN app (optional).
+    # QR vpn:// is attempted only if URI was generated successfully — no source otherwise.
     if ! generate_vpn_uri "$name"; then
         log_warn "vpn:// URI not created for '$name'."
+    elif ! generate_qr_vpnuri "$name"; then
+        log_warn "vpn:// QR not created for '$name'."
     fi
 
     log "Client '$name' created (IP: $client_ip)."
@@ -1965,6 +2805,24 @@ generate_client() {
 
 # Regenerate config and QR for existing client
 # regenerate_client <name> [endpoint]
+#
+# v5.11.0 A5.3: protected by .awg_config.lock (serializes with
+# modify_client / remove and concurrent regens on the same client) and
+# checks the return code of each sed -i that restores user settings —
+# previously sed failures were silently ignored.
+#
+# Lock scope: held only while mutating $AWG_DIR/${name}.conf.
+# generate_qr / generate_vpn_uri / generate_qr_vpnuri are called OUTSIDE
+# the lock as best-effort derived artifacts — if a concurrent modify
+# changes the conf between our sed and QR generation, the QR may be
+# stale by one tick. A concurrent `manage remove <name>` may also delete
+# the client after we release the lock, and regen will "resurrect"
+# `.conf` / `.png` / `.vpnuri` / `.vpnuri.png` for an already-removed
+# peer (stale artefacts in $AWG_DIR). Acceptable: the user gets correct
+# state on the next operation (repeat `remove` or `regen`), and the
+# peer is already out of the server config — no traffic flows through
+# it. Including QR/URI in the lock is more expensive (holding the lock
+# for several seconds) with no server-state integrity gain.
 regenerate_client() {
     local name="$1"
     local endpoint="${2:-}"
@@ -1974,11 +2832,23 @@ regenerate_client() {
         return 1
     fi
 
-    load_awg_params || return 1
+    # Cross-process lock: guards against races with modify_client/remove
+    # and concurrent regens on the same client name.
+    local lockfile="${AWG_DIR}/.awg_config.lock"
+    local lock_fd
+    exec {lock_fd}>"$lockfile"
+    if ! flock -x -w 10 "$lock_fd"; then
+        log_error "Failed to acquire config lock (another operation is running)"
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    load_awg_params || { exec {lock_fd}>&-; return 1; }
 
     # Check that client exists in server config
     if ! grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Client '$name' not found in server config"
+        exec {lock_fd}>&-
         return 1
     fi
 
@@ -1993,29 +2863,63 @@ regenerate_client() {
 
     if [[ -z "$client_privkey" ]]; then
         log_error "Private key for client '$name' not found"
+        exec {lock_fd}>&-
         return 1
     fi
 
     # Client IP from server config
     # Find [Peer] block with #_Name = name, then AllowedIPs
-    client_ip=$(awk -v target="$name" '
+    # For dual-stack: ips[1] = IPv4/32, ips[2] = IPv6/128 (if present)
+    local _regen_awk_out
+    _regen_awk_out=$(awk -v target="$name" '
     /^\[Peer\]/ { in_peer=1; found=0; next }
     in_peer && $0 == "#_Name = " target { found=1; next }
-    in_peer && found && /^AllowedIPs/ { gsub(/AllowedIPs[ \t]*=[ \t]*/, ""); gsub(/\/[0-9]+/, ""); print; exit }
+    in_peer && found && /^AllowedIPs/ {
+      sub(/^AllowedIPs[ \t]*=[ \t]*/, "")
+      n = split($0, ips, /[ \t]*,[ \t]*/)
+      sub(/\/[0-9]+$/, "", ips[1])
+      gsub(/^[ \t]+|[ \t]+$/, "", ips[1])
+      ipv4 = ips[1]
+      ipv6 = ""
+      if (n >= 2) {
+        sub(/\/[0-9]+$/, "", ips[2])
+        gsub(/^[ \t]+|[ \t]+$/, "", ips[2])
+        ipv6 = ips[2]
+      }
+      print ipv4 " " ipv6
+      exit
+    }
     /^\[/ && !/^\[Peer\]/ { in_peer=0; found=0 }
     ' "$SERVER_CONF_FILE")
 
+    client_ip="${_regen_awk_out%% *}"
+    local client_ipv6="${_regen_awk_out#* }"
+    # Defensive guard: awk always prints trailing space, so client_ipv6 is "" for IPv4-only.
+    # This guard fires only if awk produces no trailing space (not expected in practice).
+    if [[ "$client_ipv6" == "$client_ip" ]]; then
+        client_ipv6=""
+    fi
+
+    # Only carry IPv6 forward if ALLOW_IPV6_TUNNEL is enabled
+    if [[ "${ALLOW_IPV6_TUNNEL:-0}" != "1" ]]; then
+        client_ipv6=""
+    fi
+
     if [[ -z "$client_ip" ]]; then
         log_error "Client IP for '$name' not found in server config"
+        exec {lock_fd}>&-
         return 1
     fi
 
+    # Auto-gen from awg0.conf if the cache is missing (manual setup)
+    _ensure_server_public_key || { exec {lock_fd}>&-; return 1; }
     server_pubkey=$(cat "$AWG_DIR/server_public.key" 2>/dev/null) || {
         log_error "Server public key not found"
+        exec {lock_fd}>&-
         return 1
     }
 
-    # Endpoint
+    # Endpoint chain: arg → AWG_ENDPOINT → curl → local IP (best-effort).
     if [[ -z "$endpoint" ]]; then
         endpoint="${AWG_ENDPOINT:-}"
     fi
@@ -2023,7 +2927,11 @@ regenerate_client() {
         endpoint=$(get_server_public_ip)
     fi
     if [[ -z "$endpoint" ]]; then
+        endpoint=$(_try_local_ip) && log_warn "Using local server IP as Endpoint ('$endpoint') — curl to external services did not go through."
+    fi
+    if [[ -z "$endpoint" ]]; then
         log_error "Failed to determine server public IP."
+        exec {lock_fd}>&-
         return 1
     fi
 
@@ -2037,6 +2945,18 @@ regenerate_client() {
         [[ -n "$_v" ]] && current_keepalive="$_v"
         _v=$(sed -n '/^\[Peer\]/,$ s/^AllowedIPs[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
         [[ -n "$_v" ]] && current_allowed_ips="$_v"
+        # v5.11.1: preserve PresharedKey through regen. Without this,
+        # clients added with `manage add --psk` would lose their PSK on
+        # regen — the server peer still holds the PSK but the client
+        # conf would drop it, breaking the handshake. CLIENT_PSK is
+        # passed through to render_client_config.
+        local _psk
+        _psk=$(sed -n '/^\[Peer\]/,$ s/^PresharedKey[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        if [[ -n "$_psk" ]]; then
+            export CLIENT_PSK="$_psk"
+        else
+            unset CLIENT_PSK
+        fi
     fi
 
     # AmneziaDNS mode forces a hard-coded client AllowedIPs "0.0.0.0/0, ::/0"
@@ -2051,23 +2971,54 @@ regenerate_client() {
         fi
     fi
 
-    # Config regeneration
-    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" || return 1
+    # Config regeneration (pass client_ipv6 if dual-stack)
+    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" "$client_ipv6" || {
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    }
 
     # Restore user settings (escape & and \ for sed replacement)
     local _dns _ka _aip
     _dns=$(printf '%s' "$current_dns" | sed 's/[&\\/]/\\&/g')
     _ka=$(printf '%s' "$current_keepalive" | sed 's/[&\\/]/\\&/g')
     _aip=$(printf '%s' "$current_allowed_ips" | sed 's/[&\\/]/\\&/g')
-    sed -i "s/^DNS = .*/DNS = ${_dns}/" "$AWG_DIR/${name}.conf"
-    sed -i "s/^PersistentKeepalive = .*/PersistentKeepalive = ${_ka}/" "$AWG_DIR/${name}.conf"
-    sed -i "s|^AllowedIPs = .*|AllowedIPs = ${_aip}|" "$AWG_DIR/${name}.conf"
+    local _client_conf="$AWG_DIR/${name}.conf"
+    if ! sed -i "s/^DNS = .*/DNS = ${_dns}/" "$_client_conf"; then
+        log_error "sed error writing DNS to $_client_conf"
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    fi
+    if ! sed -i "s/^PersistentKeepalive = .*/PersistentKeepalive = ${_ka}/" "$_client_conf"; then
+        log_error "sed error writing PersistentKeepalive to $_client_conf"
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    fi
+    if ! sed -i "s|^AllowedIPs = .*|AllowedIPs = ${_aip}|" "$_client_conf"; then
+        log_error "sed error writing AllowedIPs to $_client_conf"
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    fi
+
+    # Release lock — config written, remaining ops are non-critical
+    exec {lock_fd}>&-
 
     # QR code
     generate_qr "$name"
 
-    # vpn:// URI for Amnezia Client
-    generate_vpn_uri "$name"
+    # vpn:// URI and QR for Amnezia VPN app (best-effort).
+    # QR vpn:// is attempted only if URI was regenerated successfully.
+    if generate_vpn_uri "$name"; then
+        generate_qr_vpnuri "$name" || log_warn "vpn:// QR not updated for '$name'."
+    else
+        log_warn "vpn:// URI not updated for '$name'."
+    fi
+
+    # Hygiene: do not let PSK leak into later operations in the same shell
+    unset CLIENT_PSK
 
     log "Client config for '$name' regenerated."
     return 0
@@ -2171,7 +3122,7 @@ validate_awg_config() {
 # ==============================================================================
 
 EXPIRY_DIR="${AWG_DIR}/expiry"
-EXPIRY_CRON="/etc/cron.d/awg-expiry"
+EXPIRY_CRON="${EXPIRY_CRON:-/etc/cron.d/awg-expiry}"
 
 # Parse duration string to seconds: 1h, 12h, 1d, 7d, 30d
 # parse_duration <duration_string>
@@ -2301,8 +3252,7 @@ check_expired_clients() {
         if [[ $now -ge $expires_at ]]; then
             log "Client '$name' expired. Removing..."
             if remove_peer_from_server "$name" 2>/dev/null; then
-                rm -f "$AWG_DIR/$name.conf" "$AWG_DIR/$name.png" "$AWG_DIR/$name.vpnuri"
-                rm -f "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+                _remove_client_files "$name"
                 rm -f "$efile"
                 log "Client '$name' removed (expired)."
                 ((removed++))
@@ -2324,19 +3274,38 @@ check_expired_clients() {
 
 # Install cron job for auto-removal
 install_expiry_cron() {
-    if [[ -f "$EXPIRY_CRON" ]]; then
-        log_debug "Expiry cron job already installed."
-        return 0
-    fi
-    cat > "$EXPIRY_CRON" << CRONEOF
-# AmneziaWG client expiry check — every 5 minutes
+    # Idempotent by CONTENT, not by file existence. The old early-out on "file
+    # exists" left stale paths after restore/migration/--conf-dir: the cron kept
+    # pointing at the old AWG_DIR. Generate the expected text and replace the file
+    # only when it differs.
+    local _cron_tmp
+    _cron_tmp=$(awg_mktemp "$(dirname "$EXPIRY_CRON")") || { log_error "mktemp error for expiry cron"; return 1; }
+    # Check the write succeeded BEFORE cmp/mv: otherwise a failure (disk/perms)
+    # could atomically replace a working cron with an empty/partial tmp.
+    if ! cat > "$_cron_tmp" << CRONEOF
+# AmneziaWG client expiry check - every 5 minutes
 AWG_DIR="${AWG_DIR}"
 CONFIG_FILE="${CONFIG_FILE}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE}"
 */5 * * * * root /bin/bash -c 'source "${AWG_DIR}/awg_common.sh" || exit 1; check_expired_clients' >> "${AWG_DIR}/expiry.log" 2>&1
 CRONEOF
-    chmod 644 "$EXPIRY_CRON"
-    log "Expiry cron job installed: $EXPIRY_CRON"
+    then
+        rm -f "$_cron_tmp"
+        log_error "Error writing expiry cron job"
+        return 1
+    fi
+    if [[ -f "$EXPIRY_CRON" ]] && cmp -s "$_cron_tmp" "$EXPIRY_CRON"; then
+        rm -f "$_cron_tmp"
+        log_debug "Expiry cron job already current."
+        return 0
+    fi
+    chmod 644 "$_cron_tmp"
+    if ! mv -f "$_cron_tmp" "$EXPIRY_CRON"; then
+        rm -f "$_cron_tmp"
+        log_error "Error installing expiry cron job: $EXPIRY_CRON"
+        return 1
+    fi
+    log "Expiry cron job installed/updated: $EXPIRY_CRON"
 }
 
 # Remove client expiry data

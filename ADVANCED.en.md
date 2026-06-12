@@ -4,7 +4,9 @@
 
 # AmneziaWG 2.0 Installer: Advanced Documentation
 
-This is a supplement to the main [README.en.md](README.en.md), containing deeper technical details, explanations, and advanced options for the AmneziaWG 2.0 installation and management scripts.
+This is a supplement to the main [README.en.md](README.en.md), containing deeper technical details, explanations, and advanced options for the AmneziaWG 2.0 installation and management scripts. For a step-by-step VPS deployment guide, see [INSTALL_VPS.md](INSTALL_VPS.md).
+
+For a step-by-step VPS deployment guide (VPS choice, OS choice, install flow, first client, update, uninstall, troubleshooting), see [INSTALL_VPS.md](INSTALL_VPS.md).
 
 ## Table of Contents
 
@@ -14,6 +16,7 @@ This is a supplement to the main [README.en.md](README.en.md), containing deeper
   - [Presets (v5.10.0+)](#presets-adv)
 - [⚙️ Client Configuration Details](#config-details-adv)
   - [AllowedIPs](#allowedips-adv)
+  - [IPv6 Dual-Stack Tunnel (v5.15.0+)](#ipv6-tunnel-adv)
   - [PersistentKeepalive](#persistentkeepalive-adv)
   - [DNS](#dns-adv)
   - [Changing Default Settings](#change-defaults-adv)
@@ -40,9 +43,11 @@ This is a supplement to the main [README.en.md](README.en.md), containing deeper
 - [⏳ Temporary Clients (--expires)](#expires-adv)
 - [📱 vpn:// URI Import](#vpnuri-adv)
 - [📱 MTU and Mobile Clients](#mtu-mobile-adv)
+- [🚧 Host Unreachable from Russia (Hetzner): AS-based Blocking](#as-blocking-adv)
 - [📋 AWG 2.0 Client Compatibility](#client-compat-adv)
 - [🐧 Debian Support](#debian-support-adv)
 - [🔧 Raspberry Pi and ARM64 Support](#arm-support-adv)
+- [📦 LXC / Docker via amneziawg-go (userspace)](#lxc-userspace-adv)
 - [⚠️ Known Limitations](#limitations-adv)
 - [🤝 Contributing](#contributing-adv)
 - [💖 Acknowledgements](#thanks-adv)
@@ -164,6 +169,55 @@ Defines which traffic the **client** routes through the VPN tunnel.
     * Example: `192.168.1.0/24,10.50.0.0/16`
 
 **AllowedIPs Calculator:** [WireGuard AllowedIPs Calculator](https://www.procustodibus.com/blog/2021/03/wireguard-allowedips-calculator/).
+
+<a id="ipv6-tunnel-adv"></a>
+### IPv6 Dual-Stack Tunnel (v5.15.0+)
+
+By default the tunnel carries IPv4 only. Starting with v5.15.0 you can also enable IPv6 inside the tunnel - clients get an IPv6 address next to IPv4 (dual-stack).
+
+**When it activates:** only with the explicit `--allow-ipv6-tunnel` flag on `install_amneziawg.sh`. Without the flag the behavior is identical to earlier versions. This is separate from `--allow-ipv6` / `--disallow-ipv6`, which control host-level IPv6 (sysctl) and are unchanged.
+
+**Interaction with `--disallow-ipv6`.** In-tunnel IPv6 needs host IPv6 forwarding, so if you combine `--allow-ipv6-tunnel` with `--disallow-ipv6` the tunnel flag wins: the installer logs a warning and keeps host IPv6 forwarding enabled. This does not happen silently.
+
+**IPv6 routing mirrors the chosen IPv4 mode (intent-mirroring).** When `--allow-ipv6-tunnel` is enabled, the client's IPv6 `AllowedIPs` mirror the IPv4 mode:
+
+- **Full tunnel** (IPv4 `AllowedIPs` = `0.0.0.0/0`): with native IPv6 on the server the client gets `0.0.0.0/0, ::/0` - all IPv6 traffic goes out to the internet through the VPN; without native IPv6 the client gets `0.0.0.0/0, fddd:2c4:2c4:2c4::/64` - IPv6 only works peer-to-peer inside the tunnel.
+- **Split-tunnel** (custom list via `--route-custom`): the IPv4 list is kept unchanged and ONLY the tunnel ULA subnet `fddd:2c4:2c4:2c4::/64` is added. `::/0` is never added - capturing all IPv6 in split mode would break split routing. IPv6 in a split tunnel reaches other peers but not the internet.
+
+> Historical note: in v5.15.0 dual-stack always implied a full tunnel (split-tunnel with IPv6 behaved differently). Since v5.15.1 split-tunnel and IPv6 combine correctly per the rules above. If a client was created on v5.15.0, recreate it (`manage remove` + `add`) to get the corrected `AllowedIPs`.
+
+**Subnet:** the private ULA `fddd:2c4:2c4:2c4::/64`. The server takes `::1`, clients get `::2`, `::3`, and so on, mirroring the IPv4 numbering. The subnet can be overridden before the first run via `IPV6_SUBNET=` in `/root/awg/awgsetup_cfg.init`.
+
+**How native IPv6 is detected on the server.** The script considers the server to have internet-routable IPv6 only when BOTH conditions hold:
+
+1. a global IPv6 address outside the ULA range (`fc00::/7`, i.e. not `fddd:...`) - checked via `ip -6 addr show scope global`;
+2. a default IPv6 route - checked via `ip -6 route show default`.
+
+A ULA address has scope global on its own but is not routed to the internet, so an address alone is not enough - a default route is also required. If either condition is missing, the server is treated as having no native IPv6: the client gets the tunnel ULA instead of `::/0` (per the routing rules above) and a warning is logged. The tunnel stays fully functional over IPv4.
+
+**How to add it to an existing install.** Re-run the installer with `--force` and the tunnel flag:
+
+```bash
+sudo bash ./install_amneziawg_en.sh --force --allow-ipv6-tunnel
+# RU version: sudo bash ./install_amneziawg.sh --force --allow-ipv6-tunnel
+```
+
+`--force` is required: without it a run on an already-working server aborts at the idempotency guard and the flag is ignored. It is `--force` that re-renders the server config as dual-stack (`[Interface] Address`, sysctl, PostUp with ip6tables). Without it an existing install is left unchanged and the server never gets its IPv6. Just setting `ALLOW_IPV6_TUNNEL=1` in `/root/awg/awgsetup_cfg.init` is not enough on its own - it does not re-render the server config.
+
+Already-issued IPv4-only clients are not changed by this. To give IPv6 to such a client, recreate it - only recreation allocates an IPv6 for that client on the server:
+
+```bash
+sudo bash /root/awg/manage_amneziawg.sh remove <name>
+sudo bash /root/awg/manage_amneziawg.sh add <name>
+```
+
+Then re-import the new `.conf` on the device. A plain `regen` will not help here: it mirrors the addresses from the client's `[Peer]` entry on the server, and an old client has no IPv6 there yet, so the config stays IPv4-only. `manage list` correctly shows the mixed state (dual-stack next to IPv4-only).
+
+**Troubleshooting:**
+
+- **ULA subnet collision.** If `fddd:2c4:2c4:2c4::/64` is already used in your network, set a different ULA subnet via `IPV6_SUBNET=` before installing.
+- **IPv6 not routing to the internet.** Check both signs of native IPv6: a global address outside ULA (`ip -6 addr show scope global`) AND a default route (`ip -6 route show default`). If either is missing, IPv6 internet egress is not possible - this is expected, and the tunnel works over IPv4. If both are present, check the ip6tables MASQUERADE rule and forwarding (`sysctl net.ipv6.conf.all.forwarding`).
+- **Rollback / IPv6 cleanup.** Setting `ALLOW_IPV6_TUNNEL=0` does not remove dual-stack `AllowedIPs` entries already added to `awg0.conf`. For a full cleanup: `awg-quick down awg0; sed -i 's|, fddd:[^/]*/[0-9]*||g' /etc/amnezia/amneziawg/awg0.conf; awg-quick up awg0`.
 
 <a id="persistentkeepalive-adv"></a>
 ### PersistentKeepalive
@@ -301,6 +355,40 @@ AllowedIPs = 10.9.9.2/32
 </details>
 
 <details>
+<summary><strong>Minimal awg0.conf for AWG 2.0 (for manual setup)</strong></summary>
+
+If you are setting up the server without my installer (for example, `amneziawg-go` in LXC), the minimum valid `awg0.conf` for AWG 2.0 looks like this — all 11 obfuscation parameters are required; `manage_amneziawg.sh add/regen` will abort if any one of them is missing:
+
+```ini
+[Interface]
+PrivateKey = [SERVER_PRIVATE_KEY]
+Address = 10.9.9.1/24
+ListenPort = 51820
+Jc = 4
+Jmin = 40
+Jmax = 90
+S1 = 50
+S2 = 40
+S3 = 12
+S4 = 8
+H1 = 1234567
+H2 = 2345678
+H3 = 3456789
+H4 = 4567890
+```
+
+Notes for manual setups:
+
+- **S3/S4** are AWG 2.0 parameters added to the protocol later than S1/S2. Configs from the earlier AWG 1.x release may not have them — add by hand, any value in `0-127` works, the key point is that the keys exist at all.
+- **H1–H4** can be single-value (`H1 = 1234567`) or a range (`H1 = 100000-200000`); ranges must not overlap. Keep the upper bound at `2147483647` (`INT32_MAX`) or below, otherwise `amneziawg-windows-client` may flag the value as invalid.
+- **I1** (CPS packets) is optional: without it the AWG client falls back to AWG 1.0 mode. For full AWG 2.0 obfuscation add `I1 = <r 128>` (random 128 bytes) or `I1 = <b 0xHEX>` (binary).
+- **MTU**, **PostUp/PostDown** are optional and depend on the setup (see the `amneziawg-go` LXC section on `iptables` MASQUERADE).
+
+After creating such an `awg0.conf`, `manage_amneziawg.sh` also needs `/root/awg/server_public.key` (compute it with `awg pubkey < /etc/amnezia/amneziawg/server_private.key > /root/awg/server_public.key`) and a minimal `/root/awg/awgsetup_cfg.init` containing at least `AWG_PORT`, `AWG_TUNNEL_SUBNET`, `AWG_ENDPOINT`.
+
+</details>
+
+<details>
 <summary><strong>client.conf (client config, keys masked)</strong></summary>
 
 ```ini
@@ -346,20 +434,24 @@ Options:
   -v, --verbose         Verbose output (including DEBUG)
   --no-color            Disable colored output
   --port=PORT           Set UDP port (1024-65535)
-  --subnet=SUBNET       Set tunnel subnet (x.x.x.x/yy)
+  --ssh-port=PORT       SSH port for the UFW rule (auto-detected; comma-separated list)
+  --subnet=SUBNET       Tunnel subnet, /24 only (e.g. 10.9.9.1/24)
   --allow-ipv6          Keep IPv6 enabled
   --disallow-ipv6       Force-disable IPv6
+  --allow-ipv6-tunnel   Enable dual-stack IPv6 inside the tunnel (ULA, opt-in)
   --route-all           Mode: All traffic (0.0.0.0/0)
   --route-amnezia       Mode: Amnezia List + DNS (default)
   --route-custom=NETS   Mode: Only specified networks
-  --endpoint=IP         Specify external IP (for servers behind NAT)
+  --endpoint=ADDR       External server endpoint: FQDN, IPv4 or [IPv6] (NAT)
   --preset=TYPE         Obfuscation parameter preset: default, mobile
                         mobile: Jc=3, narrow Jmax — for mobile carriers (Tele2, Yota, Megafon)
   --jc=N                Set Jc manually (1-128, overrides preset)
   --jmin=N              Set Jmin manually (0-1280, overrides preset)
   --jmax=N              Set Jmax manually (0-1280, overrides preset, must be >= Jmin)
   -y, --yes             Non-interactive mode (all confirmations auto-yes)
-  --no-tweaks           Skip hardening/optimization (no UFW, Fail2Ban, sysctl tweaks)
+  -f, --force           Reinstall over a working AWG (ENV: AWG_FORCE_REINSTALL=1)
+  --no-tweaks           Skip optional hardening/optimization (UFW, Fail2Ban);
+                        the minimal forwarding sysctl is always applied
 ```
 
 <a id="manage-cli-adv"></a>
@@ -372,10 +464,15 @@ Options:
   --no-color            Disable colored output
   --conf-dir=PATH       Specify AWG directory (default: /root/awg)
   --server-conf=PATH    Specify server config file
-  --json                JSON output (for stats command)
+  --json                JSON output (for list / stats; list includes client_ipv6)
   --expires=DURATION    Expiry duration for add (1h, 12h, 1d, 7d, 30d, 4w)
   --apply-mode=MODE     syncconf (default) or restart (bypass kernel panic)
+  --psk                 (add only) generate a PresharedKey for the new client (v5.11.1+)
+  --yes                 Do not prompt for confirmation (ENV: AWG_YES=1)
+  --carrier=NAME        (diagnose only) compare parameters against a carrier profile
 ```
+
+> **`--psk`** — optional extra layer on top of AWG 2.0 obfuscation. Generates a 32-byte symmetric key via `awg genpsk` and writes it to both the server `[Peer]` and the client `[Peer]` (`PresharedKey = ...`). Compatible with any WireGuard/AmneziaWG client. In batch mode (`add c1 c2 c3 --psk`) each client gets its own PSK. Without the flag clients are created without `PresharedKey` (default — AWG 2.0 obfuscation is sufficient for most scenarios). The flag only affects the new clients created by this `add` invocation — existing clients without PSK stay untouched and keep connecting as before.
 
 **Environment variables:**
 
@@ -383,6 +480,7 @@ Options:
 |----------|-------------|
 | `AWG_SKIP_APPLY=1` | Skip apply_config. For automation: accumulate N operations, apply once |
 | `AWG_APPLY_MODE=restart` | Full restart instead of syncconf (can be saved in `awgsetup_cfg.init`) |
+| `AWG_YES=1` | Do not prompt for confirmation (equivalent to the `--yes` flag) |
 
 ---
 
@@ -391,9 +489,11 @@ Options:
 
 Usage: `sudo bash /root/awg/manage_amneziawg.sh <command>`:
 
-* **`add <name> [name2 ...] [--expires=DURATION]`:** Add one or multiple clients. In batch mode, `awg syncconf` is called once for all. With `--expires` — expiry applies to all clients.
+> **How `manage` finds clients in the server config.** Every `[Peer]` created by my installer or by `manage add` has a marker comment `#_Name = <name>` on the first line of the block. That marker is what `list`, `remove`, `regen`, `modify` look up. If you are migrating `awg0.conf` from an older server or adding a peer by hand, include `#_Name = <name>` right after `[Peer]` — otherwise `manage` will not see the client. Example: the `[Peer]` block in the server config above (see [Configuration Examples](#config-examples-adv)).
+
+* **`add <name> [name2 ...] [--expires=DURATION] [--psk]`:** Add one or multiple clients. In batch mode, `awg syncconf` is called once for all. With `--expires` — expiry applies to all clients. With `--psk` — each client gets its own PresharedKey (v5.11.1+).
 * **`remove <name> [name2 ...]`:** Remove one or multiple clients. In batch mode, apply_config is called once for all.
-* **`list [-v]`:** List clients (with details when using `-v`).
+* **`list [-v] [--json]`:** List clients (with details when using `-v`; `--json` - machine-readable, includes the `client_ipv6` field).
 * **`regen [name]`:** Regenerate `.conf`/`.png` files for one or all clients.
 * **`modify <name> <param> <value>`:** Modify a client parameter in the `.conf` file. Allowed parameters: DNS, Endpoint, AllowedIPs, PersistentKeepalive. QR code and vpn:// URI are automatically regenerated after modification.
 * **`backup`:** Create a backup (configs + keys + client expiry data + cron).
@@ -401,6 +501,8 @@ Usage: `sudo bash /root/awg/manage_amneziawg.sh <command>`:
 * **`check` / `status`:** Check server status (service, port, AWG 2.0 parameters).
 * **`show`:** Run `awg show`.
 * **`restart`:** Restart the AmneziaWG service.
+* **`diagnose [--carrier=NAME]`:** Self-troubleshooting: checks the kernel module, sysctl and UFW; with `--carrier` it compares AWG parameters against a mobile carrier profile.
+* **`repair-module`:** Rebuild/restore the amneziawg kernel module (DKMS) after a server kernel upgrade.
 * **`help`:** Show help.
 * **`stats [--json]`:** Per-client traffic statistics. With `--json` — machine-readable format for integration.
 
@@ -476,7 +578,7 @@ graph TD
 <a id="dkms-adv"></a>
 ### DKMS
 
-Ensures automatic rebuilding of the `amneziawg` kernel module on kernel updates. Check: `dkms status`.
+Automatic rebuilding of the `amneziawg` kernel module on kernel updates. Check: `dkms status`.
 
 <a id="keygen-adv"></a>
 ### Key and Config Generation
@@ -494,10 +596,10 @@ Client keys are stored in `/root/awg/keys/` (permissions 600). Server keys are i
 The installer downloads `awg_common.sh` and `manage_amneziawg.sh` from URLs pinned to the specific version tag:
 
 ```
-https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.8.3/awg_common.sh
+https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.15.6/awg_common.sh
 ```
 
-This provides **supply chain pinning** — ensuring downloaded scripts match the installer version, even if `main` has already been updated.
+This provides **supply chain pinning**: downloaded scripts match the installer version, even if `main` has already been updated.
 
 For development, you can override the branch:
 
@@ -514,12 +616,12 @@ To update the management and shared library scripts **without reinstalling the s
 
 ```bash
 # Russian version:
-wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.8.3/manage_amneziawg.sh
-wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.8.3/awg_common.sh
+wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.15.6/manage_amneziawg.sh
+wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.15.6/awg_common.sh
 
 # English version:
-wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.8.3/manage_amneziawg_en.sh
-wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.8.3/awg_common_en.sh
+wget -O /root/awg/manage_amneziawg.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.15.6/manage_amneziawg_en.sh
+wget -O /root/awg/awg_common.sh https://raw.githubusercontent.com/bivlked/amneziawg-installer/v5.15.6/awg_common_en.sh
 
 # Set permissions
 chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
@@ -565,6 +667,11 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 </details>
 
 <details>
+  <summary><strong>Q: My Hetzner server is unreachable from Russia: the handshake completes, then traffic freezes. What do I do?</strong></summary>
+  <b>A:</b> The server most likely landed in an AS that is not on Russia's allowlist (Hetzner is <code>AS24940</code>). Ordinary junk does not help; what gets through is an <code>I1</code>/CPS packet disguised as QUIC with an allowlisted SNI (<code>7-zip.org</code> for Hetzner). The method does not work on every ISP. Field results and instructions are in the <a href="#as-blocking-adv">Host Unreachable from Russia</a> section.
+</details>
+
+<details>
   <summary><strong>Q: Server behind NAT — how do I specify the external IP?</strong></summary>
   <b>A:</b> Use the <code>--endpoint=&lt;external_IP&gt;</code> flag during installation: <code>sudo bash ./install_amneziawg_en.sh --endpoint=1.2.3.4</code>. Or specify it later via <code>sudo bash /root/awg/manage_amneziawg.sh regen</code> (the script will attempt to detect the IP automatically).
 </details>
@@ -590,8 +697,43 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 </details>
 
 <details>
+  <summary><strong>Q: My AWG 2.0 server can't handshake with my old AWG 1.0 client — why?</strong></summary>
+  <b>A:</b> When the server generates <code>S3>0</code> or <code>S4>0</code> (cookie / data padding from AWG 2.0), an AWG 1.0 client cannot handshake with it. This is a <b>known upstream issue</b>: <a href="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/issues/168">amnezia-vpn/amneziawg-linux-kernel-module#168</a>. My installer always generates <code>S3=8..55</code> and <code>S4=4..27</code> — both <code>>0</code>.
+  <br><br>
+  <b>In the typical scenario</b> (Amnezia VPN client / WireGuard-Tools 2.0+ on the clients + client <code>.conf</code> files generated by <code>manage add</code>) there is no issue: <code>manage</code> always writes <code>S3</code> / <code>S4</code> into the client <code>.conf</code>. The risk arises <b>only</b> when:
+  <ul>
+    <li>client <code>.conf</code> files are hand-edited to remove <code>S3</code> / <code>S4</code>;</li>
+    <li>the server preset is imported into a WireGuard client without AWG extensions (plain <code>wg-quick</code> on an older kernel without the <code>amneziawg</code> module);</li>
+    <li>migrating from an AWG 1.x setup where clients deliberately used <code>S3=0</code> / <code>S4=0</code>.</li>
+  </ul>
+  <b>Resolution</b>: use an AWG 2.0-aware client (Amnezia VPN >= 4.8.12.7 or amneziawg-windows-client >= 2.0.0) and keep <code>S3</code> / <code>S4</code> in the client <code>.conf</code> identical to the server. A real AWG 1.0 fallback is out of scope for the standard install — track upstream issue #168 for a fix.
+</details>
+
+<details>
   <summary><strong>Q: DKMS error after kernel update — what should I do?</strong></summary>
   <b>A:</b> 1. Check status: <code>dkms status</code>. 2. Try rebuilding: <code>sudo dkms install amneziawg/$(dkms status | grep amneziawg | head -1 | awk -F'[,/ ]+' '{print $2}')</code>. 3. Make sure kernel headers are installed: <code>sudo apt install linux-headers-$(uname -r)</code>. 4. If the error persists, run diagnostics: <code>sudo bash ./install_amneziawg_en.sh --diagnostic</code>.
+</details>
+
+<details>
+  <summary><strong>Q: What changes for me after installing v5.12.0+ when the kernel is upgraded?</strong></summary>
+  <b>A:</b> Before v5.12.0, after <code>apt upgrade</code> of the kernel DKMS did not always rebuild the <code>amneziawg</code> module by the next <code>reboot</code>. Symptom: <code>awg-quick@awg0</code> fails with <code>modprobe: FATAL: Module amneziawg not found</code>, and the VPN is down until manual recovery.
+  <br><br>
+  In v5.12.0 I added three safety nets that work transparently:
+  <ol>
+    <li><b>apt hook</b> <code>/etc/apt/apt.conf.d/99-amneziawg-post-kernel</code> — after <code>apt upgrade</code> the helper <code>/usr/local/sbin/amneziawg-ensure-module --hook</code> rebuilds DKMS for the new kernel. Log: <code>/var/log/amneziawg-ensure-module.log</code> (weekly rotate, 4 copies).</li>
+    <li><b>systemd unit</b> <code>amneziawg-ensure-module.service</code> — at boot, before <code>awg-quick@awg0</code>, the helper iterates kernels with already-installed headers, rebuilds DKMS for the current kernel, runs <code>modprobe amneziawg</code>, and verifies the load via <code>lsmod</code>. If headers are not yet installed, it logs a WARN and exits successfully so it does not block boot. Logs in journal: <code>journalctl -u amneziawg-ensure-module.service</code>.</li>
+    <li><b>manage repair-module</b> — explicit fallback: <code>sudo bash /root/awg/manage_amneziawg.sh repair-module</code> installs kernel-headers (with <code>AWG_ALLOW_APT_IN_ENSURE=1</code>), rebuilds DKMS, restarts <code>awg-quick</code>.</li>
+  </ol>
+  <b>Manual recovery</b> (if none of the three auto paths fired, or you are still on v5.11.x):
+  <pre>sudo apt install linux-headers-$(uname -r)
+sudo dkms autoinstall
+sudo modprobe amneziawg
+sudo systemctl restart awg-quick@awg0</pre>
+  <b>Limitations</b>:
+  <ul>
+    <li><b>ARM prebuilt</b> (Raspberry Pi, Hetzner CAX, Oracle Ampere) uses a prebuilt <code>.deb</code> rather than DKMS — auto-repair is not engaged. After a kernel upgrade either rerun the installer (it will pick a fresh prebuilt or fall back to DKMS), or run <code>manage repair-module</code>.</li>
+    <li><b>Cloud kernels</b> (Azure / AWS / GCP / Oracle / Debian-cloud) — the installer detects the meta-package from the <code>uname -r</code> suffix (e.g. <code>linux-headers-azure</code>). If you have a custom kernel or an unusual flavor, <code>manage repair-module</code> does the same in reactive mode.</li>
+  </ul>
 </details>
 
 <details>
@@ -609,7 +751,7 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
   <b>A:</b> Starting with v5.10.0, simply install with the <code>--preset=mobile</code> flag — it automatically sets optimal parameters for mobile networks (Jc=3, narrow Jmax). Discussion #38 (@elvaleto): on Tattelecom (Letai) with Jc=4-8 it took multiple attempts to connect, but after setting <code>Jc = 3</code> it worked immediately.
   <br><br>
   <b>Fresh install (recommended):</b>
-  <pre>sudo bash install_amneziawg.sh --preset=mobile --yes --route-amnezia</pre>
+  <pre>sudo bash install_amneziawg_en.sh --preset=mobile --yes --route-amnezia</pre>
 
   <b>Existing install — manual edit:</b>
   <ol>
@@ -626,10 +768,19 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
   <tr><td>Tattelecom (Letai)</td><td>Jc=3, I1=&lt;r 64&gt;</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
   <tr><td>Yota (Moscow)</td><td>I1=&lt;b 0xce...&gt;, Jmax=261</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
   <tr><td>Yota/Tele2 (Moscow)</td><td>Jc=3, Jmin=40, Jmax=70</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
-  <tr><td>Tele2 (Krasnoyarsk)</td><td>Jc=3</td><td><code>--preset=mobile</code></td><td>✅</td></tr>
+  <tr><td>Tele2 (Krasnoyarsk)</td><td>earlier I1=absent; May 2026: I1=&lt;r 48&gt;</td><td><code>--preset=mobile</code>; in the May wave I1=&lt;r 48&gt;</td><td>✅</td></tr>
+  <tr><td>MTS (Primorsky Krai)</td><td>Jc=3, I1=&lt;r 48&gt; (May 2026)</td><td><code>--preset=mobile</code> + I1=&lt;r 48&gt;</td><td>✅</td></tr>
   <tr><td>Beeline</td><td>default</td><td><code>--preset=default</code></td><td>✅</td></tr>
   <tr><td>Megafon (Moscow)</td><td>Jc=3, Jmin=80, Jmax=268</td><td><code>--preset=mobile</code></td><td>🔄 testing</td></tr>
+  <tr><td>Megafon (regions)</td><td><b>I1=absent</b></td><td><code>--preset=mobile</code> + remove <code>I1</code></td><td>✅</td></tr>
+  <tr><td>Tele2 + Megafon (Kemerovo, region 42)</td><td>random I1 (&lt;r N&gt;) stopped passing after 2+ days; works with QUIC-mimicry I1=&lt;b 0xc3...&gt; or I1=absent</td><td><code>--preset=mobile</code> + I1=&lt;b 0xc3...&gt; (QUIC) or remove <code>I1</code></td><td>✅</td></tr>
   </table>
+  <br>
+  <b>"I1=absent"</b> means: in <code>/etc/amnezia/amneziawg/awg0.conf</code> and in client <code>.conf</code> files, remove the <code>I1 = ...</code> line entirely (do not leave it empty). This is the AWG 1.0 fallback — no CPS masking, but the handshake clears DPI at some regional carriers where CPS packets themselves trigger blocks (Issue <a href="https://github.com/bivlked/amneziawg-installer/issues/42">#42</a>, @alkorrnd). On the server: <code>sudo systemctl restart awg-quick@awg0</code>. On clients — <code>sudo bash /root/awg/manage_amneziawg.sh regen &lt;name&gt;</code> for each, then redistribute the configs.
+  <br>
+  <b>Update, May 2026:</b> in the May blocking wave the <code>I1=absent</code> option stopped working on Tele2 (Krasnoyarsk), while a short <code>I1 = &lt;r 48&gt;</code> cleared DPI. The same worked on MTS (Primorsky Krai). It looks like the I1 size matters for these carriers: a smaller value <code>&lt;r 48&gt;</code> may be less conspicuous to DPI. If <code>--preset=mobile</code> or <code>I1=absent</code> do not help - try <code>I1 = &lt;r 48&gt;</code>. The <code>diagnose --carrier=tele2_krasnoyarsk</code> profile still reflects the earlier <code>I1=absent</code> (Issue #42), so for the May 2026 wave set <code>I1 = &lt;r 48&gt;</code> manually (Discussion <a href="https://github.com/bivlked/amneziawg-installer/discussions/38">#38</a>, @alkorrnd + @etotent).
+  <br>
+  <b>QUIC-mimicry I1 (experimental):</b> instead of a random <code>&lt;r N&gt;</code> you can set I1 as a block that mimics the start of a QUIC packet: <code>I1 = &lt;b 0xc30000000108&gt;&lt;r 8&gt;&lt;b 0x08&gt;&lt;r 8&gt;&lt;b 0x0045dc&gt;&lt;t&gt;&lt;r 16&gt;</code>. The first bytes (<code>0xC3</code> + version) look like a QUIC v1 long-header, and DPI that classifies UDP/443 as QUIC let the flow through in this report. It held for 2+ days on Tele2/Megafon (Kemerovo) (Issue <a href="https://github.com/bivlked/amneziawg-installer/issues/42">#42</a>, @Fourdot-co). This is a client-side parameter, changed only in client <code>.conf</code> files, no server sync needed; mind that editing just one exported <code>.conf</code> will be lost on the next client <code>regen</code>. Note: do not base it on a TLS ClientHello (<code>&lt;b 0x160301...&gt;</code>) - that is a TCP format, over UDP the DPI will see the TCP structure and drop the packet. For UDP mimicry use a QUIC long-header or DTLS (the same ClientHello handshake type, but with a record header that adds epoch and sequence number).
 </details>
 
 <details>
@@ -644,6 +795,36 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 </details>
 
 <details>
+  <summary><strong>Q: <code>ping</code> does not work between server and clients inside the tunnel</strong></summary>
+  <b>A:</b> The script applies <code>ufw default deny incoming</code> — this blocks all incoming traffic on every interface, including <code>awg0</code>. The forward rule <code>ufw route allow in on awg0 out on &lt;public_iface&gt;</code> only allows tunnel → internet; input on <code>awg0</code> (packets from clients to the server itself, including ICMP echo-request) is not covered by it.
+  <br><br>
+  Additionally: if you edited <code>/etc/ufw/before.rules</code> and replaced <code>ACCEPT</code> with <code>DROP</code> for ICMP without specifying an interface, those rules apply to every interface — including <code>awg0</code>.
+  <br><br>
+  <b>Fix:</b>
+  <ol>
+    <li>Open incoming on <code>awg0</code> in UFW:
+      <pre>sudo ufw allow in on awg0
+sudo ufw reload</pre>
+      This allows all incoming on the tunnel interface — narrow ICMP filtering is done via <code>-i</code> in <code>before.rules</code> (see below).
+    </li>
+    <li>If you edited <code>/etc/ufw/before.rules</code>, add <code>-i &lt;public_iface&gt;</code> to every ICMP DROP line:
+      <pre># instead of
+-A ufw-before-input -p icmp --icmp-type echo-request -j DROP
+# use (ens3 — your public iface)
+-A ufw-before-input -i ens3 -p icmp --icmp-type echo-request -j DROP</pre>
+      Same for <code>destination-unreachable</code>, <code>time-exceeded</code>, <code>parameter-problem</code>. Find your public interface name: <code>ip route get 8.8.8.8 | awk '{for(i=1;i&lt;=NF;i++) if($i=="dev") print $(i+1)}'</code>. Apply: <code>sudo ufw reload</code>.
+    </li>
+  </ol>
+  <b>Does NOT work:</b> <code>ufw allow in on awg0 proto icmp</code> — UFW does not support <code>icmp</code> via the <code>proto</code> flag (only <code>tcp/udp/esp/ah/gre/ipv6</code>).
+  <br><br>
+  <b>Verify:</b> from the client <code>ping &lt;server_tunnel_IP&gt;</code>. From the server to a client (<code>ping &lt;client_IP&gt;</code>) the client itself may not reply: on Windows and iOS the built-in firewall often drops echo-request — testing client → server is the cleanest path.
+  <br><br>
+  <b>If you manually customized <code>AllowedIPs</code> on the client for split tunneling</b> (only some subnets go through the VPN — e.g. only Telegram/Discord, everything else stays direct), make sure the <b>tunnel subnet</b> (<code>10.9.9.0/24</code> or your custom one) is in that list. Without it, the client does not route through the tunnel even packets destined for the server itself — <code>ufw status verbose</code> and <code>iptables -L ufw-before-input -v -n</code> can look correct, and ping still fails. Coverage depends on the routing mode chosen at install time: <code>--route-all</code> (full tunnel <code>0.0.0.0/0</code>) includes the tunnel subnet automatically; the default <code>--route-amnezia</code> (Amnezia List, excludes <code>10.0.0.0/8</code>) and <code>--route-custom=</code> do not, add it explicitly.
+  <br><br>
+  <b>For client-to-client ping</b> (phone ↔ router via the server): <code>sudo ufw route allow in on awg0 out on awg0 &amp;&amp; sudo ufw reload</code>. <code>AllowedIPs</code> in client <code>.conf</code> depends on the routing mode chosen at install (see the paragraph above). Discussion <a href="https://github.com/bivlked/amneziawg-installer/discussions/63">#63</a>.
+</details>
+
+<details>
   <summary><strong>Q: Does AmneziaWG work in an LXC container?</strong></summary>
   <b>A:</b> No. AmneziaWG requires loading a kernel module via DKMS. LXC containers share the host kernel and cannot load custom modules. Use a full VM (KVM/QEMU) or bare-metal.
 </details>
@@ -654,7 +835,7 @@ chmod 700 /root/awg/manage_amneziawg.sh /root/awg/awg_common.sh
 </details>
 
 <details>
-  <summary><strong>Q: "Another install_amneziawg.sh instance is already running" — what is this?</strong></summary>
+  <summary><strong>Q: "Another installer instance is already running" — what is this?</strong></summary>
   <b>A:</b> As of v5.8.0, the installer takes a process-wide <code>flock</code> on <code>/root/awg/.install.lock</code> at the beginning of <code>initialize_setup()</code>. This prevents two parallel runs from racing each other on <code>apt-get</code> and corrupting package state. If you see this error but no second installer is actually running (hung / crashed process), remove <code>/root/awg/.install.lock</code> and try again.
 </details>
 
@@ -733,6 +914,23 @@ The report (`--diagnostic`) includes the following sections:
 </details>
 
 <details>
+<summary><strong>AmneziaWG handshake completes but traffic then dies (Russian DPI / TSPU, Hetzner, endless re-handshakes)</strong></summary>
+
+This symptom is different from the item above: the handshake **completes once** (`Received handshake response` shows up in the client log), traffic may flow for a couple of seconds, then it goes silent. The client loops `Handshake did not complete after 5 seconds` and `stopped hearing back`, while `awg show` on the server shows a sharp asymmetry: the client sent tens of KiB, the server received only a couple of KiB, and `latest handshake` never refreshes.
+
+The server is not the problem here - the config is fine. This is DPI filtering by the host IP/AS: in-path equipment (in Russia, the TSPU) lets the initial handshake through, then chokes the established flow to near zero. The tell in `awg show`: the client received about 92 bytes (a WireGuard-level handshake response; on the wire the packet is larger due to obfuscation) and nothing more, even though it sent tens of KiB.
+
+From my own measurements Hetzner (AS24940) is consistently affected; large datacenter networks (OVH, AWS, Azure and the like) are also a risk zone - test by the specific IP and route, the block is not total.
+
+Quick way to confirm it is the path, not the config: bring the same config up **from a different network** (mobile data, another country). If the tunnel holds from there, the config works and the route to your current host is being cut.
+
+What to do:
+1. Spin up a test server at a different host or in another country. If the handshake holds there, the issue is your current host's AS.
+2. Move the server to a host with clean IPs that are not flagged as datacenter ranges. My pick is in the [Hosting](README.en.md#hosting-recommendation) section (FreakHosting): I tested it on my own Russian routes, and as of this writing AmneziaWG runs through it reliably, unlike Hetzner. This is not a guarantee - DPI shifts, so test a small VPS before migrating.
+3. Or put a relay/bridge in a "clean" network in front: client -> relay -> exit. The client->relay leg is not subject to the destination filter, and relay->exit runs between data centers.
+</details>
+
+<details>
 <summary><strong>Port is occupied by another process</strong></summary>
 
 1. Identify the process: `ss -lunp | grep :<port>`
@@ -775,10 +973,13 @@ sudo bash /root/awg/manage_amneziawg.sh stats --json
     "rx": 1332477952,
     "tx": 374083174,
     "last_handshake": 1710312180,
-    "status": "active"
+    "status": "Active",
+    "status_code": "active"
   }
 ]
 ```
+
+> **Note:** the `status` field is localized (EN `Active` / `Recent` / `Inactive`, RU `Активен` / `Недавно` / `Неактивен`) and is meant for humans. For automation, use the machine-stable `status_code` field - it does not depend on the script language and takes values from a fixed set: `active` (handshake < 3 min), `recent` (< 24 h), `inactive` (stats: no or stale handshake), `no_handshake` (list: no or stale handshake), `key_error` (list: client key not found in the server config), `no_data` (list: not enough data). The `status_code` field is present in both `list --json` and `stats --json`.
 
 ---
 
@@ -818,22 +1019,34 @@ sudo bash /root/awg/manage_amneziawg.sh add guest --expires=7d
 <a id="vpnuri-adv"></a>
 ## 📱 vpn:// URI Import
 
-When a client is created, a `.vpnuri` file is automatically generated with a `vpn://` URI for quick import into Amnezia Client.
+When a client is created, a `.vpnuri` file is automatically generated with a `vpn://` URI and, since v5.11.3, a QR code `<name>.vpnuri.png` encoding the same URI — for quick import into the Amnezia VPN app (Android / iOS / Desktop).
 
-**File location:** `/root/awg/<client_name>.vpnuri`
+**File locations:**
 
-**Format:** The configuration is compressed via zlib (Perl `Compress::Zlib`) and Base64-encoded, forming a URI like `vpn://...`.
+- `/root/awg/<client_name>.vpnuri` — plain-text `vpn://` URI
+- `/root/awg/<client_name>.vpnuri.png` — QR code of that URI (since v5.11.3)
 
-> Perl with `Compress::Zlib` and `MIME::Base64` modules must be present on the server. On Ubuntu and Debian they are installed by default. If Perl is absent, `.vpnuri` files are not created, but `.conf` files work as usual.
+**Format:** the configuration is compressed via zlib (Perl `Compress::Zlib`) and Base64-encoded, forming a URI like `vpn://...`.
 
-**Using with Amnezia Client:**
+> Perl with `Compress::Zlib` and `MIME::Base64` modules must be present on the server. On Ubuntu and Debian they are installed by default. If Perl is absent, neither `.vpnuri` nor `.vpnuri.png` is created, but `.conf` files work as usual. `qrencode` (already required for `.conf` QR) is also used for `.vpnuri.png`.
 
-1. Copy the contents of the `.vpnuri` file
-2. Open Amnezia Client
-3. "Add VPN" → "Paste from clipboard"
-4. The configuration is imported automatically
+**Option 1 — QR code (recommended for mobile):**
 
-**Permissions:** `.vpnuri` files have 600 permissions (root only).
+1. Copy `/root/awg/<name>.vpnuri.png` to your computer (`scp`) or open it locally.
+2. In the Amnezia VPN app on the phone: "Add VPN" → "Scan QR code".
+3. Point the camera at `.vpnuri.png` — the client imports automatically.
+
+**Option 2 — URI paste:**
+
+1. Copy the contents of the `.vpnuri` file.
+2. Open Amnezia VPN → "Add VPN" → "Paste from clipboard".
+3. The configuration is imported automatically.
+
+> Alongside sits `<name>.png` — the QR of `.conf` for classic WireGuard-compatible clients (AmneziaWG Windows, wireguard-apple, `wg-quick`). The two formats target different clients: Amnezia VPN app scans `.vpnuri.png`, WireGuard-compatible clients scan `<name>.png`. Do not mix them up.
+
+> For existing clients created before v5.11.3, `.vpnuri.png` appears after one `manage regen <name>`. New clients get both QR codes out of the box.
+
+**Permissions:** `.vpnuri` and `.vpnuri.png` have 600 permissions (root only).
 
 ---
 
@@ -853,6 +1066,38 @@ sudo systemctl restart awg-quick@awg0
 ```
 
 > vpn:// URIs for Amnezia Client have always included MTU = 1280 in all script versions.
+
+---
+
+<a id="as-blocking-adv"></a>
+## 🚧 Host Unreachable from Russia (Hetzner and others): AS-based Blocking and the I1/CPS Workaround
+
+**Symptom.** A VPN server on Hetzner behaves like this: the handshake completes, the client shows a recent handshake and receives a few kilobytes, after which the flow stops. The in-tunnel ping to the server (`10.x.x.x`) goes to 100% loss, incoming traffic freezes, and new handshakes never complete. It looks like the server died, even though it is alive and reachable over SSH.
+
+**Mechanism.** It looks like this is not a per-IP block but the server address landing in an autonomous system (AS) that is not on the allowlist. According to DPI researcher 0ka ([Habr, article 997088](https://habr.com/ru/articles/997088/)), the filtering relies on an allowlist of roughly 72 ASes; it excludes, for example, Hetzner `AS24940` as well as ranges of OVH, DigitalOcean, AWS and Cloudflare, and traffic to them is degraded at the carrier (TSPU) level. The key point: ordinary junk parameters (`Jc`/`Jmin`/`Jmax`) do not help here, because they change the packet signature rather than the destination AS. In our tests, what got through was an `I1`/CPS packet disguised as a QUIC handshake to an allowlisted SNI. The SNI is chosen per hoster; for Hetzner, `7-zip.org` worked.
+
+**Field test (June 2026).** The recipe was verified live on a clean Hetzner server (AS24940) from a Russian client across three Moscow ISPs, comparing the default configuration (generic `I1 = <r N>`) against the QUIC mimicry (`I1` generated for SNI `7-zip.org`).
+
+| ISP | Default (generic I1) | QUIC I1 (SNI 7-zip.org) |
+|-----|----------------------|--------------------------|
+| Rostelecom | blocked (handshake, then silence) | **access restored**: 0% loss, real web through the tunnel |
+| ecotelecom | blocked | **access restored**: 0% loss |
+| Seven Sky | blocked | **no effect** (two SNIs tested: `7-zip.org` and `www.google.com`) |
+
+Control: a tunnel to a server in a different AS (US) came up and held on all three ISPs, so in our test on Seven Sky it was Hetzner specifically that stayed unreachable, not VPN as such. On Seven Sky the block reproduced consistently, both evening and night, and the QUIC mimicry with two different SNIs did not lift it. In summary: 0ka's method does work, but not universally - the outcome depends on the ISP and the regional TSPU configuration.
+
+**How to apply manually.** The installer does not yet generate the QUIC mimicry `I1` on its own (planned, [issue #71](https://github.com/bivlked/amneziawg-installer/issues/71)); for now it is a manual step:
+
+1. Generate the `I1` string for your hoster in [Mini QUIC Generator](https://sageptr.github.io/mini_quic_generator/) (by SagePtr): enter the SNI (`7-zip.org` for Hetzner) and copy the value from the "AmneziaWG 1.5+ (I1 = )" field.
+2. Replace the `I1 = ...` line in the `[Interface]` section of the server config `/etc/amnezia/amneziawg/awg0.conf` (`I1`-`I5` are case-sensitive, uppercase only).
+3. Restart the service and regenerate clients - `regen` writes the new `I1` into the client configs from `awg0.conf`, then redistribute the updated `.conf` files:
+   ```bash
+   sudo systemctl restart awg-quick@awg0
+   sudo bash /root/awg/manage_amneziawg.sh regen <name>
+   ```
+4. If access is not restored, try a different SNI or a different hoster: on some ISPs (like Seven Sky in our test) the mimicry did not pass with any of the SNIs we tried.
+
+> Method discussion and SNI selection: [ntc.party #12845](https://ntc.party/t/12845). If your Hetzner server goes silent after the handshake, first check whether this is the cause: bring up a test server with a different hoster (for example, in the US), and if the tunnel there works, the cause is destination-AS blocking.
 
 ---
 
@@ -897,7 +1142,6 @@ Starting with v5.6.0, the installer fully supports Debian 12 (bookworm) and Debi
 | PPA codename | native | mapped to `focal` | mapped to `noble` |
 | APT format | DEB822 `.sources` | `.list` | DEB822 `.sources` |
 | Headers | `linux-headers-$(uname -r)` | fallback to `linux-headers-amd64` | fallback to `linux-headers-amd64` |
-| deb-src | Yes | No | No |
 | snapd/lxd cleanup | Yes | Skipped | Skipped |
 
 **Debian prerequisites:**
@@ -935,6 +1179,8 @@ Starting with v5.9.0, the installer works on ARM systems alongside x86_64.
 2. If a prebuilt `amneziawg.ko` package matching your kernel exists in the [arm-packages release](https://github.com/bivlked/amneziawg-installer/releases/tag/arm-packages), it is downloaded and installed via `dpkg`. This takes 2-3 minutes.
 3. If no prebuilt package matches, the installer falls back to DKMS compilation from source. This works on any kernel but takes longer (10-30 min depending on hardware).
 
+> **Prebuilt ARM coverage:** prebuilt packages are built for Raspberry Pi (3/4/5), Ubuntu 24.04/25.10 ARM64 and Debian 12/13 ARM64. Ubuntu 26.04 ARM64 has no prebuilt yet - the module is built from source via DKMS (slower on first install, then works normally).
+
 **Raspberry Pi kernel detection:**
 
 Raspberry Pi Foundation kernels have a `+rpt` suffix in their version string (e.g. `6.12.75+rpt-rpi-v8`). The installer maps this suffix to the correct headers package. Standard Debian/Ubuntu ARM64 kernels use their default headers.
@@ -958,16 +1204,147 @@ Look for <code>Prebuilt module installed</code> in the install log (<code>/root/
 
 ---
 
+<a id="lxc-userspace-adv"></a>
+## 📦 LXC / Docker via amneziawg-go (userspace)
+
+If the **AmneziaWG kernel module cannot be installed on the host** — provider restriction, shared-kernel LXC without host privileges, or a shared Proxmox running other containers that you don't want to reboot for a DKMS build — there is an alternative: the [`amneziawg-go`](https://github.com/amnezia-vpn/amneziawg-go) userspace implementation. It is a TUN-backed build that does not need a kernel module. Throughput is lower than kernel-native (~30–50% CPU overhead at 1 Gbps), but it runs on any Linux with `/dev/net/tun`.
+
+My installer `install_amneziawg.sh` **does not cover this path** — I deliberately ship kernel-native for performance and to avoid pulling a Go compiler onto a production server. This section describes a manual setup on top of a running Debian / Ubuntu LXC.
+
+### ⚠️ Security tradeoff
+
+Running `amneziawg-go` inside LXC usually requires:
+
+- A **privileged container** (root mapped to host) or an `unprivileged` one with `/dev/net/tun` passthrough and `CAP_NET_ADMIN` — both give the container broad access to the host network stack.
+- **Nesting** (`features: nesting=1` on Proxmox) — needed for `iptables` inside the container. On Proxmox 9 with Debian 13 LXC (systemd 257+) Proxmox itself warns at container creation: `WARN: Systemd 257 detected. You may need to enable nesting.` — without nesting the container also stalls at the systemd level.
+- **tun passthrough** via `lxc.cgroup2.devices.allow` plus a bind-mount of `/dev/net`.
+
+If container isolation is critical (multi-tenant host, privacy-sensitive workload), use a KVM/QEMU VM with the regular installer instead of LXC.
+
+### LXC host requirements
+
+**Proxmox LXC config** (`/etc/pve/lxc/<VMID>.conf`):
+
+```conf
+features: nesting=1
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net dev/net none bind,create=dir
+```
+
+Restart the container after editing the config: `pct stop <VMID> && pct start <VMID>`.
+
+**Forwarding inside the container:**
+
+```bash
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-awg-forwarding.conf
+sudo sysctl --system
+```
+
+### Installing amneziawg-go and amneziawg-tools
+
+**Option 1 (faster): prebuilt binary from releases.** Download the prebuilt binary, no Go toolchain needed:
+
+```bash
+# Check the latest version: https://github.com/amnezia-vpn/amneziawg-go/releases
+AWG_GO_VERSION="0.2.15"
+ARCH="amd64"  # or arm64 for ARM VPS
+sudo apt install -y iptables git make curl
+sudo curl -fsSL \
+  "https://github.com/amnezia-vpn/amneziawg-go/releases/download/v${AWG_GO_VERSION}/amneziawg-go-linux-${ARCH}" \
+  -o /usr/local/bin/amneziawg-go
+sudo chmod +x /usr/local/bin/amneziawg-go
+```
+
+**Option 2: build from source.** Requires Go 1.21+. On Debian 12 the system `golang-go` is 1.19, so either install from backports or drop in Go manually:
+
+```bash
+sudo apt install -y golang-go git make iptables
+git clone https://github.com/amnezia-vpn/amneziawg-go
+cd amneziawg-go && make && sudo make install
+cd ..
+```
+
+**amneziawg-tools** provide the `awg` and `awg-quick` CLI. The system `awg-quick` from `wireguard-tools` does not understand the obfuscation parameters (`Jc/Jmin/Jmax/S1-S4/H1-H4/I1-I5`), so this fork is required:
+
+```bash
+git clone https://github.com/amnezia-vpn/amneziawg-tools
+cd amneziawg-tools/src && make && sudo make install
+cd ../..
+```
+
+### Config and launch
+
+Create `/etc/amnezia/amneziawg/awg0.conf` — replace the `YOUR_*` values with your own. Generate keys with `awg genkey | tee /etc/amnezia/amneziawg/server_private.key | awg pubkey`. Obfuscation params (`Jc/Jmin/Jmax/S1-S4/H1-H4/I1`) must match the client:
+
+```conf
+[Interface]
+Address = 10.9.9.1/24
+ListenPort = 39743
+PrivateKey = YOUR_SERVER_PRIVATE_KEY
+Jc = 4
+Jmin = 50
+Jmax = 150
+S1 = 0
+S2 = 0
+H1 = 1234567890
+H2 = 2345678901
+H3 = 3456789012
+H4 = 4012345678
+PostUp   = iptables -I INPUT   -p udp --dport 39743 -j ACCEPT
+PostUp   = iptables -I FORWARD -i eth0 -o awg0      -j ACCEPT
+PostUp   = iptables -I FORWARD -i awg0              -j ACCEPT
+PostUp   = iptables -t nat -A POSTROUTING -o eth0   -j MASQUERADE
+PostDown = iptables -D INPUT   -p udp --dport 39743 -j ACCEPT
+PostDown = iptables -D FORWARD -i eth0 -o awg0      -j ACCEPT
+PostDown = iptables -D FORWARD -i awg0              -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o eth0   -j MASQUERADE
+
+[Peer]
+PublicKey    = YOUR_CLIENT_PUBLIC_KEY
+PresharedKey = YOUR_PRESHARED_KEY
+AllowedIPs   = 10.9.9.2/32
+```
+
+Swap the interface name (`awg0`) and external NIC (`eth0`) for yours. For IPv6 add symmetric `ip6tables` rules. `ListenPort` must be open at the host level (UFW or host iptables) and at the cloud-provider level.
+
+Smoke test:
+
+```bash
+sudo awg-quick up awg0
+sudo awg                 # should show the interface and peers
+sudo awg-quick down awg0
+```
+
+Run as a systemd service:
+
+```bash
+sudo systemctl enable awg-quick@awg0
+sudo systemctl start awg-quick@awg0
+sudo systemctl status awg-quick@awg0
+```
+
+### Does `manage_amneziawg.sh` work on top?
+
+My `manage_amneziawg.sh` targets a kernel-native setup (expects `/root/awg/awgsetup_cfg.init`, relies on `awg-quick` + `awg` from `amneziawg-tools`). In theory it should work on top of a manual `amneziawg-go` + `amneziawg-tools` install, provided the interface is named `awg0` and `/etc/amnezia/amneziawg/` exists. I **do not test or support this path** — for full client management either edit configs manually or pick a userspace-oriented tool.
+
+### Source
+
+The minimal working recipe for Debian 13 in a privileged LXC on Proxmox was shared by [@Akh-commits](https://github.com/Akh-commits) in [issue #51](https://github.com/bivlked/amneziawg-installer/issues/51#issuecomment-4288953829) — this section builds on it with additions covering the prebuilt path, the security warning, and the Debian 12 Go nuances.
+
+---
+
 <a id="limitations-adv"></a>
 ## ⚠️ Known Limitations
 
-* **LXC containers are not supported.** AmneziaWG requires a kernel module (DKMS). LXC shares the host kernel — loading a custom module from inside a container is not possible. Use a full VM or bare-metal server.
+* **LXC containers are not supported by my installer.** AmneziaWG requires a kernel module (DKMS). LXC shares the host kernel — loading a custom module from inside a container is not possible. Options: a full VM (KVM/QEMU) or a bare-metal server for a kernel-native setup, or the `amneziawg-go` userspace implementation inside LXC (see [LXC / Docker via amneziawg-go](#lxc-userspace-adv)).
 
 * **Assumes a dedicated server.** The script configures UFW, Fail2Ban, sysctl and optimizes the system for VPN. On servers running other services, use `--no-tweaks` to skip hardening.
 
 * **Single AWG protocol version per server.** All clients share the same obfuscation parameters. You cannot have some clients on AWG 1.x and others on 2.0 simultaneously.
 
-* **Ubuntu 25.10 / Debian 13:** The PPA may not have prebuilt packages. The installer builds the module from source via DKMS, which takes longer on first install.
+* **Ubuntu 25.10 / 26.04 / Debian 13:** The PPA may not have prebuilt packages for the latest non-LTS releases. The installer remaps the PPA codename to `noble` automatically (since v5.13.0) and builds the kernel module from source via DKMS, which takes longer on first install.
+
+* **IPv6 Dual-Stack Tunnel - rolling back `ALLOW_IPV6_TUNNEL=0`:** Setting `ALLOW_IPV6_TUNNEL=0` in `awgsetup_cfg.init` (or re-running without `--allow-ipv6-tunnel`) does **not** remove existing dual-stack `AllowedIPs = ..., fddd::.../128` entries from `[Peer]` blocks already written to `awg0.conf`. The entries remain and the kernel keeps IPv6 routes for those peers. `manage_amneziawg.sh regen <name>` (or the full path `/root/awg/manage_amneziawg.sh regen <name>`) after disabling the flag rebuilds only the client `.conf` - it becomes IPv4-only, since `regenerate_client` reads `ALLOW_IPV6_TUNNEL`. But `regen` does **not** remove the IPv6 `AllowedIPs` from the server `[Peer]` block. To clear the server side too, use the sed cleanup across all peers: `awg-quick down awg0; sed -i 's|, fddd:[^/]*/[0-9]*||g' /etc/amnezia/amneziawg/awg0.conf; awg-quick up awg0`, or `manage_amneziawg.sh remove <name>` + `add <name>`.
 
 ---
 

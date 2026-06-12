@@ -4,10 +4,9 @@
 
 | Version | Supported          |
 |---------|--------------------|
-| 5.10.x  | :white_check_mark: |
-| 5.9.x   | Security fixes only |
-| 5.8.x   | Security fixes only |
-| < 5.8   | :x:                |
+| 5.15.x  | :white_check_mark: |
+| 5.14.x  | Security fixes only |
+| < 5.14  | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -41,8 +40,14 @@ The following are **out of scope**:
 - Upstream userspace tools (`amneziawg-go`, `amneziawg-tools`)
 - Issues in the underlying operating system
 
-Vulnerabilities in upstream AmneziaWG components (kernel module, userspace tools, client apps) should be reported directly to [amnezia-vpn](https://github.com/amnezia-vpn). We update scripts as upstream fixes arrive.
+Vulnerabilities in upstream AmneziaWG components (kernel module, userspace tools, client apps) should be reported directly to [amnezia-vpn](https://github.com/amnezia-vpn). Scripts are updated as upstream fixes arrive.
 
 ## Disclosure Policy
 
 Coordinated disclosure. 30 days for a fix before public disclosure. If a vulnerability is actively exploited, indicate this in your report for priority handling.
+
+## Release integrity (planned)
+
+Detached `minisign` signatures for installer and management scripts are planned for a future release and are not active yet. Once the maintainer public key is published as `KEYS.txt` in the repository root, users will be able to verify a downloaded script against the maintainer's offline-held private key, independent of GitHub's TLS chain. Design and threat model: [docs/SIGNING_DESIGN.md](docs/SIGNING_DESIGN.md).
+
+Until activation, fetch the installer over HTTPS from `raw.githubusercontent.com` (default in README) - GitHub's TLS still protects the path on the wire, the missing piece is independent maintainer-level signing.

@@ -3,8 +3,8 @@
 # ==============================================================================
 # Общая библиотека функций для AmneziaWG 2.0
 # Автор: @bivlked
-# Версия: 5.10.0
-# Дата: 2026-04-16
+# Версия: 5.15.6
+# Дата: 2026-06-08
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 #
@@ -23,19 +23,43 @@ KEYS_DIR="${KEYS_DIR:-$AWG_DIR/keys}"
 # ВАЖНО: trap НЕ устанавливается здесь, чтобы не перезаписать trap вызывающего скрипта.
 # Вызывающий скрипт должен вызвать _awg_cleanup() в своём обработчике EXIT.
 _AWG_TEMP_FILES=()
+# Файл-реестр temp-файлов: awg_mktemp часто вызывается через $(...) (subshell),
+# где правка массива _AWG_TEMP_FILES теряется в родителе. Файл переживает
+# subshell, поэтому _awg_cleanup надёжно удалит даже temp, созданный в
+# подстановке команды (например прерванная запись конфига между mktemp и mv).
+# $$ = PID вызывающего скрипта, стабилен для всех его subshell.
+_AWG_TEMP_REGISTRY="${TMPDIR:-/tmp}/.awg_temp_registry.$$"
 
 _awg_cleanup() {
     local f
     for f in "${_AWG_TEMP_FILES[@]}"; do
         [[ -f "$f" ]] && rm -f "$f"
     done
+    if [[ -n "${_AWG_TEMP_REGISTRY:-}" && -f "$_AWG_TEMP_REGISTRY" ]]; then
+        while IFS= read -r f; do
+            [[ -n "$f" && -f "$f" ]] && rm -f "$f"
+        done < "$_AWG_TEMP_REGISTRY"
+        rm -f "$_AWG_TEMP_REGISTRY"
+    fi
 }
 
-# Обёртка mktemp с автоочисткой
+# Обёртка mktemp с автоочисткой.
+# Опциональный 1-й аргумент - целевой каталог: temp создаётся в нём же, где
+# окажется итоговый файл, чтобы последующий mv был атомарным rename в пределах
+# одной ФС, а не cross-fs copy+unlink (важно, когда /tmp смонтирован как tmpfs).
+# Без аргумента поведение прежнее (/tmp или $TMPDIR) - обратная совместимость.
 awg_mktemp() {
-    local f
-    f=$(mktemp) || return 1
+    local dir="${1:-}" f
+    if [[ -n "$dir" ]]; then
+        mkdir -p "$dir" 2>/dev/null
+        f=$(mktemp -p "$dir") || return 1
+    else
+        f=$(mktemp) || return 1
+    fi
     _AWG_TEMP_FILES+=("$f")
+    # Дублируем путь в файл-реестр - он переживает subshell ($(awg_mktemp ...)),
+    # в отличие от массива выше.
+    [[ -n "${_AWG_TEMP_REGISTRY:-}" ]] && printf '%s\n' "$f" >> "$_AWG_TEMP_REGISTRY" 2>/dev/null
     echo "$f"
 }
 
@@ -51,12 +75,103 @@ fi
 # Утилиты
 # ==============================================================================
 
+# --- Валидаторы IP / CIDR (общие для install и manage) ---
+# Проверяют не только форму, но и числовые диапазоны: октеты IPv4 0-255,
+# префикс IPv4 0-32, IPv6 0-128. Без префикса адрес валиден (wireguard-tools
+# трактует голый IPv4 как /32, IPv6 как /128 - host-route).
+
+# _valid_ipv4 <addr> : ровно 4 октета, каждый 0-255 (10# защищает от трактовки
+# ведущего нуля как восьмеричного числа в (( )) ).
+_valid_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o
+    for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        (( 10#$o <= 255 )) || return 1
+    done
+    return 0
+}
+
+# _valid_ipv6 <addr> : структурная проверка (не только charset). Допускает одну
+# компрессию "::"; без неё требует ровно 8 групп по 1-4 hex; с ней - не более 7.
+# Встроенный IPv4 (::ffff:1.2.3.4) намеренно не поддержан - в AllowedIPs туннеля
+# не встречается, а точки уже отсекаются charset-проверкой.
+_valid_ipv6() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    case "$ip" in
+        *:::*)   return 1 ;;                     # три и более ":" подряд
+        *::*::*) return 1 ;;                     # более одной "::"
+    esac
+    [[ "$ip" == :* && "$ip" != ::* ]] && return 1   # одиночное ведущее ":"
+    [[ "$ip" == *: && "$ip" != *:: ]] && return 1   # одиночное хвостовое ":"
+    local has_dcolon=0
+    [[ "$ip" == *::* ]] && has_dcolon=1
+    local IFS=':' parts=() p ngroups=0
+    read -ra parts <<< "$ip"
+    for p in "${parts[@]}"; do
+        [[ -z "$p" ]] && continue                 # пустые поля от "::"
+        [[ "$p" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        (( ngroups++ ))
+    done
+    if [[ $has_dcolon -eq 1 ]]; then
+        (( ngroups <= 7 )) || return 1            # "::" заменяет >=1 группу
+    else
+        (( ngroups == 8 )) || return 1
+    fi
+    return 0
+}
+
+# _valid_cidr <token> : IPv4/IPv6 адрес с опциональным префиксом. Префикс, если
+# задан, обязан быть числом в допустимом диапазоне (IPv4 0-32, IPv6 0-128).
+# Пустой префикс после "/" (например "1.2.3.4/") отвергается.
+_valid_cidr() {
+    local tok="$1" addr prefix
+    if [[ "$tok" == */* ]]; then
+        addr="${tok%/*}"; prefix="${tok##*/}"
+        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    else
+        addr="$tok"; prefix=""
+    fi
+    if _valid_ipv4 "$addr"; then
+        [[ -z "$prefix" ]] && return 0
+        (( 10#$prefix <= 32 )) || return 1
+        return 0
+    elif _valid_ipv6 "$addr"; then
+        [[ -z "$prefix" ]] && return 0
+        (( 10#$prefix <= 128 )) || return 1
+        return 0
+    fi
+    return 1
+}
+
+# _valid_host_or_ipv4 <host> : для Endpoint - корректный IPv4 ИЛИ FQDN.
+_valid_host_or_ipv4() {
+    local host="$1"
+    _valid_ipv4 "$host" && return 0
+    [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] || return 1
+    # Полностью числовая последняя метка = не настоящий TLD (RFC 3696), а скорее
+    # битый IPv4 (например "999.1.1.1"); отвергаем, чтобы не принять опечатку в IP.
+    local last="${host##*.}"
+    [[ "$last" =~ ^[0-9]+$ ]] && return 1
+    return 0
+}
+
 # Определение основного сетевого интерфейса
 get_main_nic() {
     ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}'
 }
 
-# Определение внешнего IP-адреса сервера (с кэшированием)
+# Определение внешнего IP-адреса сервера (с кэшированием).
+#
+# Список 6 сервисов покрывает основные NAT и cloud-сценарии без
+# жёсткого ранжирования по uptime: ifconfig.me исторически стабилен
+# на обычных VPS (Hetzner, Vultr, OVH), checkip.amazonaws.com -
+# доступен даже из AWS / GCP / OCI private subnet за NAT Gateway,
+# ipinfo.io / icanhazip / ifconfig.io - дополнительные fallback'и
+# на случай rate-limit одного из endpoint'ов. Порядок alphabetical
+# (детерминирован для тестов и diff'ов). First-wins: при первом
+# валидном ответе остальные не запрашиваются.
 _CACHED_PUBLIC_IP=""
 get_server_public_ip() {
     if [[ -n "$_CACHED_PUBLIC_IP" ]]; then
@@ -64,17 +179,57 @@ get_server_public_ip() {
         return 0
     fi
     local ip="" svc
-    for svc in https://ifconfig.me https://api.ipify.org https://icanhazip.com https://ipinfo.io/ip; do
+    for svc in \
+        https://api.ipify.org \
+        https://checkip.amazonaws.com \
+        https://icanhazip.com \
+        https://ifconfig.io \
+        https://ifconfig.me \
+        https://ipinfo.io/ip
+    do
         ip=$(curl -4 -sf --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]')
-        if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [[ -n "$ip" ]] && _valid_ipv4 "$ip"; then
             _CACHED_PUBLIC_IP="$ip"
+            # Observability: write trace to LOG_FILE directly. Never to stdout
+            # (the function's stdout IS the IP; any extra bytes corrupt the
+            # caller's $(get_server_public_ip) capture and the generated
+            # client Endpoint line).
+            if [[ -n "${LOG_FILE:-}" && -w "$(dirname "${LOG_FILE}")" ]]; then
+                printf '[%s] DEBUG: public IP detected: %s (via %s)\n' \
+                    "$(date +'%F %T')" "$ip" "$svc" >>"$LOG_FILE" 2>/dev/null || true
+            fi
             echo "$ip"
             return 0
         fi
     done
+    if [[ -n "${LOG_FILE:-}" && -w "$(dirname "${LOG_FILE}")" ]]; then
+        printf '[%s] DEBUG: public IP detection failed (all 6 services unreachable or invalid)\n' \
+            "$(date +'%F %T')" >>"$LOG_FILE" 2>/dev/null || true
+    fi
     echo ""
     return 1
 }
+
+# Fallback: первый non-loopback IPv4 с сетевого интерфейса.
+# Нужен когда curl до ifconfig.me / ipify / ... не проходит (LXC без egress,
+# fail2ban на outbound, firewall, и т.п.). На bare metal / обычных VPS
+# обычно совпадает с public IP; на NAT'нутом хосте даёт private IP — в
+# этом случае вызывающий код должен написать log_warn чтобы пользователь
+# сам исправил Endpoint в клиентских .conf.
+_try_local_ip() {
+    local ip
+    ip=$(ip -4 -o addr show scope global 2>/dev/null \
+        | awk '{print $4}' \
+        | cut -d/ -f1 \
+        | grep -v '^127\.' \
+        | head -1)
+    { [[ -n "$ip" ]] && _valid_ipv4 "$ip"; } || return 1
+    echo "$ip"
+    return 0
+}
+
+# Note: apt_update_tolerant() определена inline в install_amneziawg.sh
+# (нужна в шагах 1-2 до скачивания этого файла). Здесь её нет — мёртвый код.
 
 # ==============================================================================
 # Генерация AWG 2.0 параметров (используется в тестах + manage)
@@ -159,6 +314,274 @@ generate_awg_h_ranges() {
 }
 
 # ==============================================================================
+# DKMS / Автовосстановление модуля ядра amneziawg
+# ==============================================================================
+#
+# После apt upgrade ядра DKMS-модуль должен пересобраться для нового kernel.
+# Если это не произошло (или модуль был отвязан), 4 функции ниже выполняют
+# idempotent восстановление:
+#
+#   _sanitize_awg_dkms_conf       — убрать deprecated REMAKE_INITRD= из dkms.conf
+#   _install_kernel_headers       — distro-aware fallback chain (Ubuntu/Debian)
+#   _ensure_awg_quick_running     — стартовать awg-quick@awg0 если неактивен
+#   ensure_amneziawg_kernel_module — master, публичная точка входа
+#
+# === Контекст использования и safety contract ===
+#
+# Master ensure_amneziawg_kernel_module() исходит из того, что running kernel
+# (uname -r) и есть target kernel — то есть подходит только для post-reboot
+# контекстов: manage repair-module, manage add/remove (после reboot user'а),
+# systemd unit (стартует на boot когда ядро уже новое). Из DPkg::Post-Invoke
+# хука uname -r всё ещё возвращает СТАРОЕ ядро — для этого случая Phase 3
+# Apt hook helper будет использовать отдельную обёртку, итерирующую target
+# ядра через /lib/modules/*/build.
+#
+# Master НЕ вызывает apt-get install по умолчанию (это deadlock в любом
+# контексте где parent держит /var/lib/dpkg/lock-frontend). Вызов apt
+# гейтится переменной окружения AWG_ALLOW_APT_IN_ENSURE=1 — её устанавливает
+# только install_amneziawg step 2 / manage repair-module. Apt hook helper
+# и systemd unit её НЕ устанавливают, master skip'ит шаг с headers.
+#
+# Headers нужно ставить отдельно — на этапе install через мета-пакет
+# (linux-headers-$(arch) для Debian, linux-headers-generic для Ubuntu) —
+# apt сам подтянет matching headers при apt upgrade ядра.
+
+# Удаление deprecated директивы REMAKE_INITRD= из dkms.conf модуля amneziawg.
+# Современные версии DKMS считают её deprecated и печатают noisy warnings.
+_sanitize_awg_dkms_conf() {
+    local conf
+    for conf in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
+        [[ -f "$conf" ]] && sed -i '/^REMAKE_INITRD=/d' "$conf"
+    done
+}
+
+# Установка пакета kernel headers через distro-aware fallback chain.
+# Аргумент: версия ядра (по умолчанию $(uname -r)).
+# Возвращает: 0 если хотя бы один кандидат установлен успешно, 1 если все провалились.
+#
+# ВАЖНО: вызывается только из контекстов где apt lock доступен (install_amneziawg
+# step 2 или manage repair-module). НЕ должна вызываться из DPkg::Post-Invoke хука.
+#
+# Поддерживается распознавание Raspberry Pi Foundation kernel (+rpt/-rpi suffix):
+# linux-headers-rpi-2712 (Pi 5 / Cortex-A76) или linux-headers-rpi-v8 (Pi 3/4 arm64).
+_install_kernel_headers() {
+    # Defense-in-depth: эта функция вызывает apt-get install и не должна
+    # запускаться из hook-context (deadlock на dpkg lock). Master уже гейтит
+    # её через AWG_ALLOW_APT_IN_ENSURE, но _ префикс не enforced — добавляем
+    # тот же гард сюда чтобы случайный direct call из чужого скрипта не
+    # обошёл защиту.
+    if [[ "${AWG_ALLOW_APT_IN_ENSURE:-0}" != "1" ]]; then
+        log_error "_install_kernel_headers: AWG_ALLOW_APT_IN_ENSURE не выставлен — apt-вызов запрещён в этом контексте."
+        return 1
+    fi
+
+    local kernel_ver="${1:-$(uname -r)}"
+    local candidates=()
+
+    # RPi Foundation kernel (suffix +rpt или -rpi) — отдельный мета-пакет
+    # независимо от distro. Pattern check order: 2712 → v7l → v7 → v8 (default).
+    if [[ "$kernel_ver" == *+rpt* || "$kernel_ver" == *-rpi* ]]; then
+        if [[ "$kernel_ver" == *2712* ]]; then
+            candidates+=("linux-headers-rpi-2712")  # Pi 5 / Cortex-A76
+        elif [[ "$kernel_ver" == *-rpi-v7l* ]]; then
+            candidates+=("linux-headers-rpi-v7l")   # armhf 32-bit (LPAE)
+        elif [[ "$kernel_ver" == *-rpi-v7* ]]; then
+            candidates+=("linux-headers-rpi-v7")    # armhf 32-bit older
+        else
+            candidates+=("linux-headers-rpi-v8")    # Pi 3/4 arm64 default
+        fi
+    fi
+
+    case "${OS_ID:-}" in
+        ubuntu)
+            candidates+=(
+                "linux-headers-${kernel_ver}"
+                "linux-headers-generic"
+                "raspberrypi-kernel-headers"
+            )
+            ;;
+        debian)
+            local arch
+            arch=$(dpkg --print-architecture 2>/dev/null)
+            candidates+=("linux-headers-${kernel_ver}")
+            if [[ -n "$arch" ]]; then
+                # Cloud-images Debian используют отдельный мета-пакет
+                # linux-headers-cloud-${arch} вместо обычного linux-headers-${arch}
+                # (kernel ABI в них другая — sched/IRQ-таймеры урезаны под VM).
+                # Prefer cloud-meta когда running kernel явно cloud — иначе
+                # repair-module падает на AWS/Azure/GCP/cloud-Hetzner после
+                # kernel upgrade, хотя headers доступны через cloud-meta.
+                if [[ "$kernel_ver" == *-cloud-* ]]; then
+                    candidates+=("linux-headers-cloud-${arch}")
+                fi
+                candidates+=("linux-headers-${arch}")
+            fi
+            ;;
+        *)
+            log_error "Установка kernel headers: неизвестный OS_ID='${OS_ID:-}' (поддерживаются только ubuntu/debian)."
+            return 1
+            ;;
+    esac
+
+    local pkg
+    for pkg in "${candidates[@]}"; do
+        if apt-get install -y "$pkg" >/dev/null 2>&1; then
+            log "Установлены kernel headers: $pkg"
+            return 0
+        fi
+        log_warn "Не удалось установить $pkg, пробую следующий кандидат..."
+    done
+    log_error "Не удалось установить ни один из пакетов kernel headers (${candidates[*]})."
+    return 1
+}
+
+# Запуск awg-quick@<iface>, если сервис не активен.
+# Аргумент: имя интерфейса (по умолчанию awg0).
+# Возвращает: 0 при успешном старте или если сервис уже активен, 1 при сбое.
+_ensure_awg_quick_running() {
+    local iface="${1:-awg0}"
+    local svc="awg-quick@${iface}.service"
+
+    if systemctl is-active --quiet "$svc"; then
+        return 0
+    fi
+
+    log "Запуск $svc (был неактивен)..."
+    if systemctl start "$svc"; then
+        log "$svc запущен."
+        return 0
+    fi
+    log_error "Не удалось запустить $svc. Подробности: systemctl status $svc"
+    return 1
+}
+
+# Master: гарантирует что модуль ядра amneziawg собран и загружен для running kernel.
+# Idempotent: fast-path возвращает 0 если модуль уже loaded.
+#
+# Аргумент: режим — "full" (по умолчанию: модуль + старт awg-quick) или
+#                  "module-only" (только модуль, без старта сервиса).
+#
+# ВАЖНО: master рассчитан на post-reboot контексты (manage repair-module,
+# manage add/remove после reboot, systemd unit на boot). Apt/dpkg хук код
+# НЕ должен звать master — uname -r в Post-Invoke возвращает старое ядро,
+# поэтому хук должен использовать отдельную обёртку, итерирующую target
+# kernels через /lib/modules/*/build (Phase 3 helper).
+#
+# Окружение: AWG_ALLOW_APT_IN_ENSURE=1 разрешает шаг установки kernel headers
+# через apt-get install (опасно в hook context — deadlock на dpkg lock).
+# Не установлено → шаг с headers пропускается с warn (предполагается что
+# headers уже на диске через мета-пакет linux-headers-$(arch)).
+#
+# При необходимости запускает 5-шаговое восстановление:
+#   headers → sanitize → dkms autoinstall → depmod → modprobe.
+#
+# Возвращает:
+#   0 — модуль успешно загружен (и в "full" режиме awg-quick активен).
+#   1 — финальный modprobe провалился, либо невалидный режим
+#       (с печатью 4-шагового manual recovery).
+ensure_amneziawg_kernel_module() {
+    local mode="${1:-full}"
+    case "$mode" in
+        full|module-only) ;;
+        *)
+            log_error "ensure_amneziawg_kernel_module: невалидный режим '$mode' (ожидается 'full' или 'module-only')."
+            return 1
+            ;;
+    esac
+    local kernel_ver
+    kernel_ver="$(uname -r)"
+
+    # Fast-path: модуль уже загружен.
+    if lsmod 2>/dev/null | awk '{print $1}' | grep -qx 'amneziawg'; then
+        if [[ "$mode" == "full" ]]; then
+            _ensure_awg_quick_running awg0 || \
+                log_warn "Модуль активен, но awg-quick@awg0 не стартовал (модуль OK, это сервис-проблема)."
+        fi
+        return 0
+    fi
+
+    # Модуль на диске для running kernel — пробуем modprobe до full repair.
+    if find "/lib/modules/${kernel_ver}" -name 'amneziawg.ko*' -print -quit 2>/dev/null | grep -q .; then
+        if modprobe amneziawg 2>/dev/null && \
+           lsmod 2>/dev/null | awk '{print $1}' | grep -qx 'amneziawg'; then
+            log "amneziawg-модуль найден на диске и успешно загружен."
+            if [[ "$mode" == "full" ]]; then
+                _ensure_awg_quick_running awg0 || \
+                    log_warn "Модуль загружен, но awg-quick@awg0 не стартовал (модуль OK, это сервис-проблема)."
+            fi
+            return 0
+        fi
+    fi
+
+    log_warn "amneziawg-модуль не загружен и не собран для ядра ${kernel_ver}."
+    log_warn "Запускаю автоматическое восстановление..."
+
+    # Step 1: kernel headers — только если apt разрешён вызвавшим контекстом.
+    if [[ "${AWG_ALLOW_APT_IN_ENSURE:-0}" == "1" ]]; then
+        case "${OS_ID:-}" in
+            ubuntu|debian)
+                local headers_pkg="linux-headers-${kernel_ver}"
+                if ! dpkg-query -W -f='${Status}' "$headers_pkg" 2>/dev/null | grep -q 'install ok installed'; then
+                    log "Kernel headers ($headers_pkg) не установлены. Устанавливаю..."
+                    _install_kernel_headers "$kernel_ver" || \
+                        log_warn "Не удалось установить kernel headers. Сборка DKMS-модуля может провалиться."
+                fi
+                ;;
+        esac
+    elif [[ ! -d "/lib/modules/${kernel_ver}/build" ]]; then
+        log_warn "/lib/modules/${kernel_ver}/build отсутствует, headers не установлены."
+        log_warn "Apt-установка пропущена (контекст не разрешает apt). Сборка DKMS-модуля скорее всего провалится."
+    fi
+
+    # Step 2: убрать deprecated REMAKE_INITRD из dkms.conf
+    _sanitize_awg_dkms_conf
+
+    # Step 3: dkms autoinstall для running kernel.
+    # Если шаг ошибётся, всё равно пробуем modprobe ниже — он окончательный indicator.
+    if command -v dkms >/dev/null 2>&1; then
+        log "Запуск: dkms autoinstall -k ${kernel_ver}"
+        if ! dkms autoinstall -k "${kernel_ver}" >/dev/null 2>&1; then
+            log_warn "dkms autoinstall завершился с ошибкой для ядра ${kernel_ver}."
+            local dkms_log
+            dkms_log=$(find /var/lib/dkms/amneziawg -name 'make.log' -path "*${kernel_ver}*" 2>/dev/null | head -n 1)
+            if [[ -n "$dkms_log" ]]; then
+                log_warn "Последние 20 строк лога сборки DKMS (${dkms_log}):"
+                tail -20 "$dkms_log" | while IFS= read -r line; do log_warn "  $line"; done
+            else
+                log_warn "Лог сборки не найден. Подробности в /var/lib/dkms/amneziawg/."
+            fi
+        fi
+    else
+        log_warn "Пакет dkms не установлен. Пересборка модуля ядра невозможна."
+    fi
+
+    # Step 4: обновить module dependency cache для конкретного ядра.
+    if command -v depmod >/dev/null 2>&1; then
+        depmod -a "$kernel_ver" 2>/dev/null || \
+            log_warn "depmod -a $kernel_ver завершился с ошибкой; modprobe ниже даст финальный диагноз."
+    fi
+
+    # Step 5: финальная попытка modprobe.
+    if ! modprobe amneziawg 2>/dev/null; then
+        log_error "Модуль ядра amneziawg не удалось загрузить для ядра ${kernel_ver}."
+        log_error "Модуль отсутствует в /lib/modules/${kernel_ver}/."
+        log_error "Ручное восстановление:"
+        log_error "  1. apt install -y \"linux-headers-${kernel_ver}\""
+        log_error "  2. dkms autoinstall -k \"${kernel_ver}\" && depmod -a"
+        log_error "  3. modprobe amneziawg"
+        log_error "  4. systemctl start \"awg-quick@awg0\""
+        return 1
+    fi
+
+    log "Модуль amneziawg успешно загружен для ядра ${kernel_ver}."
+    if [[ "$mode" == "full" ]]; then
+        _ensure_awg_quick_running awg0 || \
+            log_warn "Модуль загружен, но awg-quick@awg0 не стартовал (модуль OK, это сервис-проблема)."
+    fi
+    return 0
+}
+
+# ==============================================================================
 # Загрузка / сохранение параметров
 # ==============================================================================
 
@@ -190,9 +613,10 @@ safe_load_config() {
             fi
             case "$key" in
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
-                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
+                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|AWG_MTU|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                ALLOW_IPV6_TUNNEL|IPV6_SUBNET|SERVER_HAS_NATIVE_IPV6|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
                 AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS|\
                 AWG_AMNEZIA_DNS)
@@ -220,7 +644,7 @@ load_awg_params_from_server_conf() {
     local _Jc="" _Jmin="" _Jmax=""
     local _S1="" _S2="" _S3="" _S4=""
     local _H1="" _H2="" _H3="" _H4=""
-    local _I1="" _Port=""
+    local _I1="" _Port="" _MTU=""
 
     local in_iface=0 line key value
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -249,6 +673,7 @@ load_awg_params_from_server_conf() {
                 H4)         _H4="$value" ;;
                 I1)         _I1="$value" ;;
                 ListenPort) _Port="$value" ;;
+                MTU)        _MTU="$value" ;;
             esac
         fi
     done < "$conf"
@@ -264,6 +689,9 @@ load_awg_params_from_server_conf() {
     export AWG_H1="$_H1" AWG_H2="$_H2" AWG_H3="$_H3" AWG_H4="$_H4"
     [[ -n "$_I1"   ]] && export AWG_I1="$_I1"
     [[ -n "$_Port" ]] && export AWG_PORT="$_Port"
+    if _validate_mtu "${_MTU:-}"; then
+        export AWG_MTU="$_MTU"
+    fi
     return 0
 }
 
@@ -403,9 +831,68 @@ generate_server_keys() {
     return 0
 }
 
+# Гарантирует наличие $AWG_DIR/server_public.key.
+# Если файла нет — пытается восстановить его из PrivateKey в awg0.conf
+# (полезно для ручных установок вне нашего installer, где кеш серверного
+# pubkey не создаётся на шаге 6). Возвращает 0 если ключ уже есть или
+# успешно восстановлен, 1 если ни того ни другого.
+_ensure_server_public_key() {
+    [[ -f "$AWG_DIR/server_public.key" ]] && return 0
+
+    [[ -f "$SERVER_CONF_FILE" ]] || {
+        log_error "Не могу восстановить server_public.key — отсутствует $SERVER_CONF_FILE"
+        return 1
+    }
+    local _srv_priv
+    _srv_priv=$(awk '
+        /^\[Interface\]/ {in_iface=1; next}
+        in_iface && /^[ \t]*PrivateKey[ \t]*=/ {
+            sub(/^[ \t]*PrivateKey[ \t]*=[ \t]*/, "")
+            gsub(/[[:space:]]/, "")
+            print
+            exit
+        }
+        /^\[/ && !/^\[Interface\]/ {in_iface=0}
+    ' "$SERVER_CONF_FILE")
+    if [[ -z "$_srv_priv" ]]; then
+        log_error "Не найден PrivateKey в $SERVER_CONF_FILE — восстановить server_public.key невозможно"
+        return 1
+    fi
+    mkdir -p "$AWG_DIR"
+    local _tmp
+    _tmp=$(awg_mktemp "$AWG_DIR") || return 1
+    if ! echo "$_srv_priv" | awg pubkey > "$_tmp"; then
+        rm -f "$_tmp"
+        log_error "Не удалось вычислить публичный ключ через awg pubkey"
+        return 1
+    fi
+    if ! mv -f "$_tmp" "$AWG_DIR/server_public.key"; then
+        rm -f "$_tmp"
+        log_error "Ошибка перемещения в $AWG_DIR/server_public.key"
+        return 1
+    fi
+    chmod 600 "$AWG_DIR/server_public.key" 2>/dev/null || true
+    log "server_public.key восстановлен из awg0.conf PrivateKey."
+    return 0
+}
+
 # ==============================================================================
 # Рендеринг конфигураций
 # ==============================================================================
+
+# Вычисление IPv6-адреса сервера (хост ::1) из туннельной подсети.
+# Вход: PREFIX::/MASK (например fddd:2c4:2c4:2c4::/64).
+# Выход: PREFIX::1/MASK (например fddd:2c4:2c4:2c4::1/64).
+# Допущение: подсеть всегда оканчивается на ::/MASK (так формирует install-скрипт).
+# Если завершающего ::/ нет - возвращаю вход без изменений (defensive fallback).
+_derive_ipv6_server_addr() {
+    local subnet="$1"
+    if [[ "$subnet" == *"::/"* ]]; then
+        echo "${subnet/::\//::1\/}"
+    else
+        echo "$subnet"
+    fi
+}
 
 # Рендер серверного конфига AWG 2.0
 # Использует глобальные переменные из load_awg_params()
@@ -431,6 +918,18 @@ render_server_config() {
     local server_ip subnet_mask
     server_ip=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
     subnet_mask=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f2)
+
+    # Адрес [Interface]: IPv4 всегда, IPv6 только при включённом туннеле.
+    # Сервер берёт хост ::1 в туннельной IPv6-подсети.
+    # IPV6_SUBNET имеет форму PREFIX::/MASK (по умолчанию fddd:2c4:2c4:2c4::/64),
+    # поэтому адрес сервера получаю заменой завершающего ::/MASK на ::1/MASK.
+    local address_line="${server_ip}/${subnet_mask}"
+    if [[ "${ALLOW_IPV6_TUNNEL:-0}" -eq 1 ]]; then
+        local ipv6_subnet="${IPV6_SUBNET:-fddd:2c4:2c4:2c4::/64}"
+        local ipv6_server_addr
+        ipv6_server_addr=$(_derive_ipv6_server_addr "$ipv6_subnet")
+        address_line="${address_line}, ${ipv6_server_addr}"
+    fi
 
     local conf_dir
     conf_dir=$(dirname "$SERVER_CONF_FILE")
@@ -507,22 +1006,31 @@ render_server_config() {
         postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
 
-    # IPv6 правила если не отключен (только для обычного режима; WARP и entry
-    # egress через v4, IPv6 forwarding на них осмысленно не настраивается)
-    if [[ "${DISABLE_IPV6:-1}" -eq 0 && "${AWG_ROLE:-single}" != "entry" && "${AWG_EGRESS:-direct}" != "warp" ]]; then
+    # IPv6 правила: при включённом IPv6-туннеле (--allow-ipv6-tunnel) ИЛИ при
+    # не отключённом host-IPv6 (FORWARD внутри туннеля + MASQUERADE на публичный
+    # интерфейс). MASQUERADE безвреден если у VPS нет native IPv6 - это no-op,
+    # пока нет IPv6 default route, зато peer-to-peer внутри туннеля работает.
+    # Использую тот же nic, что и IPv4 MASQUERADE (не хардкожу интерфейс).
+    # Условие DISABLE_IPV6=0 сохранено для байт-в-байт совместимости с v5.14.x.
+    # НО: на entry-ноде каскада и при WARP-egress трафик уходит через v4, поэтому
+    # IPv6-forwarding на них осмысленно не настраивается (исключаем эти роли).
+    if [[ ( "${ALLOW_IPV6_TUNNEL:-0}" -eq 1 || "${DISABLE_IPV6:-1}" -eq 0 ) \
+          && "${AWG_ROLE:-single}" != "entry" && "${AWG_EGRESS:-direct}" != "warp" ]]; then
         postup="${postup}; ip6tables -I FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
         postdown="${postdown}; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
     fi
 
-    # Формируем конфиг через временный файл (атомарная запись)
+    # Формируем конфиг через временный файл (атомарная запись).
+    # temp создаём в каталоге итогового конфига, чтобы mv был атомарным rename
+    # на той же ФС (а не cross-fs copy+unlink, если /tmp = tmpfs).
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; return 1; }
+    tmpfile=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "Ошибка mktemp"; return 1; }
 
     cat > "$tmpfile" << EOF
 [Interface]
 PrivateKey = ${server_privkey}
-Address = ${server_ip}/${subnet_mask}
-MTU = 1280
+Address = ${address_line}
+MTU = ${AWG_MTU:-1280}
 ListenPort = ${AWG_PORT}
 PostUp = ${postup}
 PostDown = ${postdown}
@@ -554,8 +1062,51 @@ EOF
     return 0
 }
 
+# Допустимый диапазон MTU для AWG / WireGuard.
+# Минимум 576 (классический минимум IPv4), максимум 9100 (verge на jumbo frame).
+# Значения вне диапазона трактуются как ошибочные и игнорируются (fallback к 1280).
+_validate_mtu() {
+    local v="$1"
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    (( v >= 576 && v <= 9100 )) || return 1
+    return 0
+}
+
+# Извлечение MTU из секции [Interface] серверного awg0.conf (если файл существует).
+# Печатает целое число в stdout, либо ничего если MTU не найден / файл недоступен.
+# Last-wins: если в [Interface] несколько строк MTU = ..., возвращается последняя
+# (так же как awg-quick применяет последнее присвоение).
+# Используется render_client_config для синхронизации MTU клиента с сервером
+# (баг v5.14.0: ручная правка MTU в awg0.conf не подхватывалась regen-ом).
+_extract_mtu_from_server_conf() {
+    local conf="${SERVER_CONF_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
+    [[ -r "$conf" ]] || return 1
+    local val
+    val=$(awk '
+        /^\[Interface\]/ {in_iface=1; next}
+        /^\[/ {in_iface=0}
+        in_iface && /^[[:space:]]*MTU[[:space:]]*=/ {
+            gsub(/^[[:space:]]*MTU[[:space:]]*=[[:space:]]*/, "")
+            gsub(/[[:space:]].*$/, "")
+            if ($0 ~ /^[0-9]+$/) { mtu=$0 }
+        }
+        END { if (mtu != "") print mtu }
+    ' "$conf")
+    _validate_mtu "$val" || return 1
+    echo "$val"
+}
+
 # Рендер клиентского конфига AWG 2.0
-# render_client_config <name> <client_ip> <client_privkey> <server_pubkey> <endpoint> <port>
+# render_client_config <name> <client_ip> <client_privkey> <server_pubkey> <endpoint> <port> [client_ipv6]
+#
+# client_ipv6 (необязательный, 7-й аргумент): IPv6-адрес клиента без префикса
+# длины (например fddd:2c4:2c4:2c4::5). Если непустой и ALLOW_IPV6_TUNNEL=1:
+#   - Address = <ipv4>/32, <ipv6>/128
+#   - AllowedIPs (зеркалю IPv4 routing mode в IPv6, intent-mirroring):
+#       full tunnel (ALLOWED_IPS=0.0.0.0/0): + ::/0 (native) или + <IPV6_SUBNET> (no-native)
+#       split tunnel (кастомный ALLOWED_IPS): IPv4-список БЕЗ изменений + ТОЛЬКО <IPV6_SUBNET>,
+#         НИКОГДА ::/0 - нет IPv6 split-list, нельзя угонять весь IPv6 (ломает split-tunnel).
+# Если пустой (legacy-клиент): Address = <ipv4>/32, AllowedIPs без изменений.
 render_client_config() {
     local name="$1"
     local client_ip="$2"
@@ -563,11 +1114,33 @@ render_client_config() {
     local server_pubkey="$4"
     local endpoint="$5"
     local port="$6"
+    local client_ipv6="${7:-}"
 
     load_awg_params || return 1
 
     local conf_file="$AWG_DIR/${name}.conf"
-    local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
+    local allowed_ips
+    if [[ -n "$client_ipv6" ]]; then
+        # Dual-stack: зеркалю IPv4 routing intent в IPv6.
+        # full tunnel (IPv4=0.0.0.0/0) -> ::/0 (native) или tunnel-ULA (no-native).
+        # split tunnel (кастомный ALLOWED_IPS) -> IPv4-split AS-IS + ТОЛЬКО tunnel-ULA,
+        # никогда ::/0 (нет IPv6 split-list, нельзя угонять весь IPv6).
+        local ipv4_part ipv6_part
+        ipv4_part="${ALLOWED_IPS:-0.0.0.0/0}"
+        if [[ "$ipv4_part" == "0.0.0.0/0" && "${SERVER_HAS_NATIVE_IPV6:-0}" == "1" ]]; then
+            ipv6_part="::/0"
+        else
+            ipv6_part="${IPV6_SUBNET:-fddd:2c4:2c4:2c4::/64}"
+        fi
+        # Защитный de-dup: ALLOWED_IPS по конструкции IPv4-only, но не дублирую
+        # ipv6_part если он уже присутствует токеном в списке.
+        case ",${ipv4_part// /}," in
+            *",${ipv6_part},"*) allowed_ips="$ipv4_part" ;;
+            *)                  allowed_ips="${ipv4_part}, ${ipv6_part}" ;;
+        esac
+    else
+        allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
+    fi
 
     # DNS + AllowedIPs для режима AmneziaDNS=on.
     # 1) DNS: отдаём tunnel-gateway IP (напр. 10.9.9.1), там живёт наш dnsmasq.
@@ -592,15 +1165,38 @@ render_client_config() {
         allowed_ips="0.0.0.0/0, ::/0"
     fi
 
+    # MTU: приоритет server awg0.conf > AWG_MTU из awgsetup_cfg.init > 1280 fallback.
+    # Server config - источник правды для уже работающего сервера: пользователь
+    # мог поправить MTU в /etc/amnezia/amneziawg/awg0.conf руками, и regen должен
+    # это подхватить (MyAI-sdge, Discussion #38). Невалидные значения (вне 576-9100)
+    # на любом этапе откатываются к 1280.
+    local mtu
+    mtu=$(_extract_mtu_from_server_conf) || mtu=""
+    if [[ -z "$mtu" ]]; then
+        if _validate_mtu "${AWG_MTU:-}"; then
+            mtu="$AWG_MTU"
+        else
+            mtu=1280
+        fi
+    fi
+
+    # temp в каталоге клиентского конфига ($AWG_DIR) -> mv = атомарный rename.
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; return 1; }
+    tmpfile=$(awg_mktemp "$AWG_DIR") || { log_error "Ошибка mktemp"; return 1; }
+
+    local address_line
+    if [[ -n "$client_ipv6" ]]; then
+        address_line="${client_ip}/32, ${client_ipv6}/128"
+    else
+        address_line="${client_ip}/32"
+    fi
 
     cat > "$tmpfile" << EOF
 [Interface]
 PrivateKey = ${client_privkey}
-Address = ${client_ip}/32
+Address = ${address_line}
 DNS = ${client_dns}
-MTU = 1280
+MTU = ${mtu}
 Jc = ${AWG_Jc}
 Jmin = ${AWG_Jmin}
 Jmax = ${AWG_Jmax}
@@ -622,6 +1218,14 @@ EOF
 
 [Peer]
 PublicKey = ${server_pubkey}
+EOF
+    # PresharedKey — опциональный дополнительный слой поверх AWG 2.0
+    # обфускации (включается через `manage add --psk`). Должен совпадать
+    # в server peer и client [Peer].
+    if [[ -n "${CLIENT_PSK:-}" ]]; then
+        echo "PresharedKey = ${CLIENT_PSK}" >> "$tmpfile"
+    fi
+    cat >> "$tmpfile" << EOF
 Endpoint = ${endpoint}:${port}
 AllowedIPs = ${allowed_ips}
 PersistentKeepalive = 33
@@ -1543,6 +2147,27 @@ get_next_client_ip() {
     return 1
 }
 
+# Получить IPv6-адрес клиента из его IPv4 (детерминировано по последнему октету).
+# Используется только при ALLOW_IPV6_TUNNEL=1. Аллокация зеркальна IPv4:
+# клиент 10.9.9.N получает fddd:2c4:2c4:2c4::N (тот же индекс N, /128).
+# Аргумент: IPv4-адрес клиента, например 10.9.9.5 -> fddd:2c4:2c4:2c4::5
+# Возвращает строку без префикса длины (только адрес).
+#
+# get_next_client_ipv6 <ipv4_addr>
+get_next_client_ipv6() {
+    local ipv4="$1"
+    if [[ -z "$ipv4" ]]; then
+        log_error "get_next_client_ipv6: не передан IPv4-адрес"
+        return 1
+    fi
+    local n="${ipv4##*.}"
+    local subnet="${IPV6_SUBNET:-fddd:2c4:2c4:2c4::/64}"
+    local prefix="${subnet%%::*}"
+    [[ "$prefix" == *:* ]] || { log_error "get_next_client_ipv6: IPV6_SUBNET не содержит :: (значение: $subnet)"; return 1; }
+    echo "${prefix}::${n}"
+    return 0
+}
+
 # Добавление [Peer] в серверный конфиг (атомарно через tmpfile + mv).
 #
 # КОНТРАКТ БЛОКИРОВКИ: вызывающий код ОБЯЗАН держать exclusive flock на
@@ -1560,11 +2185,16 @@ get_next_client_ip() {
 # только если sub-функция использует TOТ ЖЕ fd что родитель (через
 # inheritance), но это требует передачи fd как аргумента.
 #
-# add_peer_to_server <name> <pubkey> <client_ip>
+# add_peer_to_server <name> <pubkey> <client_ip> [client_ipv6]
+#
+# client_ipv6 (необязательный, 4-й аргумент): IPv6-адрес без префикса длины.
+# Если непустой: AllowedIPs = <ipv4>/32, <ipv6>/128
+# Если пустой (legacy): AllowedIPs = <ipv4>/32
 add_peer_to_server() {
     local name="$1"
     local pubkey="$2"
     local client_ip="$3"
+    local client_ipv6="${4:-}"
 
     if [[ -z "$name" || -z "$pubkey" || -z "$client_ip" ]]; then
         log_error "add_peer_to_server: недостаточно аргументов"
@@ -1576,9 +2206,10 @@ add_peer_to_server() {
         return 1
     fi
 
-    # Добавляем пир через временный файл (атомарно)
+    # Добавляем пир через временный файл (атомарно).
+    # temp в каталоге серверного конфига -> mv = атомарный rename на той же ФС.
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; return 1; }
+    tmpfile=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "Ошибка mktemp"; return 1; }
 
     cp "$SERVER_CONF_FILE" "$tmpfile" || {
         rm -f "$tmpfile"
@@ -1591,8 +2222,17 @@ add_peer_to_server() {
 [Peer]
 #_Name = ${name}
 PublicKey = ${pubkey}
-AllowedIPs = ${client_ip}/32
 EOF
+    # PresharedKey — опционально, пишется если передан через CLIENT_PSK env.
+    # Должен совпадать у server peer и client [Peer].
+    if [[ -n "${CLIENT_PSK:-}" ]]; then
+        echo "PresharedKey = ${CLIENT_PSK}" >> "$tmpfile"
+    fi
+    if [[ -n "$client_ipv6" ]]; then
+        echo "AllowedIPs = ${client_ip}/32, ${client_ipv6}/128" >> "$tmpfile"
+    else
+        echo "AllowedIPs = ${client_ip}/32" >> "$tmpfile"
+    fi
 
     if ! mv "$tmpfile" "$SERVER_CONF_FILE"; then
         rm -f "$tmpfile"
@@ -1630,8 +2270,9 @@ remove_peer_from_server() {
         return 1
     fi
 
+    # temp в каталоге серверного конфига -> финальный mv = атомарный rename.
     local tmpfile
-    tmpfile=$(awg_mktemp) || { log_error "Ошибка mktemp"; exec {lock_fd}>&-; return 1; }
+    tmpfile=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "Ошибка mktemp"; exec {lock_fd}>&-; return 1; }
 
     # Удаляем блок [Peer] содержащий #_Name = name
     # Логика: буферизуем каждый [Peer] блок, проверяем имя, выводим только если не совпадает
@@ -1665,9 +2306,10 @@ remove_peer_from_server() {
     }
     ' "$SERVER_CONF_FILE" > "$tmpfile"
 
-    # Нормализация: сжать множественные пустые строки в одну
+    # Нормализация: сжать множественные пустые строки в одну.
+    # tmpclean - на той же ФС, что и tmpfile (mv tmpclean->tmpfile атомарен).
     local tmpclean
-    tmpclean=$(awg_mktemp) || { log_error "Ошибка mktemp"; exec {lock_fd}>&-; return 1; }
+    tmpclean=$(awg_mktemp "$(dirname "$SERVER_CONF_FILE")") || { log_error "Ошибка mktemp"; exec {lock_fd}>&-; return 1; }
     if cat -s "$tmpfile" > "$tmpclean" 2>/dev/null; then
         mv "$tmpclean" "$tmpfile"
     else
@@ -1707,12 +2349,24 @@ generate_qr() {
         return 1
     fi
 
-    qrencode -t png -o "$png_file" < "$conf_file" || {
+    # C4: генерируем во временный файл и атомарно переносим (mv) - чтобы
+    # прерывание qrencode не оставило частичный/битый PNG поверх рабочего.
+    # awg_mktemp "$AWG_DIR" кладёт tmp в ту же папку (mv = атомарный rename на
+    # одной ФС) И регистрирует его в общем cleanup-реестре, поэтому SIGKILL
+    # между qrencode и mv не оставит осиротевший tmp.
+    local tmp_png
+    tmp_png=$(awg_mktemp "$AWG_DIR") || { log_error "Ошибка mktemp для QR '$name'"; return 1; }
+    if ! qrencode -t png -o "$tmp_png" < "$conf_file"; then
         log_error "Ошибка генерации QR-кода для '$name'"
+        rm -f "$tmp_png"
         return 1
-    }
-
-    chmod 600 "$png_file"
+    fi
+    chmod 600 "$tmp_png" 2>/dev/null
+    if ! mv -f "$tmp_png" "$png_file"; then
+        log_error "Ошибка сохранения QR-кода для '$name'"
+        rm -f "$tmp_png"
+        return 1
+    fi
     log_debug "QR-код для '$name' создан: $png_file"
     return 0
 }
@@ -1741,10 +2395,39 @@ generate_vpn_uri() {
 
     load_awg_params || return 1
 
-    local client_privkey client_ip server_pubkey endpoint allowed_ips
+    local client_privkey client_ip client_ipv6 server_pubkey endpoint allowed_ips client_psk
     client_privkey=$(grep -oP 'PrivateKey\s*=\s*\K\S+' "$conf_file") || return 1
-    client_ip=$(grep -oP 'Address\s*=\s*\K[0-9./]+' "$conf_file") || return 1
+    # Извлекаем IPv4 из Address (первое поле до запятой, без /prefix).
+    # Regex останавливается на цифрах и точках - не захватывает IPv6 при dual-stack.
+    client_ip=$(awk '/^Address[[:space:]]*=/{
+        sub(/^Address[[:space:]]*=[[:space:]]*/, "")
+        sub(/\r$/, "")
+        n = split($0, parts, /[[:space:]]*,[[:space:]]*/)
+        sub(/\/[0-9]+$/, "", parts[1])
+        print parts[1]; exit
+    }' "$conf_file") || return 1
+    # Извлекаем IPv6 из Address (второе поле, если присутствует), без /prefix.
+    client_ipv6=$(awk '/^Address[[:space:]]*=/{
+        sub(/^Address[[:space:]]*=[[:space:]]*/, "")
+        sub(/\r$/, "")
+        n = split($0, parts, /[[:space:]]*,[[:space:]]*/)
+        if (n >= 2) {
+            sub(/\/[0-9]+$/, "", parts[2])
+            gsub(/[[:space:]]/, "", parts[2])
+            print parts[2]
+        }
+        exit
+    }' "$conf_file" 2>/dev/null)
+    client_ipv6="${client_ipv6:-}"
+    _ensure_server_public_key || return 1
     server_pubkey=$(cat "$AWG_DIR/server_public.key" 2>/dev/null) || return 1
+    # PresharedKey — опциональный. awk вместо grep чтобы пустой результат
+    # не считался ошибкой (grep -P без match → rc=1, нам это здесь не нужно).
+    # Дополнительно срезаем CR (CRLF от Windows-редакторов) и хвостовые
+    # пробелы — иначе они улетят в JSON psk_key и сломают handshake так же,
+    # как полное отсутствие поля. Без psk_key в inner JSON AmneziaVPN импорт
+    # vpn:// теряет PSK и handshake падает (issue #67, fix v5.11.4).
+    client_psk=$(awk '/^[[:space:]]*PresharedKey[[:space:]]*=/{sub(/^[[:space:]]*PresharedKey[[:space:]]*=[[:space:]]*/, ""); sub(/\r$/, ""); sub(/[ \t]+$/, ""); print; exit}' "$conf_file" 2>/dev/null)
     local raw_endpoint
     raw_endpoint=$(grep -oP 'Endpoint\s*=\s*\K\S+' "$conf_file") || return 1
     if [[ "$raw_endpoint" == \[* ]]; then
@@ -1755,12 +2438,28 @@ generate_vpn_uri() {
         # IPv4/hostname: addr:port
         endpoint="${raw_endpoint%:*}"
     fi
-    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0"
+    # tr -d ' \r' — спирает пробелы И CR (на CRLF-конфигах '.+' жадно
+    # затягивает \r в значение, что ломает JSON.allowed_ips).
+    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' \r') || allowed_ips="0.0.0.0/0"
+
+    # MTU/PersistentKeepalive/DNS из .conf - могли быть изменены через manage modify.
+    # Клиент Amnezia при импорте vpn:// использует структурные поля inner JSON
+    # (awgConfigurator берёт mtu именно из структурного поля, не из embedded config),
+    # поэтому хардкод рассинхронизировал бы их с .conf - тот же класс, что issue #67
+    # (structured-поле psk_key было авторитетным).
+    local mtu keepalive dns_line dns1 dns2
+    mtu=$(grep -oP '^MTU\s*=\s*\K[0-9]+' "$conf_file" | head -n1); mtu="${mtu:-1280}"
+    keepalive=$(grep -oP '^PersistentKeepalive\s*=\s*\K[0-9]+' "$conf_file" | head -n1); keepalive="${keepalive:-33}"
+    dns_line=$(grep -oP '^DNS\s*=\s*\K.+' "$conf_file" | head -n1 | tr -d ' \r')
+    dns1="${dns_line%%,*}"; dns1="${dns1:-1.1.1.1}"
+    if [[ "$dns_line" == *,* ]]; then dns2="${dns_line#*,}"; dns2="${dns2%%,*}"; else dns2="$dns1"; fi
 
     # AmneziaDNS: режим «настоящего Amnezia-сервера» (isThirdPartyConfig:false
     # + amnezia-dns контейнер + dns1=tunnel-gateway). Активирует в клиенте UI
     # split tunneling по сайтам.
-    local amnezia_dns_flag="0" dns1="1.1.1.1" dns2="1.0.0.1"
+    # dns1/dns2 уже вычислены выше из .conf (уважая manage modify); здесь только
+    # переопределяем их в adns=on режиме — НЕ затираем .conf-значения при adns=off.
+    local amnezia_dns_flag="0"
     if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" && -n "${AWG_TUNNEL_SUBNET:-}" ]]; then
         local _gw
         _gw=$(echo "$AWG_TUNNEL_SUBNET" | cut -d'/' -f1)
@@ -1778,8 +2477,8 @@ generate_vpn_uri() {
     # shellcheck disable=SC2016
     vpn_uri=$(perl -MCompress::Zlib -MMIME::Base64 -e '
         my ($conf_path, $h1,$h2,$h3,$h4, $jc,$jmin,$jmax,
-            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cpk, $spk, $aips,
-            $adns, $dns1, $dns2) = @ARGV;
+            $s1,$s2,$s3,$s4, $i1, $port, $ep, $cip, $cipv6, $cpk, $spk, $aips, $psk,
+            $mtu, $keepalive, $adns, $dns1, $dns2) = @ARGV;
 
         open my $fh, "<", $conf_path or die;
         local $/; my $raw = <$fh>; close $fh;
@@ -1804,10 +2503,17 @@ generate_vpn_uri() {
         my @ips = split(/,/, $aips);
         my $ips_json = join(",", map { qq("$_") } @ips);
         $inner .= qq("allowed_ips":[$ips_json],);
-        $inner .= qq("client_ip":"$cip","client_priv_key":"$cpk",);
+        $inner .= qq("client_ip":"$cip",);
+        $cipv6 //= "";
+        $inner .= qq("client_ipv6":"$cipv6",);
+        $inner .= qq("client_priv_key":"$cpk",);
+        if (defined $psk && $psk ne "") {
+            my $epsk = je($psk);
+            $inner .= qq("psk_key":"$epsk",);
+        }
         $inner .= qq("config":"$eraw",);
-        $inner .= qq("hostName":"$ep","mtu":"1280",);
-        $inner .= qq("persistent_keep_alive":"33","port":$port,);
+        $inner .= qq("hostName":"$ep","mtu":"$mtu",);
+        $inner .= qq("persistent_keep_alive":"$keepalive","port":$port,);
         $inner .= qq("server_pub_key":"$spk"});
 
         my $einner = je($inner);
@@ -1830,7 +2536,8 @@ generate_vpn_uri() {
         $outer .= qq("containers":[$containers],);
         $outer .= qq("defaultContainer":"$cname",);
         $outer .= qq("description":"AWG Server",);
-        $outer .= qq("dns1":"$dns1","dns2":"$dns2",);
+        my $ed1 = je($dns1); my $ed2 = je($dns2);
+        $outer .= qq("dns1":"$ed1","dns2":"$ed2",);
         $outer .= qq("hostName":"$ep"});
 
         my $compressed = compress($outer);
@@ -1844,8 +2551,8 @@ generate_vpn_uri() {
         "$AWG_Jc" "$AWG_Jmin" "$AWG_Jmax" \
         "$AWG_S1" "$AWG_S2" "$AWG_S3" "$AWG_S4" \
         "$AWG_I1" "$AWG_PORT" "$endpoint" \
-        "$client_ip" "$client_privkey" "$server_pubkey" "$allowed_ips" \
-        "$amnezia_dns_flag" "$dns1" "$dns2" 2>"$perl_err"
+        "$client_ip" "$client_ipv6" "$client_privkey" "$server_pubkey" "$allowed_ips" "$client_psk" \
+        "$mtu" "$keepalive" "$amnezia_dns_flag" "$dns1" "$dns2" 2>"$perl_err"
     )
 
     if [[ -z "$vpn_uri" ]]; then
@@ -1856,15 +2563,103 @@ generate_vpn_uri() {
     fi
     rm -f "$perl_err"
 
-    echo "$vpn_uri" > "$uri_file"
-    chmod 600 "$uri_file"
+    # Пишем через tmp + atomic mv (как .conf/.png), чтобы обрыв записи не оставил
+    # пустой/обрезанный .vpnuri поверх рабочего.
+    local _uri_tmp
+    _uri_tmp=$(awg_mktemp "$AWG_DIR") || { log_error "Ошибка mktemp для vpn:// URI '$name'"; return 1; }
+    printf '%s\n' "$vpn_uri" > "$_uri_tmp" || { rm -f "$_uri_tmp"; log_error "Ошибка записи vpn:// URI для '$name'"; return 1; }
+    chmod 600 "$_uri_tmp"
+    if ! mv -f "$_uri_tmp" "$uri_file"; then
+        rm -f "$_uri_tmp"
+        log_error "Ошибка сохранения vpn:// URI для '$name'"
+        return 1
+    fi
     log_debug "vpn:// URI для '$name' создан: $uri_file"
     return 0
+}
+
+# Генерация QR-кода из vpn:// URI (для импорта в Amnezia VPN app Android/iOS/Desktop)
+# generate_qr_vpnuri <name>
+#
+# Пишет через tmp в той же директории + atomic mv, чтобы при сбое qrencode
+# или chmod пользователь никогда не увидел обрезанный `.vpnuri.png`:
+# старая версия файла остаётся на месте, новая появляется только целиком.
+generate_qr_vpnuri() {
+    local name="$1"
+    local uri_file="$AWG_DIR/${name}.vpnuri"
+    local png_file="$AWG_DIR/${name}.vpnuri.png"
+    local tmp_png
+
+    if [[ ! -f "$uri_file" ]]; then
+        log_error "vpn:// URI для '$name' не найден: $uri_file"
+        return 1
+    fi
+
+    if ! command -v qrencode &>/dev/null; then
+        log_warn "qrencode не установлен, QR vpn:// не создан для '$name'."
+        return 1
+    fi
+
+    # tmp через awg_mktemp (общий cleanup-реестр + atomic mv в той же ФС).
+    tmp_png=$(awg_mktemp "$AWG_DIR") || { log_error "Ошибка mktemp для QR vpn:// '$name'"; return 1; }
+
+    # Флаги qrencode для длинных vpn:// URI с PSK (issue #72):
+    #   -s 6  размер модуля 6 пикселей вместо дефолтных 3 - это и есть основной фикс.
+    #         На дефолтном масштабе модули были слишком мелкими, чтобы камера iPhone
+    #         различала их при сканировании PNG с экрана компьютера - отсюда ошибка 900
+    #         ImportInvalidConfigError в AmneziaVPN iOS у @haritos90 в issue #72.
+    #   -l L  низший уровень коррекции ошибок - это уже дефолт qrencode, фиксируем явно
+    #         для защиты от смены дефолта в будущих версиях библиотеки.
+    #   -m 4  стандартная тихая зона из 4 модулей - тоже дефолт, фиксируем явно.
+    if ! qrencode -t png -l L -s 6 -m 4 -o "$tmp_png" < "$uri_file"; then
+        log_error "Ошибка генерации QR vpn:// для '$name'"
+        rm -f "$tmp_png"
+        return 1
+    fi
+
+    if ! chmod 600 "$tmp_png"; then
+        log_error "Не удалось выставить права 600 на $tmp_png"
+        rm -f "$tmp_png"
+        return 1
+    fi
+
+    if ! mv -f "$tmp_png" "$png_file"; then
+        log_error "Ошибка сохранения QR vpn:// для '$name'"
+        rm -f "$tmp_png"
+        return 1
+    fi
+    log_debug "QR vpn:// для '$name' создан: $png_file"
+    return 0
+}
+
+# Удаляет частично созданные артефакты клиента (ключи + .conf). Используется
+# в early-error путях generate_client - C10: не оставлять orphan-ключи при сбое
+# до коммита пира в серверный конфиг.
+_rollback_client_artifacts() {
+    rm -f "$KEYS_DIR/$1.private" "$KEYS_DIR/$1.public" "$AWG_DIR/$1.conf"
+}
+
+# Полный набор клиентских артефактов (conf/png/vpnuri/vpnuri.png + ключи).
+# Единый список для `manage remove` и автоудаления истёкших, чтобы пути не
+# расходились (раньше expiry-cleanup забывал .vpnuri.png). НЕ трогает expiry-метку
+# и cron - это делает вызывающий (remove_client_expiry / rm "$efile").
+_remove_client_files() {
+    local name="$1"
+    rm -f "$AWG_DIR/${name}.conf" "$AWG_DIR/${name}.png" \
+        "$AWG_DIR/${name}.vpnuri" "$AWG_DIR/${name}.vpnuri.png" \
+        "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
 }
 
 # Полный цикл создания клиента:
 # keypair → next IP → client config → add peer → QR
 # generate_client <name> [endpoint]
+#
+# Env var contract:
+#   CLIENT_PSK — необязательный. Если установлен в "auto", генерирует
+#     свежий PSK через `awg genpsk` и прописывает его и в серверный
+#     [Peer], и в клиентский [Peer]. Если установлен в конкретное
+#     значение (32-байт base64) — использует его без генерации. Если
+#     пуст/не установлен — PSK не добавляется (default behaviour).
 generate_client() {
     local name="$1"
     local endpoint="${2:-}"
@@ -1877,6 +2672,18 @@ generate_client() {
     # Загружаем параметры
     load_awg_params || return 1
 
+    # Опциональный PresharedKey: "auto" → `awg genpsk`, иначе используем
+    # переданное значение как есть. Пустое/unset → без PSK.
+    if [[ "${CLIENT_PSK:-}" == "auto" ]]; then
+        # --psk запрошен явно: при сбое awg genpsk НЕ деградируем молча в клиента
+        # без PSK (это ослабило бы запрошенную безопасность). Fail-closed; здесь
+        # ещё нет созданных артефактов (ключи/конфиг создаются ниже), откат не нужен.
+        CLIENT_PSK=$(awg genpsk) || {
+            log_error "awg genpsk не сработал - клиент с PresharedKey (--psk) НЕ создан. Повторите."
+            return 1
+        }
+    fi
+
     # Межпроцессная блокировка: атомарность IP-аллокации + добавления пира
     local lockfile="${AWG_DIR}/.awg_config.lock"
     local lock_fd
@@ -1887,26 +2694,45 @@ generate_client() {
         return 1
     fi
 
-    # Генерация ключей
-    generate_keypair "$name" || { exec {lock_fd}>&-; return 1; }
-
-    # Следующий свободный IP
-    local client_ip
-    client_ip=$(get_next_client_ip) || { exec {lock_fd}>&-; return 1; }
-
-    # Читаем ключи
-    local client_privkey client_pubkey server_pubkey
-    client_privkey=$(cat "$KEYS_DIR/${name}.private") || { exec {lock_fd}>&-; return 1; }
-    client_pubkey=$(cat "$KEYS_DIR/${name}.public") || { exec {lock_fd}>&-; return 1; }
-
-    if [[ ! -f "$AWG_DIR/server_public.key" ]]; then
-        log_error "Публичный ключ сервера не найден"
+    # C6: клиент не должен уже существовать. Проверяю ПОД локом, ДО генерации
+    # ключей - иначе `add <существующее_имя>` молча перезатёр бы ключи живого
+    # клиента (generate_keypair перезаписывает безусловно), а параллельный add
+    # того же имени гонялся бы за перезапись.
+    if [[ -e "$KEYS_DIR/${name}.private" || -e "$KEYS_DIR/${name}.public" || -e "$AWG_DIR/${name}.conf" ]]; then
+        log_error "Клиент '$name' уже существует. Используйте 'remove' или другое имя."
         exec {lock_fd}>&-
         return 1
     fi
-    server_pubkey=$(cat "$AWG_DIR/server_public.key") || { exec {lock_fd}>&-; return 1; }
 
-    # Endpoint: из аргумента, из конфига или автоопределение
+    # Генерация ключей. С этого момента любой ранний сбой обязан удалить уже
+    # созданные ключи/conf (C10) через _rollback_client_artifacts.
+    generate_keypair "$name" || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # Следующий свободный IP
+    local client_ip
+    client_ip=$(get_next_client_ip) || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # IPv6-адрес клиента (при ALLOW_IPV6_TUNNEL=1)
+    local client_ipv6=""
+    if [[ "${ALLOW_IPV6_TUNNEL:-0}" == "1" ]]; then
+        client_ipv6=$(get_next_client_ipv6 "$client_ip") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+        log_debug "Выделен IPv6-адрес ${client_ipv6} для клиента ${name}"
+    fi
+
+    # Читаем ключи
+    local client_privkey client_pubkey server_pubkey
+    client_privkey=$(cat "$KEYS_DIR/${name}.private") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+    client_pubkey=$(cat "$KEYS_DIR/${name}.public") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # Пытаемся восстановить server_public.key из awg0.conf если кеша нет
+    # (поддержка ручных установок без installer-шага 6).
+    _ensure_server_public_key || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+    server_pubkey=$(cat "$AWG_DIR/server_public.key") || { _rollback_client_artifacts "$name"; exec {lock_fd}>&-; return 1; }
+
+    # Endpoint: из аргумента → AWG_ENDPOINT (awgsetup_cfg.init) → curl до
+    # внешних сервисов → локальный IP с сетевого интерфейса.
+    # Последний fallback для LXC / сред без egress: может быть NAT-адресом,
+    # поэтому предупреждаем пользователя в лог.
     if [[ -z "$endpoint" ]]; then
         endpoint="${AWG_ENDPOINT:-}"
     fi
@@ -1914,23 +2740,27 @@ generate_client() {
         endpoint=$(get_server_public_ip)
     fi
     if [[ -z "$endpoint" ]]; then
+        endpoint=$(_try_local_ip) && log_warn "Используется локальный IP сервера как Endpoint ('$endpoint') — curl до внешних сервисов не прошёл. Если сервер за NAT, поправьте Endpoint в клиентских .conf вручную."
+    fi
+    if [[ -z "$endpoint" ]]; then
         log_error "Не удалось определить внешний IP сервера. Используйте --endpoint=IP"
+        _rollback_client_artifacts "$name"
         exec {lock_fd}>&-
         return 1
     fi
 
     # Конфиг клиента
-    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" || {
-        log_error "Откат: удаление ключей '$name'"
-        rm -f "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" "$client_ipv6" || {
+        log_error "Откат: удаление артефактов '$name'"
+        _rollback_client_artifacts "$name"
         exec {lock_fd}>&-
         return 1
     }
 
     # Добавляем пир в серверный конфиг
-    if ! add_peer_to_server "$name" "$client_pubkey" "$client_ip"; then
-        log_error "Откат: удаление файлов '$name'"
-        rm -f "$AWG_DIR/${name}.conf" "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+    if ! add_peer_to_server "$name" "$client_pubkey" "$client_ip" "$client_ipv6"; then
+        log_error "Откат: удаление артефактов '$name'"
+        _rollback_client_artifacts "$name"
         exec {lock_fd}>&-
         return 1
     fi
@@ -1943,9 +2773,12 @@ generate_client() {
         log_warn "QR-код не создан. Конфиг: $AWG_DIR/${name}.conf"
     fi
 
-    # vpn:// URI для Amnezia Client (необязательный)
+    # vpn:// URI и QR для Amnezia VPN app (необязательные).
+    # QR vpn:// пробуем только если URI создан успешно — иначе читать нечего.
     if ! generate_vpn_uri "$name"; then
         log_warn "vpn:// URI не создан для '$name'."
+    elif ! generate_qr_vpnuri "$name"; then
+        log_warn "QR vpn:// не создан для '$name'."
     fi
 
     log "Клиент '$name' создан (IP: $client_ip)."
@@ -1954,6 +2787,24 @@ generate_client() {
 
 # Перегенерация конфига и QR для существующего клиента
 # regenerate_client <name> [endpoint]
+#
+# v5.11.0 A5.3: защищается блокировкой .awg_config.lock (сериализация
+# с modify_client / remove и параллельными regen на том же имени) и
+# проверяет возврат каждого sed -i при восстановлении пользовательских
+# настроек — прежде молча игнорировались ошибки sed.
+#
+# Lock scope: держится только пока мутируется $AWG_DIR/${name}.conf.
+# generate_qr / generate_vpn_uri / generate_qr_vpnuri вызываются ВНЕ lock
+# как best-effort derived artifacts — если между sed-ом и QR-генерацией
+# concurrent modify успеет изменить conf, QR может устареть на один такт.
+# Также concurrent `manage remove <name>` может удалить клиента после
+# release lock, и regen «воскресит» `.conf` / `.png` / `.vpnuri` /
+# `.vpnuri.png` для уже удалённого peer-а (stale artefacts в $AWG_DIR).
+# Это приемлемо: пользователь получит актуальное состояние на следующей
+# операции (повторный `remove` или `regen`), и peer уже удалён из server-
+# конфига — трафик через него не идёт. Включать QR/URI в lock дороже
+# (lock на несколько секунд — блокирует другие клиенты) без выигрыша
+# по целостности server-state.
 regenerate_client() {
     local name="$1"
     local endpoint="${2:-}"
@@ -1963,11 +2814,23 @@ regenerate_client() {
         return 1
     fi
 
-    load_awg_params || return 1
+    # Межпроцессная блокировка: защита от race с modify_client/remove и
+    # параллельных regen на одном имени клиента.
+    local lockfile="${AWG_DIR}/.awg_config.lock"
+    local lock_fd
+    exec {lock_fd}>"$lockfile"
+    if ! flock -x -w 10 "$lock_fd"; then
+        log_error "Не удалось получить блокировку конфига (другая операция выполняется)"
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    load_awg_params || { exec {lock_fd}>&-; return 1; }
 
     # Проверяем, что клиент существует в серверном конфиге
     if ! grep -qxF "#_Name = ${name}" "$SERVER_CONF_FILE" 2>/dev/null; then
         log_error "Клиент '$name' не найден в серверном конфиге"
+        exec {lock_fd}>&-
         return 1
     fi
 
@@ -1982,29 +2845,63 @@ regenerate_client() {
 
     if [[ -z "$client_privkey" ]]; then
         log_error "Приватный ключ клиента '$name' не найден"
+        exec {lock_fd}>&-
         return 1
     fi
 
     # IP клиента из серверного конфига
     # Ищем блок [Peer] с #_Name = name, затем AllowedIPs
-    client_ip=$(awk -v target="$name" '
+    # Для dual-stack: ips[1] = IPv4/32, ips[2] = IPv6/128 (если есть)
+    local _regen_awk_out
+    _regen_awk_out=$(awk -v target="$name" '
     /^\[Peer\]/ { in_peer=1; found=0; next }
     in_peer && $0 == "#_Name = " target { found=1; next }
-    in_peer && found && /^AllowedIPs/ { gsub(/AllowedIPs[ \t]*=[ \t]*/, ""); gsub(/\/[0-9]+/, ""); print; exit }
+    in_peer && found && /^AllowedIPs/ {
+      sub(/^AllowedIPs[ \t]*=[ \t]*/, "")
+      n = split($0, ips, /[ \t]*,[ \t]*/)
+      sub(/\/[0-9]+$/, "", ips[1])
+      gsub(/^[ \t]+|[ \t]+$/, "", ips[1])
+      ipv4 = ips[1]
+      ipv6 = ""
+      if (n >= 2) {
+        sub(/\/[0-9]+$/, "", ips[2])
+        gsub(/^[ \t]+|[ \t]+$/, "", ips[2])
+        ipv6 = ips[2]
+      }
+      print ipv4 " " ipv6
+      exit
+    }
     /^\[/ && !/^\[Peer\]/ { in_peer=0; found=0 }
     ' "$SERVER_CONF_FILE")
 
+    client_ip="${_regen_awk_out%% *}"
+    local client_ipv6="${_regen_awk_out#* }"
+    # Defensive guard: awk always prints trailing space, so client_ipv6 is "" for IPv4-only.
+    # This guard fires only if awk produces no trailing space (not expected in practice).
+    if [[ "$client_ipv6" == "$client_ip" ]]; then
+        client_ipv6=""
+    fi
+
+    # Only carry IPv6 forward if ALLOW_IPV6_TUNNEL is enabled
+    if [[ "${ALLOW_IPV6_TUNNEL:-0}" != "1" ]]; then
+        client_ipv6=""
+    fi
+
     if [[ -z "$client_ip" ]]; then
         log_error "IP клиента '$name' не найден в серверном конфиге"
+        exec {lock_fd}>&-
         return 1
     fi
 
+    # Auto-gen из awg0.conf если кеша нет (ручная установка)
+    _ensure_server_public_key || { exec {lock_fd}>&-; return 1; }
     server_pubkey=$(cat "$AWG_DIR/server_public.key" 2>/dev/null) || {
         log_error "Публичный ключ сервера не найден"
+        exec {lock_fd}>&-
         return 1
     }
 
-    # Endpoint
+    # Endpoint chain: arg → AWG_ENDPOINT → curl → local IP (best-effort).
     if [[ -z "$endpoint" ]]; then
         endpoint="${AWG_ENDPOINT:-}"
     fi
@@ -2012,7 +2909,11 @@ regenerate_client() {
         endpoint=$(get_server_public_ip)
     fi
     if [[ -z "$endpoint" ]]; then
+        endpoint=$(_try_local_ip) && log_warn "Используется локальный IP сервера как Endpoint ('$endpoint') — curl до внешних сервисов не прошёл."
+    fi
+    if [[ -z "$endpoint" ]]; then
         log_error "Не удалось определить внешний IP сервера."
+        exec {lock_fd}>&-
         return 1
     fi
 
@@ -2026,6 +2927,17 @@ regenerate_client() {
         [[ -n "$_v" ]] && current_keepalive="$_v"
         _v=$(sed -n '/^\[Peer\]/,$ s/^AllowedIPs[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
         [[ -n "$_v" ]] && current_allowed_ips="$_v"
+        # v5.11.1: preserve PresharedKey через regen — если у клиента
+        # был PSK (создан с manage add --psk), regen без этого сохранения
+        # выбросил бы его и сломал handshake (server peer всё ещё с PSK,
+        # client conf уже без). CLIENT_PSK передаётся в render_client_config.
+        local _psk
+        _psk=$(sed -n '/^\[Peer\]/,$ s/^PresharedKey[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        if [[ -n "$_psk" ]]; then
+            export CLIENT_PSK="$_psk"
+        else
+            unset CLIENT_PSK
+        fi
     fi
 
     # В режиме AmneziaDNS клиентский AllowedIPs жёстко фиксирован в
@@ -2040,23 +2952,54 @@ regenerate_client() {
         fi
     fi
 
-    # Перегенерация конфига
-    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" || return 1
+    # Перегенерация конфига (передаём client_ipv6 если dual-stack)
+    render_client_config "$name" "$client_ip" "$client_privkey" "$server_pubkey" "$endpoint" "${AWG_PORT}" "$client_ipv6" || {
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    }
 
     # Восстанавливаем пользовательские настройки (экранируем & и \ для sed replacement)
     local _dns _ka _aip
     _dns=$(printf '%s' "$current_dns" | sed 's/[&\\/]/\\&/g')
     _ka=$(printf '%s' "$current_keepalive" | sed 's/[&\\/]/\\&/g')
     _aip=$(printf '%s' "$current_allowed_ips" | sed 's/[&\\/]/\\&/g')
-    sed -i "s/^DNS = .*/DNS = ${_dns}/" "$AWG_DIR/${name}.conf"
-    sed -i "s/^PersistentKeepalive = .*/PersistentKeepalive = ${_ka}/" "$AWG_DIR/${name}.conf"
-    sed -i "s|^AllowedIPs = .*|AllowedIPs = ${_aip}|" "$AWG_DIR/${name}.conf"
+    local _client_conf="$AWG_DIR/${name}.conf"
+    if ! sed -i "s/^DNS = .*/DNS = ${_dns}/" "$_client_conf"; then
+        log_error "Ошибка sed при записи DNS в $_client_conf"
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    fi
+    if ! sed -i "s/^PersistentKeepalive = .*/PersistentKeepalive = ${_ka}/" "$_client_conf"; then
+        log_error "Ошибка sed при записи PersistentKeepalive в $_client_conf"
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    fi
+    if ! sed -i "s|^AllowedIPs = .*|AllowedIPs = ${_aip}|" "$_client_conf"; then
+        log_error "Ошибка sed при записи AllowedIPs в $_client_conf"
+        exec {lock_fd}>&-
+        unset CLIENT_PSK
+        return 1
+    fi
+
+    # Освобождаем блокировку — конфиг записан, дальше некритичные операции
+    exec {lock_fd}>&-
 
     # QR-код
     generate_qr "$name"
 
-    # vpn:// URI для Amnezia Client
-    generate_vpn_uri "$name"
+    # vpn:// URI и QR для Amnezia VPN app (best-effort).
+    # QR vpn:// пробуем только если URI пересоздан успешно.
+    if generate_vpn_uri "$name"; then
+        generate_qr_vpnuri "$name" || log_warn "QR vpn:// не обновлён для '$name'."
+    else
+        log_warn "vpn:// URI не обновлён для '$name'."
+    fi
+
+    # Hygiene: PSK не должен протекать в следующие операции в том же shell
+    unset CLIENT_PSK
 
     log "Конфиг клиента '$name' перегенерирован."
     return 0
@@ -2160,7 +3103,7 @@ validate_awg_config() {
 # ==============================================================================
 
 EXPIRY_DIR="${AWG_DIR}/expiry"
-EXPIRY_CRON="/etc/cron.d/awg-expiry"
+EXPIRY_CRON="${EXPIRY_CRON:-/etc/cron.d/awg-expiry}"
 
 # Парсинг длительности в секунды: 1h, 12h, 1d, 7d, 30d
 # parse_duration <duration_string>
@@ -2290,8 +3233,7 @@ check_expired_clients() {
         if [[ $now -ge $expires_at ]]; then
             log "Клиент '$name' истёк. Удаление..."
             if remove_peer_from_server "$name" 2>/dev/null; then
-                rm -f "$AWG_DIR/$name.conf" "$AWG_DIR/$name.png" "$AWG_DIR/$name.vpnuri"
-                rm -f "$KEYS_DIR/${name}.private" "$KEYS_DIR/${name}.public"
+                _remove_client_files "$name"
                 rm -f "$efile"
                 log "Клиент '$name' удалён (истёк)."
                 ((removed++))
@@ -2313,19 +3255,38 @@ check_expired_clients() {
 
 # Установка cron-задачи для автоудаления
 install_expiry_cron() {
-    if [[ -f "$EXPIRY_CRON" ]]; then
-        log_debug "Cron-задача expiry уже установлена."
-        return 0
-    fi
-    cat > "$EXPIRY_CRON" << CRONEOF
-# AmneziaWG client expiry check — every 5 minutes
+    # Идемпотентность по СОДЕРЖИМОМУ, не по факту существования файла. Раньше
+    # ранний выход «файл есть» оставлял stale-пути после restore/переноса/
+    # --conf-dir: cron продолжал смотреть в старый AWG_DIR. Генерируем ожидаемый
+    # текст и заменяем файл, только если он отличается.
+    local _cron_tmp
+    _cron_tmp=$(awg_mktemp "$(dirname "$EXPIRY_CRON")") || { log_error "Ошибка mktemp для cron expiry"; return 1; }
+    # Проверяем успех записи ДО cmp/mv: иначе сбой (диск/права) мог бы атомарно
+    # заменить рабочий cron пустым/частичным tmp.
+    if ! cat > "$_cron_tmp" << CRONEOF
+# AmneziaWG client expiry check - every 5 minutes
 AWG_DIR="${AWG_DIR}"
 CONFIG_FILE="${CONFIG_FILE}"
 SERVER_CONF_FILE="${SERVER_CONF_FILE}"
 */5 * * * * root /bin/bash -c 'source "${AWG_DIR}/awg_common.sh" || exit 1; check_expired_clients' >> "${AWG_DIR}/expiry.log" 2>&1
 CRONEOF
-    chmod 644 "$EXPIRY_CRON"
-    log "Cron-задача expiry установлена: $EXPIRY_CRON"
+    then
+        rm -f "$_cron_tmp"
+        log_error "Ошибка записи cron-задачи expiry"
+        return 1
+    fi
+    if [[ -f "$EXPIRY_CRON" ]] && cmp -s "$_cron_tmp" "$EXPIRY_CRON"; then
+        rm -f "$_cron_tmp"
+        log_debug "Cron-задача expiry уже актуальна."
+        return 0
+    fi
+    chmod 644 "$_cron_tmp"
+    if ! mv -f "$_cron_tmp" "$EXPIRY_CRON"; then
+        rm -f "$_cron_tmp"
+        log_error "Ошибка установки cron-задачи expiry: $EXPIRY_CRON"
+        return 1
+    fi
+    log "Cron-задача expiry установлена/обновлена: $EXPIRY_CRON"
 }
 
 # Удаление expiry-данных клиента

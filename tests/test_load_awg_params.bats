@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 # Tests for load_awg_params_from_server_conf (#38 fix: regen reads live awg0.conf)
+# shellcheck disable=SC2154  # Variables set by sourced scripts at runtime
 
 load test_helper
 
@@ -79,7 +80,7 @@ CONF
     [ "$AWG_I1" = "<r 128>" ]
 }
 
-@test "load_awg_params: priority — server_conf overrides init file (#38 regression)" {
+@test "load_awg_params: priority - server_conf overrides init file (#38 regression)" {
     # Init file has OLD values, server config has NEW values
     create_init_config
     cat > "$SERVER_CONF_FILE" << 'CONF'
@@ -123,11 +124,11 @@ CONF
     [ "$status" -eq 0 ]
 }
 
-@test "load_awg_params: split-brain prevention — corrupt server_conf returns 1 even if init has values" {
+@test "load_awg_params: split-brain prevention - corrupt server_conf returns 1 even if init has values" {
     # The exact scenario from the audit Findings.md #1:
     # init file has GOOD (stale) values, server_conf exists but is missing
     # required H4. Old behavior would silently fall back to init and pretend
-    # success — server runs new config, regen would emit clients old values.
+    # success - server runs new config, regen would emit clients old values.
     # New behavior: error, return 1, no split-brain possible.
     create_init_config
     cat > "$SERVER_CONF_FILE" << 'CONF'
@@ -151,16 +152,16 @@ CONF
     [ "$status" -eq 1 ]
 }
 
-@test "load_awg_params: split-brain prevention — server_conf missing falls back to init (bootstrap)" {
+@test "load_awg_params: split-brain prevention - server_conf missing falls back to init (bootstrap)" {
     # Counterpart to the previous test: when server_conf is missing entirely,
-    # init fallback IS allowed — this is the bootstrap path of first install.
+    # init fallback IS allowed - this is the bootstrap path of first install.
     create_init_config
     rm -f "$SERVER_CONF_FILE"
     run load_awg_params
     [ "$status" -eq 0 ]
 }
 
-@test "load_awg_params_from_server_conf: atomic — partial corrupt config does not pollute env" {
+@test "load_awg_params_from_server_conf: atomic - partial corrupt config does not pollute env" {
     # Init file has GOOD values
     create_init_config
     safe_load_config "$CONFIG_FILE"
@@ -168,7 +169,7 @@ CONF
     [ "$AWG_Jc" = "6" ]
     [ "$AWG_H4" = "100000000-800000000" ]
 
-    # Now write a CORRUPT server config — missing H2, H3, H4
+    # Now write a CORRUPT server config - missing H2, H3, H4
     cat > "$SERVER_CONF_FILE" << 'CONF'
 [Interface]
 PrivateKey = TESTKEY

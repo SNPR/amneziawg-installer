@@ -47,16 +47,23 @@ select_rpi_headers() {
 }
 
 @test "rpi headers: non-RPi arm64 debian kernel selects arch package" {
+    # Mock dpkg to return arm64 (test may run on x86_64 CI runner)
+    dpkg() { echo "arm64"; }
+    export -f dpkg
     result=$(select_rpi_headers "6.1.0-28-arm64")
     [ "$result" = "linux-headers-arm64" ]
 }
 
 @test "rpi headers: amd64 x86 kernel selects amd64 package" {
+    dpkg() { echo "amd64"; }
+    export -f dpkg
     result=$(select_rpi_headers "6.1.0-28-amd64")
     [ "$result" = "linux-headers-amd64" ]
 }
 
 @test "rpi headers: generic Ubuntu kernel selects arch package" {
+    dpkg() { echo "amd64"; }
+    export -f dpkg
     result=$(select_rpi_headers "6.8.0-57-generic")
     # Should not match RPi pattern
     [[ "$result" != *rpi* ]]

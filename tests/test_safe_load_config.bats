@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 # Tests for safe_load_config() in awg_common.sh
+# shellcheck disable=SC2154  # Variables set by safe_load_config() at runtime
 
 load test_helper
 

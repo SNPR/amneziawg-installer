@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.10.0
-# Date: 2026-04-16
+# Version: 5.15.6
+# Date: 2026-06-08
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.10.0"
+SCRIPT_VERSION="5.15.6"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -44,13 +44,14 @@ fi
 # Verified in step5_download_scripts() after curl.
 # Verification is skipped when AWG_BRANCH is overridden (test branch).
 # Format: sha256sum output (hex, 64 chars).
-COMMON_SCRIPT_SHA256="9fa34141c1fc51caa224fca7812680069d12897dbb3461f05416659cbee97da7"
-MANAGE_SCRIPT_SHA256="e7ccba01379ddfe5ad18a7fb3d41f702bc815c7418093a9033bdc0882ab7526b"
+COMMON_SCRIPT_SHA256="4e0bf6c5d80c8fbb67229af82949ee964364476a9c41cb5556a40671276035e5"
+MANAGE_SCRIPT_SHA256="98d4e0502290926ace179694a6d750ab1f7c67ce74f4eead59de49f1e48e0889"
 
 # CLI flags
-UNINSTALL=0; HELP=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
+UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
+FORCE_REINSTALL=0
 _APT_UPDATED=0
-CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"
+CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"; CLI_SSH_PORT=""
 CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0
 # Multi-hop / cascade: node role and upstream tunnel parameters (for role=entry)
 CLI_ROLE=""; CLI_UPSTREAM_CONF=""; CLI_UPSTREAM_IFACE=""
@@ -59,16 +60,32 @@ CLI_UPSTREAM_TABLE=""; CLI_UPSTREAM_FWMARK=""
 CLI_EGRESS=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""; CLI_WARP_BYPASS=""
 # AmneziaDNS: local dnsmasq on the tunnel gateway + "native" Amnezia vpn:// URI
 CLI_AMNEZIA_DNS=""
+# Optional dual-stack IPv6 inside the tunnel (upstream v5.15.0)
+CLI_ALLOW_IPV6_TUNNEL=0
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
+_install_cleaned=0
 _install_cleanup() {
+    # Idempotent: on INT/TERM it is called from the signal handler, then again on
+    # EXIT - the second call must be a no-op.
+    [[ "$_install_cleaned" -eq 1 ]] && return 0
+    _install_cleaned=1
     local f
     for f in "${_install_temp_files[@]}"; do [[ -f "$f" ]] && rm -f "$f"; done
     # Clean up temporary files from awg_common.sh (if already sourced)
     type _awg_cleanup &>/dev/null && _awg_cleanup
 }
-trap _install_cleanup EXIT INT TERM
+# On INT/TERM the cleanup used to run but the script did NOT exit - execution
+# continued past the interrupted command (dangerous mid apt/dpkg/config edits)
+# and cleanup ran again on EXIT. A signal now means cleanup + explicit 130/143.
+_install_on_signal() {
+    _install_cleanup
+    exit "$1"
+}
+trap _install_cleanup EXIT
+trap '_install_on_signal 130' INT
+trap '_install_on_signal 143' TERM
 
 # --- Argument processing ---
 while [[ $# -gt 0 ]]; do
@@ -79,15 +96,18 @@ while [[ $# -gt 0 ]]; do
         --verbose|-v)    VERBOSE=1 ;;
         --no-color)      NO_COLOR=1 ;;
         --port=*)        CLI_PORT="${1#*=}" ;;
+        --ssh-port=*)    CLI_SSH_PORT="${1#*=}" ;;
         --subnet=*)      CLI_SUBNET="${1#*=}" ;;
-        --allow-ipv6)    CLI_DISABLE_IPV6=0 ;;
-        --disallow-ipv6) CLI_DISABLE_IPV6=1 ;;
+        --allow-ipv6)        CLI_DISABLE_IPV6=0 ;;
+        --disallow-ipv6)     CLI_DISABLE_IPV6=1 ;;
+        --allow-ipv6-tunnel) CLI_ALLOW_IPV6_TUNNEL=1 ;;
         --route-all)     CLI_ROUTING_MODE=1 ;;
         --route-amnezia) CLI_ROUTING_MODE=2 ;;
         --route-custom=*) CLI_ROUTING_MODE=3; CLI_CUSTOM_ROUTES="${1#*=}" ;;
         --endpoint=*)    CLI_ENDPOINT="${1#*=}" ;;
         --yes|-y)        AUTO_YES=1 ;;
         --no-tweaks)     NO_TWEAKS=1; CLI_NO_TWEAKS=1 ;;
+        --force|-f)      FORCE_REINSTALL=1 ;;
         --preset=*)      CLI_PRESET="${1#*=}" ;;
         --jc=*)          CLI_JC="${1#*=}" ;;
         --jmin=*)        CLI_JMIN="${1#*=}" ;;
@@ -103,7 +123,7 @@ while [[ $# -gt 0 ]]; do
         --warp-priority=*)    CLI_WARP_PRIORITY="${1#*=}" ;;
         --warp-bypass=*)      CLI_WARP_BYPASS="${1#*=}" ;;
         --amnezia-dns=*)      CLI_AMNEZIA_DNS="${1#*=}" ;;
-        *) echo "Unknown argument: $1"; HELP=1 ;;
+        *) echo "Unknown argument: $1" >&2; HELP=1; HELP_EXIT_RC=1 ;;
     esac
     shift
 done
@@ -116,9 +136,7 @@ log_msg() {
     local type="$1" msg="$2"
     local ts
     ts=$(date +'%F %T')
-    local safe_msg
-    safe_msg="${msg//%/%%}"
-    local entry="[$ts] $type: $safe_msg"
+    local entry="[$ts] $type: $msg"
     local color_start="" color_end=""
 
     if [[ "$NO_COLOR" -eq 0 ]]; then
@@ -154,13 +172,129 @@ log_debug() { if [[ "$VERBOSE" -eq 1 ]]; then log_msg "DEBUG" "$1"; fi; }
 die()       { log_error "CRITICAL ERROR: $1"; log_error "Installation aborted. Log: $LOG_FILE"; exit 1; }
 
 # ==============================================================================
+# apt-get update wrapper that tolerates 404s only for source packages (deb-src).
+# INLINE: needed in steps 1-2 before awg_common.sh is downloaded (Step 5).
+# Some mirrors (Hetzner, AWS) do not serve source packages, but the default
+# ubuntu.sources contains 'Types: deb deb-src'. We do not need source packages
+# (kernel module is built via DKMS using binary headers), so such 404s are safe
+# to ignore. Returns 0 if update succeeded OR if all errors are on source markers.
+# Any other error (GPG, binary-package network, silent crash / OOM / SIGKILL) → non-zero.
+# ==============================================================================
+apt_update_tolerant() {
+    # --ppa-amnezia-tolerant: also ignore errors from the Amnezia PPA. Used
+    # in step 2 — apt_wait_for_ppa_package below already retries for the
+    # ppa.launchpadcontent.net outage scenario (issue #68). Without this
+    # flag we must fail fast on any non-source error, otherwise the script
+    # would continue installing on a stale apt-cache (PR #69 review finding).
+    local ppa_tolerant=0
+    if [[ "${1:-}" == "--ppa-amnezia-tolerant" ]]; then
+        ppa_tolerant=1
+        shift
+    fi
+
+    local err_output rc non_src_errors raw_had_non_src_errors=0
+    err_output=$(LANG=C LC_ALL=C apt-get update -y 2>&1)
+    rc=$?
+    echo "$err_output"
+
+    if [[ $rc -eq 0 ]]; then
+        return 0
+    fi
+
+    # Filter error lines. Ignore:
+    #   1. Lines about source packages (deb-src / /source/ / Sources)
+    #   2. Generic 'Some index files failed to download' — symptom, not cause
+    non_src_errors=$(printf '%s\n' "$err_output" \
+        | grep -E '^(E:|Err:|W:)' \
+        | grep -vE '(deb-src|/source/|Sources([^[:alpha:]]|$))' \
+        | grep -vE 'Some index files failed to download' || true)
+
+    # Remember pre-PPA-filter state — we need to distinguish "real APT errors,
+    # but all on Amnezia PPA" (tolerant OK) from "no classifiable errors at all"
+    # (OOM / silent crash — NOT tolerant even if the output happens to mention
+    # a PPA URL elsewhere).
+    [[ -n "$non_src_errors" ]] && raw_had_non_src_errors=1
+
+    # Optional (step 2): drop errors that are only on the Amnezia PPA — they
+    # will be re-checked via apt_wait_for_ppa_package against apt-cache (issue #68).
+    if [[ $ppa_tolerant -eq 1 && -n "$non_src_errors" ]]; then
+        non_src_errors=$(printf '%s\n' "$non_src_errors" \
+            | grep -vE 'ppa\.launchpadcontent\.net.*amnezia' || true)
+    fi
+
+    if [[ -z "$non_src_errors" ]]; then
+        # Edge case: rc != 0 but no classifiable E:/Err:/W: lines found
+        # (OOM-killer SIGKILL, silent crash, unknown apt output format).
+        # Ignore ONLY if the output actually contains source-markers, or if
+        # ppa-tolerant + there were real APT lines and all of them were on the
+        # Amnezia PPA.
+        if printf '%s\n' "$err_output" | grep -qE '(deb-src|/source/|Sources([^[:alpha:]]|$))'; then
+            log_warn "apt update: source packages unavailable in mirror (expected, ignored)"
+            return 0
+        fi
+        if [[ $ppa_tolerant -eq 1 && $raw_had_non_src_errors -eq 1 ]] \
+            && printf '%s\n' "$err_output" | grep -qE 'ppa\.launchpadcontent\.net.*amnezia'; then
+            log_warn "apt update: errors only on Amnezia PPA (issue #68), continuing with retry."
+            return 0
+        fi
+        log_error "apt update exited with rc=$rc without any classifiable APT lines — possible silent crash / OOM / SIGKILL"
+        return "$rc"
+    fi
+
+    log_error "apt update failed with non-source errors:"
+    printf '%s\n' "$non_src_errors" | while IFS= read -r line; do
+        log_error "  $line"
+    done
+    return "$rc"
+}
+
+# ==============================================================================
+# apt_wait_for_ppa_package <package> [max_attempts] [initial_delay_seconds]
+#   Waits until the given package becomes visible in apt-cache, with
+#   exponential backoff between attempts. Needed in step 2 after the
+#   Amnezia PPA is added: ppa.launchpadcontent.net sometimes briefly
+#   goes down (issue #68), and without retries the first cold install
+#   fails even though the PPA is back a minute later.
+#
+#   IMPORTANT: this checks apt-cache show, not the rc of apt-get update.
+#   apt-get update returns 0 tolerantly even when an InRelease file did
+#   not download — so a plain rc-based retry does not catch a PPA outage.
+#   Package visibility in apt-cache is the only reliable signal that
+#   the PPA actually got indexed.
+#
+#   With the defaults (3 attempts × initial=30s) the timeline is:
+#   attempt 1 → sleep 30s → apt update + attempt 2 → sleep 60s →
+#   apt update + attempt 3 (last). After the third fail we return 1.
+#   Total wait between attempts is about 1.5 minutes.
+#
+#   The 1800s delay cap guards against arithmetic overflow if the helper
+#   is ever called with a very large max.
+# ==============================================================================
+apt_wait_for_ppa_package() {
+    local pkg="$1" max="${2:-3}" delay="${3:-30}" attempt
+    for ((attempt = 1; attempt <= max; attempt++)); do
+        if apt-cache show "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        if (( attempt == max )); then
+            return 1
+        fi
+        log_warn "Package '${pkg}' did not appear in apt-cache (attempt ${attempt}/${max}, PPA still unavailable), retrying in ${delay}s..."
+        sleep "$delay"
+        apt_update_tolerant >/dev/null 2>&1 || true
+        delay=$(( delay * 2 > 1800 ? 1800 : delay * 2 ))
+    done
+    return 1
+}
+
+# ==============================================================================
 # Help
 # ==============================================================================
 
 show_help() {
     cat << 'EOF'
 Usage: sudo bash install_amneziawg_en.sh [OPTIONS]
-Script for installation and configuration of AmneziaWG 2.0 on Ubuntu (24.04 / 25.10) and Debian (12 / 13).
+Script for installation and configuration of AmneziaWG 2.0 on Ubuntu (24.04 / 25.10 / 26.04) and Debian (12 / 13).
 
 Options:
   -h, --help            Show this help and exit
@@ -170,15 +304,23 @@ Options:
   --no-color            Disable colored terminal output
   --port=NUMBER         Set UDP port (1-65535) non-interactively.
                         Useful against mobile DPI: 500 (IKE/NAT-T), 443, 53.
-  --subnet=SUBNET       Set tunnel subnet (x.x.x.x/yy) non-interactively
+  --ssh-port=PORT       SSH port for the UFW rule (auto-detected by default;
+                        comma-separated list). Use if SSH runs on a non-standard
+                        port and auto-detection is unavailable
+  --subnet=SUBNET       Tunnel subnet, /24 only (e.g. 10.9.9.1/24) non-interactively
   --allow-ipv6          Keep IPv6 enabled non-interactively
   --disallow-ipv6       Force-disable IPv6 non-interactively
+  --allow-ipv6-tunnel   Enable dual-stack IPv6 inside the tunnel (ULA, opt-in)
   --route-all           Use 'All traffic' mode non-interactively
   --route-amnezia       Use 'Amnezia' mode non-interactively
   --route-custom=NETS   Use 'Custom' mode non-interactively
-  --endpoint=IP         Specify external server IP (for servers behind NAT)
+  --endpoint=ADDR       External server endpoint: FQDN, IPv4 or [IPv6] (NAT)
   -y, --yes             Auto-confirm (reboots, UFW, etc.)
-  --no-tweaks           Skip hardening/optimization (no UFW, Fail2Ban, sysctl tweaks)
+  -f, --force           Force reinstall on top of an already-running AmneziaWG
+                        (by default a run on a configured server aborts;
+                        ENV: AWG_FORCE_REINSTALL=1 is equivalent to the flag)
+  --no-tweaks           Skip optional hardening/optimization (UFW, Fail2Ban);
+                        the minimal forwarding sysctl is always applied
   --preset=TYPE         Obfuscation parameter preset: default, mobile
                         mobile: Jc=3, narrow Jmax — for mobile carriers (Tele2, Yota, Megafon)
   --jc=N               Set Jc manually (1-128, overrides preset)
@@ -252,7 +394,8 @@ Examples:
 
 Repository: https://github.com/bivlked/amneziawg-installer
 EOF
-    exit 0
+    # Explicit --help exits 0; an unknown argument exits 1 (false success in CI).
+    exit "${HELP_EXIT_RC:-0}"
 }
 
 # ==============================================================================
@@ -262,10 +405,16 @@ EOF
 update_state() {
     local next_step=$1
     mkdir -p "$(dirname "$STATE_FILE")"
-    # Atomic write with flock to prevent race condition
+    # Atomic write: tmp-file + flock + mv. Protects against a truncated
+    # state file if the process is killed / power-lost between write and close.
     (
         flock -x 200
-        echo "$next_step" > "$STATE_FILE"
+        local tmp="${STATE_FILE}.tmp.$BASHPID"
+        if printf '%s\n' "$next_step" > "$tmp" && mv -f "$tmp" "$STATE_FILE"; then
+            exit 0
+        fi
+        rm -f "$tmp" 2>/dev/null
+        exit 1
     ) 200>"${STATE_FILE}.lock" || die "Failed to write state"
     log "State: next step - $next_step"
 }
@@ -273,6 +422,19 @@ update_state() {
 request_reboot() {
     local next_step=$1
     update_state "$next_step"
+
+    # Capture boot_id before the 1→2 reboot gate. On step 2 entry we
+    # compare it with the current boot_id — if they match, the user did
+    # not reboot, which means apt full-upgrade staged a new kernel on
+    # disk but the running kernel is still the old one. DKMS would build
+    # the module against the old kernel and modprobe would fail after
+    # the next reboot. Fail fast instead.
+    if [[ "$next_step" == "2" ]] && [[ -r /proc/sys/kernel/random/boot_id ]]; then
+        if cat /proc/sys/kernel/random/boot_id > "$AWG_DIR/.boot_id_before_step2" 2>/dev/null; then
+            log_debug "boot_id captured before reboot"
+        fi
+    fi
+
     echo "" >> "$LOG_FILE"
     log_warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
     log_warn "!!! SYSTEM REBOOT REQUIRED                                !!!"
@@ -324,7 +486,7 @@ check_os_version() {
     local supported=0
     case "$OS_ID" in
         ubuntu)
-            if [[ "$OS_VERSION" == "24.04" || "$OS_VERSION" == "25.10" ]]; then
+            if [[ "$OS_VERSION" == "24.04" || "$OS_VERSION" == "25.10" || "$OS_VERSION" == "26.04" ]]; then
                 supported=1
             fi
             ;;
@@ -338,7 +500,7 @@ check_os_version() {
     if [[ "$supported" -eq 1 ]]; then
         log "OS: ${OS_ID^} $OS_VERSION ($OS_CODENAME) — supported"
     else
-        log_warn "Detected $OS_ID $OS_VERSION ($OS_CODENAME). Script tested on Ubuntu 24.04/25.10 and Debian 12/13."
+        log_warn "Detected $OS_ID $OS_VERSION ($OS_CODENAME). Script tested on Ubuntu 24.04/25.10/26.04 and Debian 12/13."
         if [[ "$AUTO_YES" -eq 0 ]]; then
             read -rp "Continue? [y/N]: " confirm < /dev/tty
             if ! [[ "$confirm" =~ ^[Yy]$ ]]; then die "Cancelled."; fi
@@ -400,10 +562,36 @@ install_packages() {
     fi
     log "Installing: ${to_install[*]}..."
     if [[ "${_APT_UPDATED:-0}" -eq 0 ]]; then
-        apt update -y || log_warn "Failed to update apt."
+        # C4: a hard apt_update_tolerant failure (GPG / binary-repo network / OOM)
+        # is NOT source noise but a real error; continuing on a stale cache is not
+        # safe (contract line ~138, same as callers 1975/2108). die aborts the
+        # install, so _APT_UPDATED=1 is set only on success - otherwise a later
+        # install_packages call in this session would silently skip the update.
+        apt_update_tolerant || die "apt update error."
         _APT_UPDATED=1
     fi
-    DEBIAN_FRONTEND=noninteractive apt install -y "${to_install[@]}" || die "Package installation error."
+    if ! DEBIAN_FRONTEND=noninteractive apt install -y "${to_install[@]}"; then
+        # v5.13.0: typical failure on 25.10/26.04 after an in-place upgrade
+        # from 24.04 — the amneziawg-dkms postinst runs `dkms autoinstall`
+        # which iterates over ALL kernels in /lib/modules/. The leftover
+        # 6.8.x headers were compiled with gcc-13, but 25.10 ships only
+        # gcc-15 by default → autoinstall fails, dpkg leaves the dependent
+        # amneziawg-tools / amneziawg unconfigured. Force-build the module
+        # for the running kernel only and finish with dpkg --configure -a.
+        if printf '%s\n' "${to_install[@]}" | grep -qx "amneziawg-dkms"; then
+            log_warn "apt install did not complete — trying a DKMS build for the running kernel $(uname -r) only..."
+            local _mver
+            _mver="$(ls /var/lib/dkms/amneziawg/ 2>/dev/null | head -n1)"
+            if [[ -n "$_mver" ]] \
+               && dkms install -m amneziawg -v "$_mver" -k "$(uname -r)" --force \
+               && DEBIAN_FRONTEND=noninteractive dpkg --configure -a; then
+                log "DKMS module built for $(uname -r), dpkg configured."
+                log "Packages installed."
+                return 0
+            fi
+        fi
+        die "Package installation error."
+    fi
     log "Packages installed."
 }
 
@@ -433,6 +621,60 @@ configure_ipv6() {
     log "IPv6 disable: $(if [ "$DISABLE_IPV6" -eq 1 ]; then echo 'Yes'; else echo 'No'; fi)"
 }
 
+# Detect whether the VPS has native IPv6.
+# Native IPv6 = a globally routable address (NOT ULA fc00::/7, NOT link-local
+# fe80::) AND a default IPv6 route. Either condition alone is insufficient:
+#   - a global address without a default route -> no IPv6 internet egress (a client
+#     with ::/0 would black-hole);
+#   - a ULA (fddd::/...) has global scope to `ip` but is not internet-routable.
+# Echo 1 only when both conditions hold, otherwise 0.
+detect_native_ipv6() {
+    local have_addr=0 have_route=0
+    if ip -6 addr show scope global 2>/dev/null \
+        | grep -oP 'inet6\s+\K[0-9a-fA-F:]+' \
+        | grep -qviE '^(fc|fd)'; then
+        have_addr=1
+    fi
+    if ip -6 route show default 2>/dev/null | grep -q .; then
+        have_route=1
+    fi
+    if [[ "$have_addr" -eq 1 && "$have_route" -eq 1 ]]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+configure_ipv6_tunnel() {
+    if [[ "$CLI_ALLOW_IPV6_TUNNEL" -eq 1 ]]; then
+        ALLOW_IPV6_TUNNEL=1
+    elif [[ -z "${ALLOW_IPV6_TUNNEL:-}" ]]; then
+        ALLOW_IPV6_TUNNEL=0
+    fi
+    : "${IPV6_SUBNET:=fddd:2c4:2c4:2c4::/64}"
+    # The IPv6 tunnel requires host IPv6 enabled. Override --disallow-ipv6 AND
+    # actively re-enable IPv6 at runtime BEFORE detection/render: on an upgrade
+    # from a default past install (IPv6 was runtime-disabled), the kernel hides
+    # all IPv6 addresses, so detect_native_ipv6 would false-negative and a client
+    # would be rendered with an IPv6 Address while the kernel has IPv6 off
+    # (awg-quick restart can fail). weaq P1.
+    if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 ]]; then
+        if [[ "$DISABLE_IPV6" -eq 1 ]]; then
+            log_warn "--allow-ipv6-tunnel requires host IPv6 forwarding; overriding --disallow-ipv6 (DISABLE_IPV6=0)"
+            DISABLE_IPV6=0
+        fi
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
+    fi
+    # Detect native IPv6 AFTER the runtime re-enable (cached in init for client render in Phase 4).
+    SERVER_HAS_NATIVE_IPV6=$(detect_native_ipv6)
+    if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 && "$SERVER_HAS_NATIVE_IPV6" -eq 0 ]]; then
+        log_warn "Native IPv6 not detected on VPS - the IPv6 tunnel will work peer-to-peer only, without IPv6 internet egress."
+    fi
+    export ALLOW_IPV6_TUNNEL IPV6_SUBNET SERVER_HAS_NATIVE_IPV6 DISABLE_IPV6
+}
+
 # Safe configuration loader (whitelist parser, no source/eval)
 safe_load_config() {
     local config_file="${1:-$CONFIG_FILE}"
@@ -460,9 +702,10 @@ safe_load_config() {
             fi
             case "$key" in
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
-                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|\
+                DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|AWG_MTU|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
                 AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                ALLOW_IPV6_TUNNEL|IPV6_SUBNET|SERVER_HAS_NATIVE_IPV6|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
                 AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS|\
                 AWG_AMNEZIA_DNS)
@@ -516,18 +759,25 @@ validate_port() {
     # binding to privileged ports (500 IKE/NAT-T, 443, 53) is fine — and
     # actually useful for defeating mobile-carrier DPI, which typically
     # leaves "service" ports unfiltered.
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+    # The ^[1-9][0-9]{0,4}$ regex (from upstream) forbids leading zeros ('0080'
+    # would otherwise be parsed as octal in arithmetic) and bounds the length:
+    # without a limit 64-bit (( )) arithmetic wraps, so 2^64+51820 would pass the
+    # range check. Comparison uses plain decimal.
+    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( port < 1 )) || (( port > 65535 )); then
         die "Invalid port: '$port'. Allowed range: 1-65535."
     fi
 }
 
 validate_subnet() {
-    local subnet="$1"
-    if ! [[ "$subnet" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/24$ ]] \
-       || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
-       || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]]; then
+    local subnet="$1" o
+    # Octets without leading zeros: '010.008...' would otherwise be parsed as octal
+    # in [[ -gt ]] and slip past the check. Range is compared on plain decimal values.
+    if ! [[ "$subnet" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})/24$ ]]; then
         die "Invalid subnet: '$subnet'. Only /24 is supported."
     fi
+    for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        (( o <= 255 )) || die "Invalid subnet: '$subnet'. Octet out of range 0-255."
+    done
     if [[ "${BASH_REMATCH[4]}" -eq 0 ]] || [[ "${BASH_REMATCH[4]}" -eq 255 ]]; then
         die "Invalid subnet: '$subnet'. Last octet cannot be 0 (network address) or 255 (broadcast)."
     fi
@@ -548,9 +798,34 @@ validate_endpoint() {
     [[ "$ep" != *$'\n'* && "$ep" != *$'\r'* && \
        "$ep" != *"'"* && "$ep" != *'"'* && "$ep" != *'\\'* && \
        "$ep" != *' '* && "$ep" != *$'\t'* ]] || return 1
-    # One of three formats: FQDN, IPv4, [IPv6]
-    [[ "$ep" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*|[0-9]{1,3}(\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:]+\])$ ]] || return 1
-    # If IPv4 format — additionally validate octet range 0-255
+    # Bracketed [IPv6] form: structural check of the bracket contents. The previous
+    # charset-only test let junk like [:::] / [1:2:3] through. Mirrors _valid_ipv6.
+    if [[ "$ep" == \[*\] ]]; then
+        local inner="${ep#\[}"; inner="${inner%\]}"
+        [[ "$inner" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+        case "$inner" in
+            *:::*|*::*::*) return 1 ;;
+        esac
+        [[ "$inner" == :* && "$inner" != ::* ]] && return 1
+        [[ "$inner" == *: && "$inner" != *:: ]] && return 1
+        local has_dcolon=0; [[ "$inner" == *::* ]] && has_dcolon=1
+        local IFS=':' parts=() p ngroups=0
+        read -ra parts <<< "$inner"
+        for p in "${parts[@]}"; do
+            [[ -z "$p" ]] && continue
+            [[ "$p" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+            ngroups=$((ngroups + 1))
+        done
+        if [[ $has_dcolon -eq 1 ]]; then
+            (( ngroups <= 7 )) || return 1
+        else
+            (( ngroups == 8 )) || return 1
+        fi
+        return 0
+    fi
+    # Otherwise FQDN or IPv4
+    [[ "$ep" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*|[0-9]{1,3}(\.[0-9]{1,3}){3})$ ]] || return 1
+    # If IPv4 format - additionally validate octet range 0-255
     if [[ "$ep" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
         [[ "${BASH_REMATCH[1]}" -le 255 && "${BASH_REMATCH[2]}" -le 255 && \
            "${BASH_REMATCH[3]}" -le 255 && "${BASH_REMATCH[4]}" -le 255 ]] || return 1
@@ -559,18 +834,29 @@ validate_endpoint() {
 }
 
 validate_cidr_list() {
-    local input="$1" cidr
+    local input="$1" cidr o nospace
     input="${input//$'\r'/}"
     input="${input//$'\t'/ }"
+    # A newline means injection into awgsetup_cfg.init (read <<< only sees the
+    # first line, the rest would pass unchecked). Same policy as validate_endpoint.
+    [[ "$input" != *$'\n'* ]] || return 1
+    # Structural comma check before split: bash IFS drops a trailing empty element,
+    # so '10.0.0.0/24,' used to pass. Reject leading/trailing/double comma and empty
+    # input (spaces are ignored for this check).
+    nospace="${input// /}"
+    case "$nospace" in
+        ""|,*|*,|*,,*) return 1 ;;
+    esac
     IFS=',' read -ra cidrs <<< "$input"
     for cidr in "${cidrs[@]}"; do
-        cidr=$(echo "$cidr" | tr -d ' ')
-        if ! [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] \
-           || [[ "${BASH_REMATCH[1]}" -gt 255 ]] || [[ "${BASH_REMATCH[2]}" -gt 255 ]] \
-           || [[ "${BASH_REMATCH[3]}" -gt 255 ]] || [[ "${BASH_REMATCH[4]}" -gt 255 ]] \
-           || [[ "${BASH_REMATCH[5]}" -gt 32 ]]; then
+        cidr="${cidr// /}"
+        # Octets without leading zeros; prefix 0-32 enforced in the regex (no octal).
+        if ! [[ "$cidr" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})/([0-9]|[12][0-9]|3[0-2])$ ]]; then
             return 1
         fi
+        for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+            (( o <= 255 )) || return 1
+        done
     done
 }
 
@@ -891,6 +1177,37 @@ detect_hardware() {
 cleanup_system() {
     log "Cleaning system of unnecessary components..."
 
+    # Snapshot default route BEFORE cleanup - detects when we break the network.
+    # Issue #84: on clean Ubuntu 26.04 server (subiquity, no cloud-init netplan
+    # markers) apt-get autoremove after purging cloud-init removed
+    # netplan-generator as a transitive dep, and the server lost its IP on reboot.
+    local pre_default_route
+    pre_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+    log_debug "Pre-cleanup default route: ${pre_default_route:-<none>}"
+
+    # apt-mark hold for critical network stack packages: defence against
+    # accidental removal via transitive deps. Covers both netplan naming
+    # variants (netplan.io on 24.04, netplan-generator on 25.10/26.04) plus
+    # systemd-resolved and netcfg/ifupdown legacy. There is no standalone
+    # systemd-networkd package - the binary lives inside systemd, nothing to hold.
+    # Before holding we snapshot the user's existing holds so we never strip
+    # holds we did not place (e.g. on linux-image-* held by the user).
+    local _hold_pkgs="netplan.io netplan-generator systemd-resolved netcfg ifupdown"
+    local _preexisting_holds=""
+    _preexisting_holds="$(apt-mark showhold 2>/dev/null || true)"
+    local _held_actual=()
+    local _hpkg
+    for _hpkg in $_hold_pkgs; do
+        if dpkg-query -W -f='${Status}' "$_hpkg" 2>/dev/null | grep -q "ok installed"; then
+            # Skip if user already held - that hold is not ours to release.
+            if grep -qxF "$_hpkg" <<<"$_preexisting_holds"; then
+                continue
+            fi
+            apt-mark hold "$_hpkg" >/dev/null 2>&1 && _held_actual+=("$_hpkg")
+        fi
+    done
+    [ ${#_held_actual[@]} -gt 0 ] && log_debug "Apt-mark hold: ${_held_actual[*]}"
+
     # Packages to remove (safe for VPS)
     # snapd and lxd-agent-loader — Ubuntu only, not present on Debian
     local packages_to_remove=()
@@ -937,7 +1254,71 @@ cleanup_system() {
         fi
     fi
 
-    apt-get autoremove -y 2>/dev/null || log_warn "autoremove error"
+    # apt-get autoremove dropped (was the source of Issue #84 on Ubuntu 26.04
+    # ISO): autoremove zapped netplan-generator as a transitive dep of
+    # cloud-init. Orphans left after purge take ~50-200 MB - acceptable trade
+    # for stability. User can manually run apt-get autoremove --no-install-recommends.
+
+    # Release apt-mark holds so packages do not stay frozen for the user.
+    local _upkg
+    for _upkg in "${_held_actual[@]}"; do
+        apt-mark unhold "$_upkg" >/dev/null 2>&1 || true
+    done
+
+    # Verify default route is still present. If lost, attempt recovery.
+    # We reinstall netplan.io unconditionally (present on every supported
+    # distro). netplan-generator only ships from Ubuntu 25.10+ / Debian 13+ -
+    # gate the install behind apt-cache show so Debian 12 does not abort the
+    # transaction trying to fetch a non-existent package.
+    local post_default_route
+    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+    if [[ -n "$pre_default_route" && -z "$post_default_route" ]]; then
+        log_error "Default route lost after cleanup. Attempting recovery..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            netplan.io 2>/dev/null || true
+        if apt-cache show netplan-generator &>/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                netplan-generator 2>/dev/null || true
+        fi
+        systemctl restart systemd-networkd 2>/dev/null || true
+        netplan apply 2>/dev/null || true
+        # Route-wait loop: up to ~26 seconds, polling every 1-5 seconds.
+        # Fixed sleeps are unreliable - DHCP route appearance on slow VMs is
+        # unpredictable.
+        local _wait
+        for _wait in 1 2 3 5 5 5 5; do
+            post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+            [[ -n "$post_default_route" ]] && break
+            sleep "$_wait"
+        done
+        # Last-ditch: bring up the interface from pre_default_route. Try
+        # networkctl renew first (for systemd-networkd-managed link); if the
+        # route still does not come back, fall through to dhclient (ifupdown).
+        if [[ -z "$post_default_route" ]]; then
+            local _iface
+            _iface="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit } }' <<<"$pre_default_route")"
+            if [[ -n "$_iface" ]]; then
+                log_warn "Last-ditch attempt to bring $_iface up..."
+                ip link set "$_iface" up 2>/dev/null || true
+                if command -v networkctl &>/dev/null; then
+                    networkctl renew "$_iface" 2>/dev/null || true
+                    sleep 3
+                    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+                fi
+                # If networkctl did not bring the route back (or is absent) - dhclient.
+                if [[ -z "$post_default_route" ]] && command -v dhclient &>/dev/null; then
+                    dhclient -4 "$_iface" 2>/dev/null || true
+                    sleep 3
+                    post_default_route="$(ip -4 route show default 2>/dev/null | head -1 || true)"
+                fi
+            fi
+        fi
+        if [[ -z "$post_default_route" ]]; then
+            die "Network did not recover after cleanup_system. Restore it from the console (e.g. sudo dhclient -4 <iface>) and retry the installer with --no-tweaks flag."
+        fi
+        log_warn "Network recovered: $post_default_route"
+    fi
+
     log "System cleanup completed."
 }
 
@@ -972,8 +1353,11 @@ optimize_swap() {
         chmod 600 /swapfile
         mkswap /swapfile >/dev/null 2>&1 || { log_warn "mkswap error"; return 1; }
         swapon /swapfile || { log_warn "swapon error"; return 1; }
-        # Add to fstab if missing
-        if ! grep -q '/swapfile' /etc/fstab; then
+        # Add to fstab if missing. Precise field match: ignore commented
+        # lines and partial matches (e.g. `/swapfile.bak` or an old entry
+        # left in a comment).
+        if ! awk '!/^[[:space:]]*#/ && $1 == "/swapfile" && $3 == "swap" {found=1} END {exit !(found+0)}' \
+             /etc/fstab; then
             echo '/swapfile none swap sw 0 0' >> /etc/fstab
         fi
         log "Swap file created: ${target_swap_mb}MB"
@@ -1184,6 +1568,73 @@ EOF
 # Firewall and security
 # ==============================================================================
 
+# Detect the real SSH port(s) so the UFW rule does not lock you out.
+# Without this, ufw limit 22/tcp + default deny incoming cuts server access
+# after ufw enable when SSH runs on a non-standard port (Issue #91).
+# Self-contained: called at step 4, BEFORE awg_common.sh is sourced.
+# Sources:
+#   1. CLI_SSH_PORT (--ssh-port=, manual override, comma-separated list) - authoritative
+#   otherwise UNION (not fallback - so we never miss the real port):
+#   2. sshd -T   (effective config: `Port` AND `ListenAddress host:port`, honours drop-ins)
+#   3. ss -tlnp  (real sshd listening sockets: ground truth for ListenAddress)
+#   4. /etc/ssh/sshd_config + sshd_config.d/*.conf (parsing, only if 2-3 are empty)
+#   5. 22 (default, if nothing is found)
+# Prints unique valid ports (1-65535) space-separated to stdout.
+# IMPORTANT: only log_warn/log_error (stderr) inside; log() writes to stdout
+# and would corrupt the $(detect_ssh_ports) capture.
+detect_ssh_ports() {
+    local ports="" p pp valid=""
+    # awk: pulls the port from `port N` and `listenaddress host:port` lines
+    # (IPv4 and [IPv6]); a bare address without a port is skipped.
+    local awk_ports='tolower($1)=="port"&&$2~/^[0-9]+$/{print $2} tolower($1)=="listenaddress"{v=$2; if(v~/\]:[0-9]+$/){sub(/.*\]:/,"",v); print v} else if(v~/^[0-9.]+:[0-9]+$/){sub(/.*:/,"",v); print v}}'
+
+    if [[ -n "$CLI_SSH_PORT" ]]; then
+        # 1. Manual override - authoritative source
+        ports="${CLI_SSH_PORT//,/ }"
+    else
+        # 2. sshd -T: effective configuration (Port + ListenAddress, drop-ins)
+        if command -v sshd &>/dev/null; then
+            ports+=" $(sshd -T 2>/dev/null | awk "$awk_ports" | tr '\n' ' ')"
+        fi
+        # 3. ss: real sshd listening sockets. Merged, not fallback - catches the
+        #    ListenAddress port even when sshd -T prints the default port 22.
+        if command -v ss &>/dev/null; then
+            ports+=" $(ss -H -tlnp 2>/dev/null | awk '/"sshd"/{n=split($4,a,":"); print a[n]}' | tr '\n' ' ')"
+        fi
+        # 4. Parse config files - only if sshd -T and ss yielded nothing
+        if [[ -z "${ports// }" ]]; then
+            local cfgs=() d
+            [[ -f /etc/ssh/sshd_config ]] && cfgs+=(/etc/ssh/sshd_config)
+            for d in /etc/ssh/sshd_config.d/*.conf; do
+                [[ -f "$d" ]] && cfgs+=("$d")
+            done
+            if [[ "${#cfgs[@]}" -gt 0 ]]; then
+                ports+=" $(awk "$awk_ports" "${cfgs[@]}" 2>/dev/null | tr '\n' ' ')"
+            fi
+        fi
+    fi
+
+    # Validate (decimal 1-65535, 10# guards against octal) + dedup preserving order
+    for p in $ports; do
+        if [[ "$p" =~ ^[0-9]+$ ]]; then
+            pp=$((10#$p))
+            if (( pp >= 1 && pp <= 65535 )); then
+                case " $valid " in
+                    *" $pp "*) ;;
+                    *) valid+="${valid:+ }$pp" ;;
+                esac
+            fi
+        fi
+    done
+
+    # 5. Default if detection produced nothing valid
+    if [[ -z "$valid" ]]; then
+        [[ -n "$CLI_SSH_PORT" ]] && log_warn "--ssh-port has no valid ports, falling back to 22."
+        valid="22"
+    fi
+    printf '%s' "$valid"
+}
+
 setup_improved_firewall() {
     log "Configuring UFW..."
     if ! command -v ufw &>/dev/null; then install_packages ufw; fi
@@ -1195,12 +1646,19 @@ setup_improved_firewall() {
         log_warn "Could not detect network interface for UFW route."
     fi
 
+    # Detect the real SSH port(s) so we do not lock out access on a non-standard port (Issue #91)
+    local ssh_ports _sp
+    ssh_ports=$(detect_ssh_ports)
+    log "SSH port(s) for the UFW rule: ${ssh_ports}"
+
     local ufw_errors=0
     if ufw status 2>/dev/null | grep -q inactive; then
         log "UFW is inactive. Configuring..."
         ufw default deny incoming  || { log_warn "UFW: failed to set default deny incoming"; ufw_errors=1; }
         ufw default allow outgoing || { log_warn "UFW: failed to set default allow outgoing"; ufw_errors=1; }
-        ufw limit 22/tcp comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH"; ufw_errors=1; }
+        for _sp in $ssh_ports; do
+            ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
+        done
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN" || { log_warn "UFW: failed to allow VPN port"; ufw_errors=1; }
         if [[ -n "$main_nic" ]]; then
             ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
@@ -1218,7 +1676,11 @@ setup_improved_firewall() {
         fi
         log "UFW rules added."
         log_warn "--- ENABLING UFW ---"
-        log_warn "Verify SSH access!"
+        log_warn "UFW will allow SSH ONLY on port(s): ${ssh_ports}. Make sure you connect over it."
+        if [[ "$ssh_ports" != "22" ]]; then
+            log_warn "NOTE: SSH on a non-standard port. If the port is detected wrong, you will lose server access."
+            log_warn "Override if needed: --ssh-port=PORT"
+        fi
         local confirm_ufw="y"
         if [[ "$AUTO_YES" -eq 0 ]]; then
             sleep 5
@@ -1227,8 +1689,9 @@ setup_improved_firewall() {
             log "Auto-enabling UFW (--yes)."
         fi
         if ! [[ "$confirm_ufw" =~ ^[Yy]$ ]]; then
-            log_warn "UFW not enabled."
-            return 1
+            log_warn "UFW configured but not activated by your choice."
+            log_warn "The server is running WITHOUT a firewall. Enable later: sudo ufw enable"
+            return 0
         fi
         if ! ufw enable <<< "y"; then die "UFW enable error."; fi
         log "UFW enabled."
@@ -1240,7 +1703,9 @@ setup_improved_firewall() {
             log_warn "Failed to create UFW marker — uninstall will not disable UFW automatically."
     else
         log "UFW is active. Updating rules..."
-        ufw limit 22/tcp comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH"; ufw_errors=1; }
+        for _sp in $ssh_ports; do
+            ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
+        done
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN" || { log_warn "UFW: failed to allow VPN port"; ufw_errors=1; }
         if [[ -n "$main_nic" ]]; then
             ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
@@ -1298,11 +1763,8 @@ setup_fail2ban() {
 
     mkdir -p /etc/fail2ban/jail.d 2>/dev/null
 
-    # Backend: systemd for Debian (no rsyslog), auto for Ubuntu
-    local f2b_backend="auto"
-    if [[ "${OS_ID:-}" == "debian" ]]; then
-        f2b_backend="systemd"
-    fi
+    # Backend: systemd for Debian and Ubuntu (no rsyslog)
+    local f2b_backend="systemd"
 
     cat > /etc/fail2ban/jail.d/amneziawg.conf << JAILEOF || { log_warn "jail.d/amneziawg.conf write error"; return 1; }
 # AmneziaWG — SSH protection (managed by amneziawg-installer)
@@ -1315,7 +1777,11 @@ bantime  = 1h
 banaction = ufw
 JAILEOF
 
-    if systemctl restart fail2ban; then
+    systemctl restart fail2ban
+    # Wait a second, service is restarting...
+    sleep 1
+
+    if systemctl is-active --quiet fail2ban; then
         log "Fail2Ban configured and restarted."
     else
         log_warn "fail2ban restart error"
@@ -1553,6 +2019,29 @@ step_uninstall() {
         log "AmneziaDNS removed (dnsmasq package kept, /etc/dnsmasq.d/amneziawg.conf deleted)."
     fi
     modprobe -r amneziawg 2>/dev/null || true
+    # v5.12.0+: kernel module auto-repair on kernel upgrade.
+    # Remove apt hook and systemd unit BEFORE apt purge so the hook does not
+    # fire during amneziawg-dkms purge (the helper would try to rebuild DKMS,
+    # but the package is already gone). Files may be absent on installs from
+    # before v5.12.0 — all operations are idempotent.
+    log "Removing kernel module auto-repair components (v5.12.0+)..."
+    if systemctl is-enabled amneziawg-ensure-module.service &>/dev/null; then
+        systemctl disable amneziawg-ensure-module.service 2>/dev/null || true
+    fi
+    rm -f /etc/systemd/system/amneziawg-ensure-module.service \
+        /etc/apt/apt.conf.d/99-amneziawg-post-kernel \
+        /etc/logrotate.d/amneziawg-ensure-module \
+        /usr/local/sbin/amneziawg-ensure-module \
+        2>/dev/null
+    # Also clean up staging dotfiles that may be left over from an interrupted install (atomic deploy).
+    rm -f /etc/systemd/system/.amneziawg-ensure-module.service.new \
+        /etc/apt/apt.conf.d/.99-amneziawg-post-kernel.new \
+        /etc/logrotate.d/.amneziawg-ensure-module.new \
+        /usr/local/sbin/.amneziawg-ensure-module.new \
+        2>/dev/null || true
+    rm -f /var/log/amneziawg-ensure-module.log* 2>/dev/null || true
+    rm -rf /var/lib/amneziawg 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
         log "Cleaning up AmneziaWG UFW rules..."
         if command -v ufw &>/dev/null; then
@@ -1659,7 +2148,7 @@ initialize_setup() {
     INSTALL_LOCK_FILE="$AWG_DIR/.install.lock"
     exec 9>"$INSTALL_LOCK_FILE" || die "Cannot open $INSTALL_LOCK_FILE"
     if ! flock -n 9; then
-        die "Another install_amneziawg.sh instance is already running. Wait for it to finish, or if the process is hung, remove $INSTALL_LOCK_FILE and try again."
+        die "Another install_amneziawg_en.sh instance is already running. Wait for it to finish, or if the process is hung, remove $INSTALL_LOCK_FILE and try again."
     fi
 
     touch "$LOG_FILE" || die "Failed to create log file $LOG_FILE"
@@ -1802,6 +2291,7 @@ initialize_setup() {
     if [[ "$AWG_WARP_BYPASS" != "none" ]]; then
         local _OLDIFS="$IFS"
         IFS=','
+        # shellcheck disable=SC2206  # intentional comma-split of the bypass spec list
         local _specs=( $AWG_WARP_BYPASS )
         IFS="$_OLDIFS"
         local _s
@@ -1870,8 +2360,17 @@ initialize_setup() {
 
     # Default values
     if [[ "$DISABLE_IPV6" == "default" ]]; then DISABLE_IPV6=1; fi
+    configure_ipv6_tunnel
     if [[ "$ALLOWED_IPS_MODE" == "default" ]]; then ALLOWED_IPS_MODE=2; fi
     if [[ -z "$ALLOWED_IPS" ]]; then configure_routing_mode; fi
+
+    # Single mandatory AllowedIPs validation before saving the config: CLI
+    # --route-custom on a first run assigned ALLOWED_IPS without checking it
+    # (configure_routing_mode was skipped because the mode was already 3).
+    # Validate any non-empty list regardless of its source (CLI / config / mode).
+    if [[ -n "$ALLOWED_IPS" ]] && ! validate_cidr_list "$ALLOWED_IPS"; then
+        die "Invalid ALLOWED_IPS: '$ALLOWED_IPS'. Expected a list x.x.x.x/y[,x.x.x.x/y]."
+    fi
 
     # Port check (skip if AWG service is already listening on this port)
     if ! systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
@@ -1891,8 +2390,12 @@ initialize_setup() {
 
     # Save configuration
     log "Saving settings to $CONFIG_FILE..."
-    local temp_conf
-    temp_conf=$(mktemp) || die "mktemp error."
+    # temp in the target config's directory -> mv = atomic rename on the same
+    # filesystem (not a cross-fs copy+unlink when /tmp is mounted as tmpfs).
+    local temp_conf cfg_dir
+    cfg_dir="$(dirname "$CONFIG_FILE")"
+    mkdir -p "$cfg_dir" 2>/dev/null
+    temp_conf=$(mktemp -p "$cfg_dir") || die "mktemp error."
     _install_temp_files+=("$temp_conf")
     cat > "$temp_conf" << EOF
 # AmneziaWG 2.0 installation configuration (Auto-generated)
@@ -1906,6 +2409,7 @@ export DISABLE_IPV6=${DISABLE_IPV6}
 export ALLOWED_IPS_MODE=${ALLOWED_IPS_MODE}
 export ALLOWED_IPS='${ALLOWED_IPS}'
 export AWG_ENDPOINT='${AWG_ENDPOINT}'
+export AWG_MTU=${AWG_MTU:-1280}
 # AWG 2.0 Parameters
 export AWG_Jc=${AWG_Jc}
 export AWG_Jmin=${AWG_Jmin}
@@ -1937,6 +2441,10 @@ export AWG_WARP_PRIORITY=${AWG_WARP_PRIORITY:-789}
 export AWG_WARP_BYPASS='${AWG_WARP_BYPASS:-none}'
 # AmneziaDNS
 export AWG_AMNEZIA_DNS='${AWG_AMNEZIA_DNS:-off}'
+# IPv6 dual-stack tunnel (upstream v5.15.0)
+export ALLOW_IPV6_TUNNEL=${ALLOW_IPV6_TUNNEL:-0}
+export IPV6_SUBNET='${IPV6_SUBNET}'
+export SERVER_HAS_NATIVE_IPV6=${SERVER_HAS_NATIVE_IPV6:-0}
 EOF
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
@@ -1984,7 +2492,7 @@ step1_update_and_optimize() {
     fi
 
     log "Updating package lists..."
-    apt update -y || die "apt update error."
+    apt_update_tolerant || die "apt update error."
 
     log "Unlocking dpkg..."
     if ! apt-get check &>/dev/null; then
@@ -2042,8 +2550,10 @@ _try_install_prebuilt_arm() {
         target_id="rpi-bookworm-armhf"
     elif [[ "$kernel" == *-generic* && "${OS_VERSION:-}" == "24.04" ]]; then
         target_id="ubuntu-2404-arm64"
-    elif [[ "$kernel" == *-generic* && "${OS_VERSION:-}" == "22.04" ]]; then
-        target_id="ubuntu-2204-arm64"
+    elif [[ "$kernel" == *-generic* && "${OS_VERSION:-}" == "25.10" ]]; then
+        target_id="ubuntu-2510-arm64"
+    elif [[ "$kernel" == *-arm64* && "${OS_ID:-}" == "debian" && "${OS_VERSION:-}" == "13" ]]; then
+        target_id="debian-trixie-arm64"
     elif [[ "$kernel" == *-arm64* && "${OS_ID:-}" == "debian" ]]; then
         target_id="debian-bookworm-arm64"
     else
@@ -2102,41 +2612,29 @@ _try_install_prebuilt_arm() {
 
 step2_install_amnezia() {
     update_state 2
+
+    # Guard: make sure the user actually rebooted before step 2.
+    # If boot_id matches the one saved in request_reboot 2 — the reboot
+    # did not happen (e.g. user re-ran the script by mistake). Step 1's
+    # apt full-upgrade staged a new kernel on disk, but the running
+    # kernel is still the old one → DKMS would build the module against
+    # the old kernel and modprobe would fail after the next reboot.
+    local boot_id_file="$AWG_DIR/.boot_id_before_step2"
+    if [[ -f "$boot_id_file" ]] && [[ -r /proc/sys/kernel/random/boot_id ]]; then
+        local saved_boot_id current_boot_id
+        saved_boot_id=$(< "$boot_id_file")
+        current_boot_id=$(< /proc/sys/kernel/random/boot_id)
+        if [[ -n "$saved_boot_id" ]] && [[ "$saved_boot_id" == "$current_boot_id" ]]; then
+            die "Reboot expected before step 2 (kernel upgrade is only activated after reboot). Run: sudo reboot — then re-run the script."
+        fi
+        log "Reboot confirmed (boot_id changed) — continuing with step 2"
+        rm -f "$boot_id_file" 2>/dev/null || true
+    fi
+
     log "### STEP 2: Installing AmneziaWG and dependencies ###"
     _APT_UPDATED=0  # Reset: new sources will be added in this step
 
-    # Enabling deb-src (Ubuntu only — Ubuntu uses ubuntu.sources)
-    local sources_file="/etc/apt/sources.list.d/ubuntu.sources"
-    if [[ "${OS_ID:-ubuntu}" == "ubuntu" ]]; then
-        log "Checking/enabling deb-src..."
-        if [[ -f "$sources_file" ]]; then
-            if grep -q "^Types: deb$" "$sources_file"; then
-                log "Enabling deb-src..."
-                local bak
-                bak="${AWG_DIR}/ubuntu.sources.bak-$(date +%F_%H%M%S)"
-                cp "$sources_file" "$bak" || log_warn "Backup error"
-                local tmp_sed
-                tmp_sed=$(mktemp)
-                _install_temp_files+=("$tmp_sed")
-                sed '/^Types: deb$/s/Types: deb/Types: deb deb-src/' "$sources_file" > "$tmp_sed" || {
-                    rm -f "$tmp_sed"; die "sed error."
-                }
-                if ! mv "$tmp_sed" "$sources_file"; then
-                    rm -f "$tmp_sed"; die "mv $sources_file error"
-                fi
-                apt update -y || die "apt update error."
-            else
-                apt update -y
-            fi
-        else
-            log_warn "$sources_file not found, skipping deb-src."
-            apt update -y
-        fi
-    else
-        # Debian: deb-src is usually already configured or not needed
-        log "Debian: skipping deb-src configuration."
-        apt update -y
-    fi
+    apt_update_tolerant || die "apt update error."
 
     # PPA Amnezia (without software-properties-common)
     log "Adding Amnezia PPA..."
@@ -2157,6 +2655,29 @@ step2_install_amnezia() {
             ;;
         *)
             ppa_codename="$codename"
+            # For Ubuntu non-LTS (questing/plucky/oracular/...) Amnezia PPA does
+            # not publish packages — dists/<codename>/Release returns 404.
+            # Pre-check via HEAD and fall back to noble (LTS): the noble build
+            # gets DKMS-compiled against the running kernel.
+            # Upstream: amnezia-vpn/amneziawg-linux-kernel-module#118
+            case "$ppa_codename" in
+                noble|jammy|focal)
+                    # Known LTS — skip pre-check (PPA is reliably published)
+                    ;;
+                *)
+                    log "Checking Amnezia PPA availability for Ubuntu '${ppa_codename}'..."
+                    if ! curl -fsI --max-time 15 --retry 2 --retry-delay 5 \
+                        "https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu/dists/${ppa_codename}/Release" \
+                        >/dev/null 2>&1; then
+                        log_warn "Amnezia PPA does not publish packages for Ubuntu '${ppa_codename}' (HTTP 404 or host unreachable)."
+                        log_warn "Falling back to 'noble' — DKMS will build the module against the running kernel."
+                        log_warn "Context: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/issues/118"
+                        ppa_codename="noble"
+                    else
+                        log "Amnezia PPA is available for '${ppa_codename}'."
+                    fi
+                    ;;
+            esac
             ;;
     esac
 
@@ -2167,6 +2688,34 @@ step2_install_amnezia() {
     # Check for legacy files (from add-apt-repository of previous versions)
     local legacy_list="/etc/apt/sources.list.d/amnezia-ubuntu-ppa-${codename}.list"
     local legacy_sources="/etc/apt/sources.list.d/amnezia-ubuntu-ppa-${codename}.sources"
+    # Re-run on a server where a previous run (≤ v5.12.1) wrote a broken
+    # .sources file with Suites=questing/plucky/etc.: if the existing suite
+    # doesn't match the target ppa_codename, remove the file so it gets
+    # recreated below with the correct suite. Same check for legacy
+    # .sources (add-apt-repository format).
+    # If the file exists but `Suites:` can't be parsed — treat as corrupt
+    # and recreate, otherwise the broken file would slip through as
+    # "PPA already added".
+    local existing_suite=""
+    if [[ -f "$ppa_sources" ]]; then
+        existing_suite=$(awk '/^Suites:/{print $2; exit}' "$ppa_sources" 2>/dev/null)
+    fi
+    if [[ -f "$ppa_sources" && ( -z "$existing_suite" || "$existing_suite" != "$ppa_codename" ) ]]; then
+        if [[ -z "$existing_suite" ]]; then
+            log_warn "$ppa_sources exists but no Suites: line found — recreating."
+        else
+            log_warn "Existing PPA suite='${existing_suite}', target='${ppa_codename}' — recreating $ppa_sources."
+        fi
+        rm -f "$ppa_sources" "$ppa_list"
+    fi
+    local legacy_suite=""
+    if [[ -f "$legacy_sources" ]]; then
+        legacy_suite=$(awk '/^Suites:/{print $2; exit}' "$legacy_sources" 2>/dev/null)
+    fi
+    if [[ -f "$legacy_sources" && ( -z "$legacy_suite" || "$legacy_suite" != "$ppa_codename" ) ]]; then
+        log_warn "Legacy PPA $legacy_sources (suite='${legacy_suite:-<empty>}') does not match target '${ppa_codename}' — removing."
+        rm -f "$legacy_sources" "$legacy_list"
+    fi
     if [[ -f "$legacy_list" ]] || [[ -f "$legacy_sources" ]]; then
         log "PPA already added (legacy format)."
     elif [[ -f "$ppa_sources" ]] || [[ -f "$ppa_list" ]]; then
@@ -2174,10 +2723,23 @@ step2_install_amnezia() {
     else
         mkdir -p "$keyring_dir"
         log "Importing Amnezia PPA GPG key..."
-        curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" \
-            | gpg --dearmor -o "$keyring_file" \
-            || die "Amnezia PPA GPG key import error."
-        chmod 644 "$keyring_file"
+        # Atomic: pipe into temp, then mv — a half-written keyring never
+        # lives on the target path, even if curl/gpg die mid-way.
+        local _kf_tmp
+        _kf_tmp=$(mktemp -p "$keyring_dir" ".amnezia-ppa.gpg.tmp.XXXXXX") \
+            || die "Failed to create temp file for GPG key."
+        # --batch --no-tty --yes: gpg must not open /dev/tty (non-interactive
+        # SSH, cloud-init, Ansible, etc.) and must not abort with "File exists"
+        # when overwriting the mktemp-created tmp file. Without --yes gpg in
+        # batch mode refuses to write into the pre-existing empty tmp file.
+        if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" \
+             | gpg --batch --no-tty --yes --dearmor -o "$_kf_tmp"; then
+            rm -f "$_kf_tmp" 2>/dev/null
+            die "Amnezia PPA GPG key import error."
+        fi
+        chmod 644 "$_kf_tmp" || { rm -f "$_kf_tmp" 2>/dev/null; die "chmod GPG key error."; }
+        mv -f "$_kf_tmp" "$keyring_file" \
+            || { rm -f "$_kf_tmp" 2>/dev/null; die "Failed to move GPG key to target path."; }
 
         # Debian 12 uses traditional .list format, Debian 13+ and Ubuntu 24.04+ use DEB822 .sources
         if [[ "${OS_ID:-ubuntu}" == "debian" && "${OS_VERSION}" == "12" ]]; then
@@ -2197,7 +2759,32 @@ PPASRC
         fi
         log "PPA added."
     fi
-    apt update -y || die "apt update error."
+    # apt-get update + error classification:
+    #   - Errors only on the Amnezia PPA → continue, apt_wait_for_ppa_package
+    #     below will retry (issue #68: ppa.launchpadcontent.net briefly down).
+    #   - Any other non-source error (DNS / GPG mismatch / dpkg lock on the
+    #     base mirror) → fail fast. Continuing on a stale apt-cache is unsafe —
+    #     the next apt-get install would fail with a less actionable error
+    #     (PR #69 review finding).
+    if ! apt_update_tolerant --ppa-amnezia-tolerant; then
+        log_error "apt-get update failed with a hard error — not a PPA outage (issue #68)."
+        log_error "Check: DNS, access to archive.ubuntu.com / deb.debian.org,"
+        log_error "integrity of keys in /etc/apt/keyrings, dpkg lock contention."
+        die "apt update returned an error (rc!=0, not the Amnezia PPA)."
+    fi
+    # apt-get update is tolerant to an unreachable InRelease (rc=0 even when
+    # the PPA is down). So we check that amneziawg-dkms actually appears in
+    # apt-cache, with three attempts and 30s/60s backoff (~1.5 min total).
+    # A brief ppa.launchpadcontent.net outage (issue #68) must not break
+    # the install.
+    if ! apt_wait_for_ppa_package amneziawg-dkms 3 30; then
+        log_error "Package amneziawg-dkms did not appear in apt-cache after 3 attempts."
+        log_error "ppa.launchpadcontent.net appears to be down — this is a"
+        log_error "Launchpad infrastructure outage, not a script bug."
+        log_error "Wait 10–15 minutes and re-run the script with the same args."
+        log_error "Details: https://github.com/bivlked/amneziawg-installer/issues/68"
+        die "Amnezia PPA is temporarily unavailable."
+    fi
 
     # AmneziaWG + qrencode packages (NO Python!)
     log "Installing AmneziaWG packages..."
@@ -2249,7 +2836,326 @@ PPASRC
             packages+=("linux-headers-generic")
         fi
     fi
+    # v5.13.0: on 25.10/26.04 after an in-place upgrade from 24.04, the
+    # system may still carry kernel headers from 24.04 (6.8.x) compiled with
+    # gcc-13. 25.10 ships gcc-15 by default → dkms autoinstall in the
+    # amneziawg-dkms postinst fails when building against stale kernels, and
+    # dpkg leaves amneziawg* unconfigured. If we detect kernel headers other
+    # than the running one, install gcc-13 ahead of time (available in
+    # questing/universe and 26.04 archive) so autoinstall succeeds for every
+    # kernel.
+    local _running_kernel _has_stale=0 _hd _hd_kern
+    _running_kernel="$(uname -r)"
+    for _hd in /lib/modules/*/build; do
+        [[ -e "$_hd" ]] || continue
+        _hd_kern="${_hd#/lib/modules/}"
+        _hd_kern="${_hd_kern%/build}"
+        if [[ "$_hd_kern" != "$_running_kernel" ]]; then
+            _has_stale=1
+            break
+        fi
+    done
+    if [[ "$_has_stale" -eq 1 ]] && ! command -v gcc-13 >/dev/null 2>&1; then
+        if apt-cache madison gcc-13 2>/dev/null | grep -q .; then
+            log "Stale kernel headers detected (other than $_running_kernel) — installing gcc-13 for DKMS autoinstall compatibility."
+            DEBIAN_FRONTEND=noninteractive apt install -y gcc-13 \
+                || log_warn "gcc-13 install failed — DKMS autoinstall may fail on stale kernels."
+        else
+            log_warn "Stale kernel headers detected, but gcc-13 is not in the repo — DKMS autoinstall may fail."
+        fi
+    fi
     install_packages "${packages[@]}"
+
+    # v5.12.0: install a kernel-headers meta-package so apt automatically
+    # pulls matching headers on every kernel upgrade. Without the meta only
+    # linux-headers-$(uname -r) is installed, which does not track new
+    # kernels and the DKMS module fails to rebuild on the next apt upgrade.
+    #
+    # Detect kernel flavor (Ubuntu cloud images: aws/azure/gcp/oracle/kvm/
+    # lowlatency/raspi; Debian cloud-amd64) — a plain linux-headers-generic
+    # on an Azure VM does not track the right kernel pipeline. Take the
+    # uname -r suffix, try the flavor-specific meta first, fall back to
+    # generic / arch.
+    local arch_meta kernel_rel
+    arch_meta="$(dpkg --print-architecture 2>/dev/null || echo '')"
+    kernel_rel="$(uname -r)"
+    local -a meta_candidates=()
+    if [[ "$kernel_rel" == *+rpt* || "$kernel_rel" == *-rpi* ]]; then
+        : # RPi: linux-headers-rpi-{2712,v8} meta is already in packages above.
+    elif [[ "${OS_ID:-ubuntu}" == "ubuntu" ]]; then
+        # Ubuntu uname -r format: 6.8.0-49-generic / 6.8.0-1009-aws / ...
+        local flavor="${kernel_rel##*-}"
+        if [[ -n "$flavor" && "$flavor" != "$kernel_rel" ]]; then
+            meta_candidates+=("linux-headers-${flavor}")
+        fi
+        meta_candidates+=("linux-headers-generic")
+    elif [[ "${OS_ID:-}" == "debian" && -n "$arch_meta" ]]; then
+        # Debian: stock kernel 6.12.85+deb13-amd64, cloud — 6.12.85+deb13-cloud-amd64.
+        [[ "$kernel_rel" == *-cloud-* ]] \
+            && meta_candidates+=("linux-headers-cloud-${arch_meta}")
+        meta_candidates+=("linux-headers-${arch_meta}")
+    fi
+    local meta meta_installed=0
+    for meta in "${meta_candidates[@]}"; do
+        if dpkg-query -W -f='${Status}' "$meta" 2>/dev/null \
+                | grep -q 'install ok installed'; then
+            log "$meta is already installed (auto-tracking kernel upgrades)."
+            meta_installed=1
+            break
+        fi
+        log "Installing meta-package $meta..."
+        if DEBIAN_FRONTEND=noninteractive apt install -y "$meta" 2>/dev/null; then
+            log "$meta installed."
+            meta_installed=1
+            break
+        fi
+        log_warn "Failed to install $meta — trying next candidate."
+    done
+    if [[ ${#meta_candidates[@]} -gt 0 && $meta_installed -eq 0 ]]; then
+        log_warn "No kernel-headers meta-package installed — auto-rebuild on kernel upgrade may not work."
+    fi
+
+    # v5.12.0: deploy the standalone helper /usr/local/sbin/amneziawg-ensure-module.
+    # It is invoked from the apt hook (DPkg::Post-Invoke) and from the Phase 4
+    # systemd unit. The helper is self-contained — it does NOT source
+    # awg_common.sh — so it keeps working even if /root/awg/ is moved.
+    #
+    # Deploy uses a staging file in the SAME filesystem as the destination
+    # plus a final `mv -f` — guaranteeing atomic replacement (a cross-FS
+    # rename is copy+remove, NOT atomic). The staging file starts with a
+    # dot so apt and logrotate skip dotfiles when scanning the directory.
+    log "Deploying DKMS auto-repair helper..."
+    mkdir -p /usr/local/sbin
+    local _stage_helper=/usr/local/sbin/.amneziawg-ensure-module.new
+    cat > "$_stage_helper" <<'AWG_ENSURE_HELPER_EOF'
+#!/bin/bash
+# amneziawg-ensure-module — rebuilds the AmneziaWG DKMS module after a
+# kernel upgrade.
+#
+# Generated by install_amneziawg.sh (v5.12.0+). Do not edit; re-run the
+# installer to refresh.
+#
+# Modes:
+#   --hook     — invoked from /etc/apt/apt.conf.d/99-amneziawg-post-kernel
+#                (DPkg::Post-Invoke). Constraints:
+#                  - MUST NOT call apt-get install: the parent apt still
+#                    holds /var/lib/dpkg/lock-frontend, a nested install
+#                    would deadlock.
+#                  - Skips modprobe and systemctl: the running kernel may
+#                    still be the old one. The newly-built module is
+#                    loaded after reboot via the systemd unit, or via
+#                    `manage repair-module`.
+#                Stamp-file fast-path keeps routine apt ops noise-free.
+#
+#   --systemd  — invoked from amneziawg-ensure-module.service at boot,
+#                ordered Before=awg-quick@awg0.service. Builds for every
+#                target kernel (same as --hook), then loads the module
+#                via modprobe so awg-quick can start. No stamp fast-path
+#                — boot must always verify load state, even if /lib/modules
+#                hasn't changed since the last build (module not loaded
+#                across reboots). Exit 1 if modprobe fails so systemd
+#                marks the unit as failed (visible via systemctl status).
+#
+# Iteration target: every kernel that exposes /lib/modules/<ver>/build
+# (= a directory with installed headers). uname -r alone is insufficient
+# in apt-hook context because it returns the OLD running kernel while
+# the new kernel's headers are already on disk.
+#
+# Output: stdout / stderr; --hook appends to
+# /var/log/amneziawg-ensure-module.log (rotated weekly via
+# /etc/logrotate.d/amneziawg-ensure-module). --systemd writes to journal
+# (StandardOutput=journal, StandardError=journal in the unit file).
+
+set -euo pipefail
+
+MODE="${1:-}"
+case "$MODE" in
+    --hook|--systemd) ;;
+    --help|-h) echo "Usage: $0 --hook | --systemd"; exit 0 ;;
+    *) echo "amneziawg-ensure-module: missing or unknown mode (use --hook or --systemd)" >&2; exit 2 ;;
+esac
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log_line() { printf '[%s] [%s] %s\n' "$(ts)" "$MODE" "$*"; }
+
+if [[ $(id -u) -ne 0 ]]; then
+    log_line "ERROR: root privileges required" >&2
+    exit 1
+fi
+
+if ! command -v dkms >/dev/null 2>&1; then
+    log_line "WARN: dkms is not installed — nothing to do"
+    exit 0
+fi
+
+declare -a target_kernels=()
+shopt -s nullglob
+for build_dir in /lib/modules/*/build; do
+    [[ -d "$build_dir" || -L "$build_dir" ]] || continue
+    target_kernels+=("$(basename "$(dirname "$build_dir")")")
+done
+shopt -u nullglob
+
+if [[ ${#target_kernels[@]} -eq 0 ]]; then
+    log_line "WARN: no /lib/modules/*/build directories — kernel headers missing"
+    exit 0
+fi
+
+# Build per-run state signature (mtime + kver) used by both modes:
+#   --hook     — for stamp-file fast-path comparison (silent exit if equal)
+#   --systemd  — recorded after success so subsequent --hook calls can skip
+STAMP_DIR=/var/lib/amneziawg
+STAMP_FILE="${STAMP_DIR}/ensure-module.stamp"
+current_state=""
+for kver in "${target_kernels[@]}"; do
+    # stat may fail (build dir removed in flight) — guard against set -e abort.
+    # Empty mtime → comparison differs → we re-run dkms autoinstall (acceptable).
+    mtime="$(stat -c '%Y' "/lib/modules/${kver}/build" 2>/dev/null || true)"
+    current_state+="${mtime} ${kver} "
+done
+
+# Fast-path applies ONLY to --hook. Boot (--systemd) must always run the
+# full path — module is not loaded across reboots even when /lib/modules
+# state is unchanged.
+if [[ "$MODE" == "--hook" ]] \
+        && [[ -f "$STAMP_FILE" && "$(cat "$STAMP_FILE" 2>/dev/null)" == "$current_state" ]]; then
+    # Silent exit — routine apt ops don't add log noise.
+    exit 0
+fi
+
+# Strip the deprecated REMAKE_INITRD directive (triggers noisy warnings
+# on modern DKMS releases).
+for cfg in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
+    [[ -f "$cfg" ]] && sed -i '/^REMAKE_INITRD=/d' "$cfg" 2>/dev/null || true
+done
+
+build_rc=0
+for kver in "${target_kernels[@]}"; do
+    log_line "dkms autoinstall -k $kver"
+    if ! dkms autoinstall -k "$kver"; then
+        log_line "WARN: dkms autoinstall failed for kernel $kver" >&2
+        build_rc=1
+    fi
+done
+
+depmod -a 2>/dev/null || true
+
+# --systemd: load the module so awg-quick can start. Exit 1 on modprobe
+# failure — systemd marks the unit failed; visible via `systemctl status
+# amneziawg-ensure-module.service`. awg-quick still starts (Before= is
+# ordering only, not a dependency) and surfaces its own error if the
+# module is unavailable.
+if [[ "$MODE" == "--systemd" ]]; then
+    log_line "modprobe amneziawg"
+    if ! modprobe amneziawg 2>&1; then
+        log_line "ERROR: modprobe amneziawg failed for running kernel $(uname -r)" >&2
+        log_line "  Check: /var/lib/dkms/amneziawg/<ver>/<kernel>/log/make.log" >&2
+        exit 1
+    fi
+    if ! lsmod 2>/dev/null | grep -q '^amneziawg '; then
+        log_line "ERROR: amneziawg module not present in lsmod after modprobe" >&2
+        exit 1
+    fi
+    log_line "amneziawg module loaded for $(uname -r)"
+    # Update stamp on --systemd success (current kernel is usable, what matters
+    # for boot) even if some other kernel's build failed (build_rc=1).
+    mkdir -p "$STAMP_DIR" 2>/dev/null || true
+    printf '%s' "$current_state" > "$STAMP_FILE" 2>/dev/null || true
+    log_line "done"
+    exit 0
+fi
+
+# --hook: update stamp only on full success — partial failures retry next run.
+if [[ $build_rc -eq 0 ]]; then
+    mkdir -p "$STAMP_DIR" 2>/dev/null || true
+    printf '%s' "$current_state" > "$STAMP_FILE" 2>/dev/null || true
+fi
+
+log_line "done (rc=$build_rc)"
+exit "$build_rc"
+AWG_ENSURE_HELPER_EOF
+    chown root:root "$_stage_helper" 2>/dev/null || true
+    chmod 0755 "$_stage_helper" \
+        || { rm -f "$_stage_helper"; die "Failed to chmod helper."; }
+    mv -f "$_stage_helper" /usr/local/sbin/amneziawg-ensure-module \
+        || { rm -f "$_stage_helper"; die "Failed to deploy amneziawg-ensure-module helper."; }
+    log "Helper /usr/local/sbin/amneziawg-ensure-module deployed."
+
+    # v5.12.0: apt hook DPkg::Post-Invoke calls the helper after a kernel upgrade.
+    mkdir -p /etc/apt/apt.conf.d
+    local _stage_hook=/etc/apt/apt.conf.d/.99-amneziawg-post-kernel.new
+    cat > "$_stage_hook" <<'AWG_APT_HOOK_EOF'
+// amneziawg-installer (v5.12.0+): rebuild DKMS module after kernel upgrades.
+// Generated by install_amneziawg.sh — do not edit; re-run the installer to refresh.
+DPkg::Post-Invoke {"if [ -x /usr/local/sbin/amneziawg-ensure-module ]; then /usr/local/sbin/amneziawg-ensure-module --hook >>/var/log/amneziawg-ensure-module.log 2>&1 || true; fi";};
+AWG_APT_HOOK_EOF
+    chown root:root "$_stage_hook" 2>/dev/null || true
+    chmod 0644 "$_stage_hook" \
+        || { rm -f "$_stage_hook"; die "Failed to chmod apt hook."; }
+    mv -f "$_stage_hook" /etc/apt/apt.conf.d/99-amneziawg-post-kernel \
+        || { rm -f "$_stage_hook"; die "Failed to deploy apt hook."; }
+    log "Apt hook 99-amneziawg-post-kernel installed (auto-rebuild on apt kernel upgrade)."
+
+    # v5.12.0: logrotate config for /var/log/amneziawg-ensure-module.log
+    mkdir -p /etc/logrotate.d
+    local _stage_logrotate=/etc/logrotate.d/.amneziawg-ensure-module.new
+    cat > "$_stage_logrotate" <<'AWG_LOGROTATE_EOF'
+/var/log/amneziawg-ensure-module.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+AWG_LOGROTATE_EOF
+    chown root:root "$_stage_logrotate" 2>/dev/null || true
+    chmod 0644 "$_stage_logrotate" \
+        || { rm -f "$_stage_logrotate"; die "Failed to chmod logrotate config."; }
+    mv -f "$_stage_logrotate" /etc/logrotate.d/amneziawg-ensure-module \
+        || { rm -f "$_stage_logrotate"; die "Failed to deploy logrotate config."; }
+    log "Logrotate config /etc/logrotate.d/amneziawg-ensure-module installed (weekly, rotate 4)."
+
+    # v5.12.0 Phase 4: systemd unit guarantees the kernel module is built
+    # and loaded BEFORE awg-quick@awg0 starts on every boot. Type=oneshot +
+    # RemainAfterExit=yes + Before=awg-quick@awg0.service — the standard
+    # pre-load pattern (after a kernel upgrade DKMS may need to rebuild on
+    # the very first boot of the new kernel).
+    log "Deploying systemd unit amneziawg-ensure-module.service..."
+    mkdir -p /etc/systemd/system
+    local _stage_unit=/etc/systemd/system/.amneziawg-ensure-module.service.new
+    cat > "$_stage_unit" <<'AWG_SYSTEMD_UNIT_EOF'
+[Unit]
+Description=Ensure amneziawg kernel module is built and loaded
+Documentation=https://github.com/bivlked/amneziawg-installer
+Before=awg-quick@awg0.service
+After=systemd-modules-load.service local-fs.target
+ConditionPathExists=/usr/local/sbin/amneziawg-ensure-module
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/amneziawg-ensure-module --systemd
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+AWG_SYSTEMD_UNIT_EOF
+    chown root:root "$_stage_unit" 2>/dev/null || true
+    chmod 0644 "$_stage_unit" \
+        || { rm -f "$_stage_unit"; die "Failed to chmod systemd unit."; }
+    mv -f "$_stage_unit" /etc/systemd/system/amneziawg-ensure-module.service \
+        || { rm -f "$_stage_unit"; die "Failed to deploy systemd unit."; }
+    if ! systemctl daemon-reload; then
+        log_warn "systemctl daemon-reload failed — the unit may not activate until reboot."
+    fi
+    if ! systemctl enable amneziawg-ensure-module.service; then
+        log_warn "Failed to enable amneziawg-ensure-module.service — boot-time auto-rebuild will not run."
+    fi
+    log "Systemd unit amneziawg-ensure-module.service installed and enabled (Before=awg-quick@awg0)."
 
     # DKMS status
     log "Checking DKMS status..."
@@ -2366,6 +3272,39 @@ verify_sha256() {
     return 0
 }
 
+# _secure_download <url> <target> <expected_sha256> <label>
+# Atomic download:
+#   1. curl → mktemp on the same FS as target;
+#   2. verify_sha256 on the temp file (not on target, so a corrupt file
+#      never lives on the target path even for a fraction of a second);
+#   3. chmod 700 on temp;
+#   4. mv -f temp → target (atomic rename).
+# If any step fails, temp is removed and target is untouched.
+_secure_download() {
+    local url="$1" target="$2" expected_sha256="$3" label="$4"
+    local tmp target_dir
+    target_dir=$(dirname "$target")
+    tmp=$(mktemp -p "$target_dir" ".${label//\//_}.tmp.XXXXXX") \
+        || die "Failed to create temp file for $label"
+    if ! curl -fLso "$tmp" --max-time 60 --retry 2 "$url"; then
+        rm -f "$tmp" 2>/dev/null
+        die "$label download error"
+    fi
+    if ! verify_sha256 "$tmp" "$expected_sha256" "$label"; then
+        rm -f "$tmp" 2>/dev/null
+        die "$label integrity check failed (SHA256 mismatch). Installation aborted."
+    fi
+    if ! chmod 700 "$tmp"; then
+        rm -f "$tmp" 2>/dev/null
+        die "chmod $label error"
+    fi
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp" 2>/dev/null
+        die "Failed to move $label to target path"
+    fi
+    log "$label downloaded and verified."
+}
+
 step5_download_scripts() {
     update_state 5
     log "### STEP 5: Installing management scripts ###"
@@ -2408,27 +3347,14 @@ step5_download_scripts() {
     fi
     log_debug "No local clone detected (INSTALLER_DIR='${script_dir}', AWG_DIR='$AWG_DIR') — fetching from CDN."
 
-    # Fallback: download from CDN (upstream release)
+    # Fallback: download from CDN via _secure_download (mktemp + SHA256 + atomic mv)
     log "Downloading $COMMON_SCRIPT_PATH..."
-    if curl -fLso "$COMMON_SCRIPT_PATH" --max-time 60 --retry 2 "$COMMON_SCRIPT_URL"; then
-        chmod 700 "$COMMON_SCRIPT_PATH" || die "chmod awg_common.sh error"
-        verify_sha256 "$COMMON_SCRIPT_PATH" "$COMMON_SCRIPT_SHA256" "awg_common.sh" || \
-            die "awg_common.sh integrity check failed (SHA256 mismatch). Installation aborted."
-        log "awg_common.sh downloaded and verified."
-    else
-        die "awg_common.sh download error"
-    fi
+    _secure_download "$COMMON_SCRIPT_URL" "$COMMON_SCRIPT_PATH" \
+        "$COMMON_SCRIPT_SHA256" "awg_common.sh"
 
-    # Downloading manage_amneziawg.sh
     log "Downloading $MANAGE_SCRIPT_PATH..."
-    if curl -fLso "$MANAGE_SCRIPT_PATH" --max-time 60 --retry 2 "$MANAGE_SCRIPT_URL"; then
-        chmod 700 "$MANAGE_SCRIPT_PATH" || die "chmod manage_amneziawg.sh error"
-        verify_sha256 "$MANAGE_SCRIPT_PATH" "$MANAGE_SCRIPT_SHA256" "manage_amneziawg.sh" || \
-            die "manage_amneziawg.sh integrity check failed (SHA256 mismatch). Installation aborted."
-        log "manage_amneziawg.sh downloaded and verified."
-    else
-        die "manage_amneziawg.sh download error"
-    fi
+    _secure_download "$MANAGE_SCRIPT_URL" "$MANAGE_SCRIPT_PATH" \
+        "$MANAGE_SCRIPT_SHA256" "manage_amneziawg.sh"
 
     log "Step 5 completed."
     update_state 6
@@ -2493,14 +3419,22 @@ step6_generate_configs() {
     log "Creating server config..."
     render_server_config || die "Server config creation error."
 
-    # Restore existing [Peer] blocks from backup (excluding defaults)
+    # Restore ALL existing [Peer] blocks from backup.
+    # C5: defaults my_phone/my_laptop used to be excluded here, but the
+    # generation loop below skips peers that already exist while the guard in
+    # generate_client refuses to recreate one whose artifacts exist - so a
+    # default client became an orphan (files present, no peer block, silent
+    # connectivity loss on --force reinstall). The previous awk also dropped
+    # every peer but the last: each new [Peer] overwrote the buffer without
+    # flushing the previous one. We now flush on every [Peer] and restore ALL
+    # blocks; the idempotent loop below does not recreate what was restored.
     if [[ -n "${s_bak:-}" && -f "$s_bak" ]]; then
         local restored_peers
         restored_peers=$(awk '
-            /^\[Peer\]/ { buf=$0"\n"; in_peer=1; skip=0; next }
-            in_peer && /^\[/ { if (!skip) printf "%s\n", buf; buf=""; in_peer=0; next }
-            in_peer { buf=buf $0"\n"; if ($0 ~ /^#_Name = (my_phone|my_laptop)$/) skip=1; next }
-            END { if (in_peer && !skip) printf "%s", buf }
+            /^\[Peer\]/ { if (in_peer) printf "%s", buf; buf=$0"\n"; in_peer=1; next }
+            in_peer && /^\[/ { printf "%s", buf; buf=""; in_peer=0; next }
+            in_peer { buf=buf $0"\n"; next }
+            END { if (in_peer) printf "%s", buf }
         ' "$s_bak")
         if [[ -n "$restored_peers" ]]; then
             printf '\n%s' "$restored_peers" >> "$SERVER_CONF_FILE"
@@ -2647,7 +3581,7 @@ step99_finish() {
 
     # Remove state file
     log "Removing installation state file..."
-    rm -f "$STATE_FILE" "${STATE_FILE}.lock" || log_warn "Failed to remove $STATE_FILE"
+    rm -f "$STATE_FILE" "${STATE_FILE}.lock" "$AWG_DIR/.boot_id_before_step2" || log_warn "Failed to remove $STATE_FILE"
     log "Installation fully completed. Log: $LOG_FILE"
     log "=============================================================================="
 }
@@ -2660,6 +3594,28 @@ if [[ "$HELP" -eq 1 ]]; then show_help; fi
 if [[ "$UNINSTALL" -eq 1 ]]; then step_uninstall; fi
 if [[ "$DIAGNOSTIC" -eq 1 ]]; then create_diagnostic_report; exit 0; fi
 if [[ "$VERBOSE" -eq 1 ]]; then set -x; fi
+
+# v5.13.0: idempotency guard — if AmneziaWG is already installed and
+# running, a re-run wastes ~20 minutes (Step 1 re-tunes sysctl/swap/BBR,
+# `apt-get upgrade` can pull a new kernel and force another reboot, Step 7
+# restarts awg-quick@awg0 — handshakes drop for a few seconds). Server
+# keys, peers and obfuscation parameters survive a re-run, but without
+# explicit opt-in this behaviour looks like a silent reinstall. Guarded by
+# an explicit flag.
+# AWG_FORCE_REINSTALL=1 in the environment is equivalent to --force.
+if [[ "${AWG_FORCE_REINSTALL:-0}" == "1" ]]; then
+    FORCE_REINSTALL=1
+fi
+if [[ "$FORCE_REINSTALL" -ne 1 ]] && [[ -f "$SERVER_CONF_FILE" ]] \
+   && systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
+    log_error "AmneziaWG is already installed and running."
+    log_error "To reinstall — pass --force (or AWG_FORCE_REINSTALL=1)."
+    log_error "WARNING: a reinstall will rerun Step 1 (sysctl/swap/BBR) and Step 7 (service restart);"
+    log_error "         obfuscation parameters (Jc/Jmin/Jmax/H1-H4/I1) survive."
+    log_error "To manage clients:  sudo bash $MANAGE_SCRIPT_PATH help"
+    log_error "To fully uninstall: sudo bash $0 --uninstall"
+    exit 0
+fi
 
 initialize_setup
 

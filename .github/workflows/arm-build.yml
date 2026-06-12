@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       module_version:
-        description: 'amneziawg-linux-kernel-module tag (leave blank for latest)'
+        description: 'Upstream module tag/branch. Blank = use scripts/arm-module-version.txt pin, then default-branch HEAD.'
         required: false
         default: ''
   push:
@@ -21,6 +21,7 @@ jobs:
   prepare-release:
     name: Ensure arm-packages release exists
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Create arm-packages release if missing
         env:
@@ -38,6 +39,7 @@ jobs:
     name: Build ${{ matrix.id }}
     needs: prepare-release
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     strategy:
       fail-fast: false
@@ -76,10 +78,10 @@ jobs:
             headers_pkg: linux-headers-generic
             arch: arm64
 
-          # Ubuntu 22.04 LTS — arm64
-          - id: ubuntu-2204-arm64
+          # Ubuntu 25.10 Questing — arm64 (latest non-LTS, kernel 6.17+)
+          - id: ubuntu-2510-arm64
             platform: linux/arm64
-            image: ubuntu:22.04
+            image: ubuntu:25.10
             extra_sources: ''
             headers_pkg: linux-headers-generic
             arch: arm64
@@ -92,11 +94,19 @@ jobs:
             headers_pkg: linux-headers-arm64
             arch: arm64
 
+          # Debian 13 Trixie — arm64 (current stable, kernel 6.12 LTS)
+          - id: debian-trixie-arm64
+            platform: linux/arm64
+            image: debian:trixie
+            extra_sources: ''
+            headers_pkg: linux-headers-arm64
+            arch: arm64
+
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
         with:
           platforms: ${{ matrix.platform }}
 
@@ -109,6 +119,9 @@ jobs:
           EXTRA_SOURCES: ${{ matrix.extra_sources }}
           HEADERS_PKG: ${{ matrix.headers_pkg }}
           MODULE_VERSION: ${{ inputs.module_version }}
+          # On a tag push this records the installer release in the build manifest;
+          # empty on workflow_dispatch.
+          INSTALLER_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         uses: addnab/docker-run-action@4f65fabd2431ebc8d299f8e5a018d79a769ae185 # v3
         with:
           image: ${{ matrix.image }}
@@ -121,6 +134,7 @@ jobs:
             -e HEADERS_PKG
             -e OUTPUT_DIR=/output
             -e MODULE_VERSION
+            -e INSTALLER_TAG
           run: |
             bash <<'CONTAINER_SCRIPT'
             set -euo pipefail
@@ -167,4 +181,9 @@ jobs:
             gh release upload arm-packages "${deb}.sha256" \
               --repo "${{ github.repository }}" \
               --clobber
+            if [[ -f "${deb}.manifest.json" ]]; then
+              gh release upload arm-packages "${deb}.manifest.json" \
+                --repo "${{ github.repository }}" \
+                --clobber
+            fi
           done
