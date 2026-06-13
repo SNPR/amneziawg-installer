@@ -1255,6 +1255,7 @@ EOF
 # AWG_SKIP_APPLY=1: skip apply (for batch automation)
 # AWG_APPLY_MODE=syncconf|restart: apply method (config or --apply-mode CLI)
 # flock on .awg_apply.lock: prevents concurrent apply calls
+# shellcheck disable=SC2120  # iface is an optional positional arg (multi-hop awg1)
 apply_config() {
     local iface="${1:-awg0}"
     # Skip apply (AWG_SKIP_APPLY=1 manage add/remove ...)
@@ -2960,7 +2961,7 @@ regenerate_client() {
     fi
 
     # AmneziaDNS mode forces a hard-coded client AllowedIPs "0.0.0.0/0, ::/0"
-    # (required by the Amnezia-Client split-tunnel UI gate — see
+    # (required by the Amnezia-Client per-site routing UI gate — see
     # render_client_config). A "preserved" old value from the previous .conf
     # would just re-lock the gate on the first regen/modify call. DNS is
     # similarly forced to the tunnel-gateway IP rather than 1.1.1.1.

@@ -43,7 +43,7 @@ fi
 # Проверяются в step5_download_scripts() после curl.
 # Если AWG_BRANCH переопределён (не v$SCRIPT_VERSION), проверка пропускается.
 # Формат: sha256sum output (hex, 64 chars).
-COMMON_SCRIPT_SHA256="58659b4af620dfa5b04d56b61667c94f7aa928ab01c9815f6735b82a44b34355"
+COMMON_SCRIPT_SHA256="00d12bfa5b35f3041970dab03c1124c6bd261e95743f7decf6f38b9a66dd2667"
 MANAGE_SCRIPT_SHA256="86d43e0d64b698ad8af681c87832fc3dd8d139bd0b76035632c0c4d99265a47f"
 
 # Флаги CLI

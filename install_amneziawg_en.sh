@@ -44,7 +44,7 @@ fi
 # Verified in step5_download_scripts() after curl.
 # Verification is skipped when AWG_BRANCH is overridden (test branch).
 # Format: sha256sum output (hex, 64 chars).
-COMMON_SCRIPT_SHA256="4e0bf6c5d80c8fbb67229af82949ee964364476a9c41cb5556a40671276035e5"
+COMMON_SCRIPT_SHA256="854fa5b33a5aa429f1969683c5d5f510ec06317be25aec05441b180985a931ab"
 MANAGE_SCRIPT_SHA256="98d4e0502290926ace179694a6d750ab1f7c67ce74f4eead59de49f1e48e0889"
 
 # CLI flags

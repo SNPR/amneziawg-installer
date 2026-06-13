@@ -1250,6 +1250,7 @@ EOF
 # AWG_SKIP_APPLY=1: пропустить apply (для batch-автоматизации)
 # AWG_APPLY_MODE=syncconf|restart: режим применения (конфиг или --apply-mode CLI)
 # flock на .awg_apply.lock: защита от параллельных вызовов
+# shellcheck disable=SC2120  # iface — опциональный позиционный аргумент (multi-hop awg1)
 apply_config() {
     local iface="${1:-awg0}"
     # Пропуск apply (AWG_SKIP_APPLY=1 manage add/remove ...)
@@ -2941,7 +2942,7 @@ regenerate_client() {
     fi
 
     # В режиме AmneziaDNS клиентский AllowedIPs жёстко фиксирован в
-    # "0.0.0.0/0, ::/0" (требование гейта Amnezia-Client split-tunnel UI —
+    # "0.0.0.0/0, ::/0" (требование UI-гейта раздельного туннелирования Amnezia —
     # см. render_client_config). «Сохранённое» старое значение из .conf
     # вернуло бы инсталл в сломанное состояние при первом же regen/modify.
     # Аналогично DNS: всегда tunnel-gateway IP, а не 1.1.1.1 из прошлого .conf.

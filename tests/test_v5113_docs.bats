@@ -68,42 +68,12 @@
 
 # ---------- Phase 5 ----------
 
-@test "Phase 5: README.md cheat sheet shows --psk example" {
-    run grep -F -- '--psk' "$BATS_TEST_DIRNAME/../README.md"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"my_iphone"* ]]
-}
-
-@test "Phase 5: README.en.md cheat sheet shows --psk example" {
-    run grep -F -- '--psk' "$BATS_TEST_DIRNAME/../README.en.md"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"my_iphone"* ]]
-}
-
-@test "Phase 5: README FAQ has Shadowrocket / PSK entry in both languages" {
-    run grep -F 'Shadowrocket' "$BATS_TEST_DIRNAME/../README.md"
-    [ "$status" -eq 0 ]
-    run grep -F 'Shadowrocket' "$BATS_TEST_DIRNAME/../README.en.md"
-    [ "$status" -eq 0 ]
-}
-
-@test "Phase 5: README.md --psk link points to ADVANCED.md#manage-cli-adv (RU stays RU)" {
-    # Strict per-language target — guards against cross-language link drift
-    # (e.g. someone accidentally pointing RU README at ADVANCED.en.md).
-    run grep -F 'ADVANCED.md#manage-cli-adv' "$BATS_TEST_DIRNAME/../README.md"
-    [ "$status" -eq 0 ]
-    # And the wrong target must NOT appear.
-    run grep -F 'ADVANCED.en.md#manage-cli-adv' "$BATS_TEST_DIRNAME/../README.md"
-    [ "$status" -ne 0 ]
-}
-
-@test "Phase 5: README.en.md --psk link points to ADVANCED.en.md#manage-cli-adv (EN stays EN)" {
-    run grep -F 'ADVANCED.en.md#manage-cli-adv' "$BATS_TEST_DIRNAME/../README.en.md"
-    [ "$status" -eq 0 ]
-    # The RU target must NOT appear in EN README.
-    run grep -F 'ADVANCED.md#manage-cli-adv' "$BATS_TEST_DIRNAME/../README.en.md"
-    [ "$status" -ne 0 ]
-}
+# NB (fork): the fork ships a concise, fork-specific README (cascade/WARP focus),
+# so upstream's Phase-5 README assertions (--psk cheat sheet with my_iphone,
+# Shadowrocket FAQ, README --psk → ADVANCED#manage-cli-adv link, and the README
+# <details> RU/EN parity) were removed here — they pinned upstream's marketing
+# README structure that this fork intentionally dropped. The ADVANCED-doc checks
+# below (anchor + <details> parity in ADVANCED) still apply unchanged.
 
 @test "Phase 5: anchor target manage-cli-adv exists in both ADVANCED files" {
     run grep -F '<a id="manage-cli-adv">' "$BATS_TEST_DIRNAME/../ADVANCED.md"
@@ -117,11 +87,5 @@
 @test "Cross: <details> count identical in ADVANCED RU vs EN" {
     ru=$(grep -c '^<details>' "$BATS_TEST_DIRNAME/../ADVANCED.md")
     en=$(grep -c '^<details>' "$BATS_TEST_DIRNAME/../ADVANCED.en.md")
-    [ "$ru" = "$en" ]
-}
-
-@test "Cross: <details> count identical in README RU vs EN" {
-    ru=$(grep -c '^<details>' "$BATS_TEST_DIRNAME/../README.md")
-    en=$(grep -c '^<details>' "$BATS_TEST_DIRNAME/../README.en.md")
     [ "$ru" = "$en" ]
 }

@@ -16,6 +16,7 @@
   <img src="https://img.shields.io/badge/Debian-12_|_13-A81D33" alt="Debian">
   <img src="https://img.shields.io/badge/Arch-x86__64_|_ARM64_|_ARMv7-green" alt="Arch">
   <img src="https://img.shields.io/badge/AmneziaWG-2.0-blueviolet" alt="AWG 2.0">
+  <img src="https://img.shields.io/badge/Installer_Version-5.15.6-blue" alt="Installer version">
   <img src="https://img.shields.io/badge/upstream-bivlked_5.15.6-blue" alt="Upstream baseline">
 </p>
 
@@ -155,7 +156,7 @@ sudo bash /root/awg/manage_amneziawg.sh repair-module    # rebuild the module af
 
 ## Requirements
 
-A VPS on Ubuntu 24.04 / 25.10 / 26.04 or Debian 12 / 13, x86_64 / ARM64 / ARMv7, ≥ 1 GB RAM, root access. A cascade needs two such VPS.
+OS support: Ubuntu 24.04 / 25.10 / 26.04, Debian 12 / Debian 13. Architectures x86_64 / ARM64 / ARMv7, ≥ 1 GB RAM, root access. A cascade needs two such VPS.
 
 ## License
 
