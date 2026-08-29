@@ -8,25 +8,31 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 installation and configuration script for Ubuntu/Debian servers
 # Author: @bivlked
-# Version: 5.15.6
-# Date: 2026-06-08
-# Repository: https://github.com/bivlked/amneziawg-installer
+# Version: 5.28.1
+# Date: 2026-08-27
+# Fork: https://github.com/SNPR/amneziawg-installer (upstream: bivlked)
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 set -o pipefail
-SCRIPT_VERSION="5.15.6"
+SCRIPT_VERSION="5.28.1"
 
 AWG_DIR="/root/awg"
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
 STATE_FILE="$AWG_DIR/setup_state"
+BOOT_CRITICAL_SNAPSHOT_FILE="$AWG_DIR/boot-critical.pkgs"
 LOG_FILE="$AWG_DIR/install_amneziawg.log"
 KEYS_DIR="$AWG_DIR/keys"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
-AWG_BRANCH="${AWG_BRANCH:-v${SCRIPT_VERSION}}"
-COMMON_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/${AWG_BRANCH}/awg_common_en.sh"
+AWG0_DEPENDENCY_DROPIN="/etc/systemd/system/awg-quick@awg0.service.d/10-awgchain-dependency.conf"
+AWG0_DEPENDENCY_MARKER="$AWG_DIR/.awg0_dependency_created_by_installer"
+PINNED_HELPERS_REPOSITORY="SNPR/amneziawg-installer"
+PINNED_HELPERS_REF="feat/v3"
+AWG_REPOSITORY="${AWG_REPOSITORY:-$PINNED_HELPERS_REPOSITORY}"
+AWG_BRANCH="${AWG_BRANCH:-$PINNED_HELPERS_REF}"
+COMMON_SCRIPT_URL="https://raw.githubusercontent.com/${AWG_REPOSITORY}/${AWG_BRANCH}/awg_common_en.sh"
 COMMON_SCRIPT_PATH="$AWG_DIR/awg_common.sh"
-MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/bivlked/amneziawg-installer/${AWG_BRANCH}/manage_amneziawg_en.sh"
+MANAGE_SCRIPT_URL="https://raw.githubusercontent.com/${AWG_REPOSITORY}/${AWG_BRANCH}/manage_amneziawg_en.sh"
 MANAGE_SCRIPT_PATH="$AWG_DIR/manage_amneziawg.sh"
 
 # Installer's own directory — captured BEFORE any cd happens. step5 uses it
@@ -42,39 +48,500 @@ fi
 
 # SHA256 checksums of downloaded scripts. Updated at each release.
 # Verified in step5_download_scripts() after curl.
-# Verification is skipped when AWG_BRANCH is overridden (test branch).
+# Verification is skipped when AWG_REPOSITORY/AWG_BRANCH is overridden; the
+# local pins cover only the published fork branch feat/v3.
 # Format: sha256sum output (hex, 64 chars).
-COMMON_SCRIPT_SHA256="854fa5b33a5aa429f1969683c5d5f510ec06317be25aec05441b180985a931ab"
-MANAGE_SCRIPT_SHA256="98d4e0502290926ace179694a6d750ab1f7c67ce74f4eead59de49f1e48e0889"
+COMMON_SCRIPT_SHA256="e896670ecdae5cb7eb70b41374918afa590da0d6c24b06496d217eb57c6763e9"
+MANAGE_SCRIPT_SHA256="a9d5d24746feb835ca9246cc6ed915606c594d5c46ba0e22e59acad93b7a1f74"
+
+# AmneziaWG 2.0 pin (H0, 31 jul 2026). Upstream merged AmneziaWG 3.0 into the
+# amneziawg-linux-kernel-module default branch, and the PPA switched to it. Back
+# then the PPA DKMS build failed on nla_put_uint on kernels older than 6.7
+# (Debian 12 = 6.1). Upstream fixed that the same evening on 31 jul
+# (v3.0.20260731-04; verified by us on Debian 12 / 6.1.0-51 on 1 aug), so the pin
+# went from FORCED to DELIBERATE: on older kernels we keep the module we have
+# tested until 3.0 is validated separately. AWG2_PIN_COMMIT is checked after clone
+# (integrity: more robust than a fragile tarball SHA - a tag can be moved, an
+# immutable commit cannot).
+AWG2_PIN_TAG="v1.0.20260725"
+AWG2_PIN_COMMIT="ae0924ca700520ca34c5bdbcfd05b2f683ea9353"
 
 # CLI flags
-UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0
+UNINSTALL=0; HELP=0; HELP_EXIT_RC=0; DIAGNOSTIC=0; VERBOSE=0; NO_COLOR=0; AUTO_YES=0; NO_TWEAKS=0; NO_CPS=0; KEEP_PACKAGES=""
 FORCE_REINSTALL=0
 _APT_UPDATED=0
-CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"; CLI_SSH_PORT=""
-CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0
+CLI_PORT=""; CLI_SUBNET=""; CLI_DISABLE_IPV6="default"; CLI_SSH_PORT=""; CLI_I1_MODE=""
+CLI_ROUTING_MODE="default"; CLI_CUSTOM_ROUTES=""; CLI_ENDPOINT=""; CLI_NO_TWEAKS=0; CLI_NO_CPS=0; CLI_KEEP_PACKAGES=0
 # Multi-hop / cascade: node role and upstream tunnel parameters (for role=entry)
 CLI_ROLE=""; CLI_UPSTREAM_CONF=""; CLI_UPSTREAM_IFACE=""
 CLI_UPSTREAM_TABLE=""; CLI_UPSTREAM_FWMARK=""
 # WARP egress: route client traffic through Cloudflare WARP (for role=exit|single)
-CLI_EGRESS=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""; CLI_WARP_BYPASS=""
+CLI_EGRESS=""; CLI_WARP_IFACE=""; CLI_WARP_TABLE=""; CLI_WARP_PRIORITY=""; CLI_WARP_BYPASS=""
 # AmneziaDNS: local dnsmasq on the tunnel gateway + "native" Amnezia vpn:// URI
 CLI_AMNEZIA_DNS=""
 # Optional dual-stack IPv6 inside the tunnel (upstream v5.15.0)
-CLI_ALLOW_IPV6_TUNNEL=0
+CLI_ALLOW_IPV6_TUNNEL="default"
+CLI_ISOLATION="default"
+CLI_SERVER_NAME=""
+CLI_MOBILE=0
 
 # --- Auto-cleanup of temporary files ---
 _install_temp_files=()
+_install_temp_dirs=()
 _install_cleaned=0
+_INSTALL_ROLLBACK_AWG0=0
+_INSTALL_ROLLBACK_SERVER_BACKUP=""
+_INSTALL_ROLLBACK_SERVER_EXISTED=0
+_INSTALL_ROLLBACK_AWG0_WAS_ACTIVE=0
+_INSTALL_ROLLBACK_AWG0_WAS_LINK=0
+_INSTALL_ROLLBACK_AWG0_WAS_ENABLED=0
+_INSTALL_ROLLBACK_DEP_ACTIVE=0
+_INSTALL_ROLLBACK_DEP_EXISTED=0
+_INSTALL_ROLLBACK_DEP_BACKUP=""
+_INSTALL_ROLLBACK_WARP_PARKED=0
+_INSTALL_ROLLBACK_UPSTREAM=0
+_INSTALL_ROLLBACK_UPSTREAM_TARGET=""
+_INSTALL_ROLLBACK_UPSTREAM_BACKUP=""
+_INSTALL_ROLLBACK_UPSTREAM_EXISTED=0
+_INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE=0
+_INSTALL_ROLLBACK_UPSTREAM_WAS_LINK=0
+_INSTALL_ROLLBACK_UPSTREAM_WAS_ENABLED=0
+_INSTALL_ROLLBACK_OLD_SUPPORT=0
+_INSTALL_ROLLBACK_OLD_SUPPORT_IFACE=""
+_INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ACTIVE=0
+_INSTALL_ROLLBACK_OLD_SUPPORT_WAS_LINK=0
+_INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ENABLED=0
+_INSTALL_ROLLBACK_UFW_MAIN_RULE=0
+_INSTALL_ROLLBACK_UFW_MAIN_IFACE=""
+_INSTALL_ROLLBACK_UFW_CASCADE_RULE=0
+_INSTALL_ROLLBACK_UFW_CASCADE_IFACE=""
+_INSTALL_UFW_MAIN_MARKER_RESOLVED=0
+_INSTALL_INITIAL_STEP=1
+declare -A _INSTALL_VALIDATED_WARP_ROUTES=()
+
+_install_restore_upstream_config() {
+    [[ "$_INSTALL_ROLLBACK_UPSTREAM" -eq 1 ]] || return 0
+    local target="$_INSTALL_ROLLBACK_UPSTREAM_TARGET" iface="" unit="" state="" iface_present=0 tmp=""
+    [[ "$target" =~ ^/etc/amnezia/amneziawg/([a-zA-Z][a-zA-Z0-9_-]{0,14})\.conf$ ]] || {
+        printf '[ERROR] Invalid upstream rollback target: %s\n' "$target" >&2
+        return 1
+    }
+    iface="${BASH_REMATCH[1]}"
+    [[ "$iface" != "awg0" ]] || {
+        printf '[ERROR] Refusing to use awg0 as an upstream rollback target.\n' >&2
+        return 1
+    }
+    unit="awg-quick@${iface}"
+    command -v ip >/dev/null 2>&1 || {
+        printf '[ERROR] ip is unavailable; live upstream state cannot be checked, so config was NOT overwritten.\n' >&2
+        return 1
+    }
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    command -v ip >/dev/null 2>&1 && ip link show dev "$iface" >/dev/null 2>&1 \
+        && iface_present=1
+    if [[ "$state" =~ ^(active|activating|deactivating|reloading)$ || "$iface_present" -eq 1 ]]; then
+        if [[ "$state" =~ ^(active|activating|deactivating|reloading)$ ]]; then
+            systemctl stop "$unit" >/dev/null 2>&1 || {
+                printf '[ERROR] Could not stop the new upstream %s; its live config was NOT overwritten. Backup: %s\n' \
+                    "$iface" "$_INSTALL_ROLLBACK_UPSTREAM_BACKUP" >&2
+                return 1
+            }
+        fi
+        iface_present=0
+        command -v ip >/dev/null 2>&1 && ip link show dev "$iface" >/dev/null 2>&1 \
+            && iface_present=1
+        if [[ "$iface_present" -eq 1 ]] \
+           && { [[ ! -f "$target" || -L "$target" ]] \
+                || ! timeout 15 awg-quick down "$target" >/dev/null 2>&1; }; then
+            printf '[ERROR] Could not bring down the new upstream %s; its live config was NOT overwritten. Backup: %s\n' \
+                "$iface" "$_INSTALL_ROLLBACK_UPSTREAM_BACKUP" >&2
+            return 1
+        fi
+        if command -v ip >/dev/null 2>&1 && ip link show dev "$iface" >/dev/null 2>&1; then
+            printf '[ERROR] New upstream %s is still live; its config was NOT overwritten.\n' "$iface" >&2
+            return 1
+        fi
+    elif [[ "$state" != "inactive" && "$state" != "failed" && "$state" != "unknown" ]]; then
+        printf '[ERROR] Could not determine upstream %s state; live config was NOT overwritten.\n' "$iface" >&2
+        return 1
+    fi
+
+    if [[ "$_INSTALL_ROLLBACK_UPSTREAM_EXISTED" -eq 1 ]]; then
+        [[ -f "$_INSTALL_ROLLBACK_UPSTREAM_BACKUP" && ! -L "$_INSTALL_ROLLBACK_UPSTREAM_BACKUP" ]] \
+            || { printf '[ERROR] Upstream rollback backup is missing: %s\n' "$_INSTALL_ROLLBACK_UPSTREAM_BACKUP" >&2; return 1; }
+        tmp=$(mktemp -p "$(dirname "$target")" '.upstream.rollback.XXXXXX' 2>/dev/null) || tmp=""
+        [[ -n "$tmp" ]] && cp -- "$_INSTALL_ROLLBACK_UPSTREAM_BACKUP" "$tmp" \
+            && chmod 600 "$tmp" && mv -f -- "$tmp" "$target" || {
+                rm -f -- "$tmp" 2>/dev/null || true
+                printf '[ERROR] Could not atomically restore upstream config from %s\n' \
+                    "$_INSTALL_ROLLBACK_UPSTREAM_BACKUP" >&2
+                return 1
+            }
+    else
+        rm -f -- "$target" || { printf '[ERROR] Could not remove new upstream config %s\n' "$target" >&2; return 1; }
+    fi
+
+    if [[ "$_INSTALL_ROLLBACK_UPSTREAM_WAS_ENABLED" -eq 1 ]]; then
+        systemctl enable "$unit" >/dev/null 2>&1 || return 1
+    else
+        systemctl disable "$unit" >/dev/null 2>&1 || return 1
+    fi
+    if [[ "$_INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE" -eq 1 ]]; then
+        systemctl start "$unit" >/dev/null 2>&1 || {
+            printf '[ERROR] Previous upstream %s was restored but did not start.\n' "$iface" >&2
+            return 1
+        }
+    elif [[ "$_INSTALL_ROLLBACK_UPSTREAM_WAS_LINK" -eq 1 ]]; then
+        timeout 15 awg-quick up "$target" >/dev/null 2>&1 || {
+            printf '[ERROR] Previous manually-raised upstream %s was restored on disk but did not come up.\n' "$iface" >&2
+            return 1
+        }
+    fi
+    _INSTALL_ROLLBACK_UPSTREAM=0
+    return 0
+}
+
+# During a role switch the previous installer-owned upstream must be stopped
+# before the new awg0 starts, otherwise its policy route keeps affecting the
+# new mode. Only exact runtime/autostart state is restored here; its config and
+# ownership marker are retained untouched until post-commit cleanup.
+_install_restore_stopped_old_support() {
+    [[ "$_INSTALL_ROLLBACK_OLD_SUPPORT" -eq 1 ]] || return 0
+    local iface="$_INSTALL_ROLLBACK_OLD_SUPPORT_IFACE"
+    local unit="awg-quick@${iface}" conf="/etc/amnezia/amneziawg/${iface}.conf"
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] || {
+        printf '[ERROR] Invalid previous-upstream iface during rollback: %s\n' "$iface" >&2
+        return 1
+    }
+    if [[ "$_INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ENABLED" -eq 1 ]]; then
+        systemctl enable "$unit" >/dev/null 2>&1 || return 1
+    else
+        systemctl disable "$unit" >/dev/null 2>&1 || return 1
+    fi
+    if [[ "$_INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ACTIVE" -eq 1 ]]; then
+        systemctl start "$unit" >/dev/null 2>&1 || {
+            printf '[ERROR] Could not restart the previous upstream %s.\n' "$iface" >&2
+            return 1
+        }
+    elif [[ "$_INSTALL_ROLLBACK_OLD_SUPPORT_WAS_LINK" -eq 1 ]]; then
+        [[ -f "$conf" && ! -L "$conf" ]] \
+            && timeout 15 awg-quick up "$conf" >/dev/null 2>&1 || {
+                printf '[ERROR] Could not restore manually started previous upstream %s.\n' "$iface" >&2
+                return 1
+            }
+    fi
+    _INSTALL_ROLLBACK_OLD_SUPPORT=0
+    return 0
+}
+
+_install_restore_awg0_dependency() {
+    [[ "$_INSTALL_ROLLBACK_DEP_ACTIVE" -eq 1 ]] || return 0
+    local target_dir="" tmp="" marker_tmp="" marker_value=""
+    target_dir=$(dirname "$AWG0_DEPENDENCY_DROPIN")
+    if [[ "$_INSTALL_ROLLBACK_DEP_EXISTED" -eq 1 ]]; then
+        [[ -f "$_INSTALL_ROLLBACK_DEP_BACKUP" && ! -L "$_INSTALL_ROLLBACK_DEP_BACKUP" ]] || return 1
+        mkdir -p "$target_dir" || return 1
+        tmp=$(mktemp -p "$target_dir" '.dependency.rollback.XXXXXX') || return 1
+        cp -p -- "$_INSTALL_ROLLBACK_DEP_BACKUP" "$tmp" \
+            && mv -f -- "$tmp" "$AWG0_DEPENDENCY_DROPIN" || { rm -f -- "$tmp"; return 1; }
+        marker_tmp=$(mktemp -p "$AWG_DIR" '.dependency-marker.rollback.XXXXXX') || return 1
+        printf '%s\n' "$AWG0_DEPENDENCY_DROPIN" > "$marker_tmp" \
+            && chmod 600 "$marker_tmp" \
+            && mv -f -- "$marker_tmp" "$AWG0_DEPENDENCY_MARKER" \
+            || { rm -f -- "$marker_tmp"; return 1; }
+    else
+        if [[ -e "$AWG0_DEPENDENCY_MARKER" || -L "$AWG0_DEPENDENCY_MARKER" ]]; then
+            [[ -f "$AWG0_DEPENDENCY_MARKER" && ! -L "$AWG0_DEPENDENCY_MARKER" ]] || return 1
+            IFS= read -r marker_value < "$AWG0_DEPENDENCY_MARKER" || marker_value=""
+            [[ "$marker_value" == "$AWG0_DEPENDENCY_DROPIN" ]] || return 1
+        fi
+        [[ ! -L "$AWG0_DEPENDENCY_DROPIN" ]] || return 1
+        rm -f -- "$AWG0_DEPENDENCY_DROPIN" "$AWG0_DEPENDENCY_MARKER" || return 1
+        rmdir "$target_dir" 2>/dev/null || true
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    _INSTALL_ROLLBACK_DEP_ACTIVE=0
+    return 0
+}
+
+_install_restore_ufw_main_rule() {
+    [[ "$_INSTALL_ROLLBACK_UFW_MAIN_RULE" -eq 1 ]] || return 0
+    local iface="$_INSTALL_ROLLBACK_UFW_MAIN_IFACE"
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$ ]] || return 1
+    command -v ufw >/dev/null 2>&1 || return 1
+    _inspect_exact_ufw_route "$iface" "AmneziaWG Routing" || return 1
+    if [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 1 && "$_INSTALL_UFW_ROUTE_OWNED_COUNT" -eq 1 ]]; then
+        _INSTALL_ROLLBACK_UFW_MAIN_RULE=0
+        return 0
+    fi
+    [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 0 ]] || return 1
+    ufw route allow in on awg0 out on "$iface" comment "AmneziaWG Routing" >/dev/null 2>&1 \
+        || return 1
+    _inspect_exact_ufw_route "$iface" "AmneziaWG Routing" \
+        && [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 1 \
+              && "$_INSTALL_UFW_ROUTE_OWNED_COUNT" -eq 1 ]] || return 1
+    _INSTALL_ROLLBACK_UFW_MAIN_RULE=0
+    return 0
+}
+
+# When the WARP interface name changes, old ownership is moved temporarily to
+# dedicated markers. This frees the regular names for the new iface without
+# losing ownership of the old resources. EXIT rollback restores a marker only
+# when a new resource has not occupied its regular name.
+_install_restore_parked_warp_ownership() {
+    local -a live_markers=(
+        "$AWG_DIR/.wgcf_enabled_by_installer"
+        "$AWG_DIR/.wgcf_config_created_by_installer"
+        "$AWG_DIR/.wgcf_config_managed_by_installer"
+    )
+    local -a parked_markers=(
+        "$AWG_DIR/.warp_cleanup_service_owner"
+        "$AWG_DIR/.warp_cleanup_created_config_owner"
+        "$AWG_DIR/.warp_cleanup_managed_config_owner"
+    )
+    local i live parked parked_value live_value failed=0
+    for i in "${!live_markers[@]}"; do
+        live="${live_markers[$i]}"
+        parked="${parked_markers[$i]}"
+        [[ -e "$parked" || -L "$parked" ]] || continue
+        if [[ ! -f "$parked" || -L "$parked" ]]; then
+            printf '[ERROR] Unsafe parked WARP ownership marker retained: %s\n' "$parked" >&2
+            failed=1
+            continue
+        fi
+        IFS= read -r parked_value < "$parked" || parked_value=""
+        if [[ ! -e "$live" && ! -L "$live" ]]; then
+            mv -f -- "$parked" "$live" 2>/dev/null \
+                || { printf '[ERROR] Could not restore WARP ownership marker %s\n' "$live" >&2; failed=1; }
+        elif [[ -f "$live" && ! -L "$live" ]]; then
+            IFS= read -r live_value < "$live" || live_value=""
+            if [[ "$live_value" == "$parked_value" ]]; then
+                rm -f -- "$parked" 2>/dev/null || failed=1
+            else
+                printf '[WARN] New WARP ownership already occupies %s; old ownership remains in %s\n' \
+                    "$live" "$parked" >&2
+                failed=1
+            fi
+        else
+            printf '[WARN] Cannot safely restore WARP ownership to %s; old marker remains in %s\n' \
+                "$live" "$parked" >&2
+            failed=1
+        fi
+    done
+    [[ "$failed" -eq 0 ]] && _INSTALL_ROLLBACK_WARP_PARKED=0
+    return "$failed"
+}
+
 _install_cleanup() {
     # Idempotent: on INT/TERM it is called from the signal handler, then again on
     # EXIT - the second call must be a no-op.
-    [[ "$_install_cleaned" -eq 1 ]] && return 0
+    [[ "$_install_cleaned" -eq 1 || "$_install_cleaned" -eq 2 ]] && return 0
     _install_cleaned=1
+    local rollback_attempted=0 rollback_can_restore=1 rollback_config_restored=0
+    local rollback_state="" rollback_iface_present=0 rollback_tmp="" rollback_state_tmp=""
+
+    # Arm the transaction for every target awg0.conf: an inactive previous
+    # config as well as a first install. If the new awg0 came up, always run
+    # its NEW PostDown before restoring/removing that file. Any uncertainty
+    # leaves the live config untouched.
+    if [[ "$_INSTALL_ROLLBACK_AWG0" -eq 1 ]]; then
+        rollback_attempted=1
+        if ! command -v ip >/dev/null 2>&1; then
+            rollback_can_restore=0
+            printf '[ERROR] ip is unavailable; live awg0 cannot be checked, so config was NOT overwritten.\n' >&2
+        fi
+        rollback_state=$(systemctl is-active awg-quick@awg0 2>/dev/null || true)
+        command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1 \
+            && rollback_iface_present=1
+        if [[ "$rollback_can_restore" -eq 1 \
+              && "$rollback_state" =~ ^(active|activating|deactivating|reloading)$ ]]; then
+            if ! systemctl stop awg-quick@awg0 >/dev/null 2>&1; then
+                rollback_can_restore=0
+                printf '[ERROR] Could not stop the new awg0; live config was NOT overwritten. Backup: %s\n' \
+                    "${_INSTALL_ROLLBACK_SERVER_BACKUP:-none (first install)}" >&2
+            fi
+        elif [[ "$rollback_can_restore" -eq 1 \
+                && "$rollback_state" != "inactive" && "$rollback_state" != "failed" \
+                && "$rollback_state" != "unknown" ]]; then
+            rollback_can_restore=0
+            printf '[ERROR] Could not determine awg0 state reliably (%s); live config was NOT overwritten. Backup: %s\n' \
+                "${rollback_state:-no response}" "${_INSTALL_ROLLBACK_SERVER_BACKUP:-none}" >&2
+        fi
+
+        # A failed/inactive unit may still have a live link. systemctl stop
+        # does not remove it, so run down against the still-NEW config before
+        # restoring or removing that file.
+        rollback_iface_present=0
+        command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1 \
+            && rollback_iface_present=1
+        if [[ "$rollback_can_restore" -eq 1 && "$rollback_iface_present" -eq 1 ]]; then
+            if [[ ! -f "$SERVER_CONF_FILE" || -L "$SERVER_CONF_FILE" ]] \
+                || ! timeout 15 awg-quick down "$SERVER_CONF_FILE" >/dev/null 2>&1; then
+                rollback_can_restore=0
+                printf '[ERROR] Live awg0 was not removed with the new config; config was NOT overwritten.\n' >&2
+            fi
+        fi
+        if [[ "$rollback_can_restore" -eq 1 ]] \
+            && command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1; then
+            rollback_can_restore=0
+            printf '[ERROR] awg0 remains live after stop/down; config was NOT overwritten.\n' >&2
+        fi
+
+        if [[ "$rollback_can_restore" -eq 1 && "$_INSTALL_ROLLBACK_SERVER_EXISTED" -eq 1 ]]; then
+            if [[ ! -f "$_INSTALL_ROLLBACK_SERVER_BACKUP" || -L "$_INSTALL_ROLLBACK_SERVER_BACKUP" ]]; then
+                rollback_can_restore=0
+                printf '[ERROR] Previous awg0.conf backup is missing; live config was NOT overwritten.\n' >&2
+            else
+                rollback_tmp=$(mktemp -p "$(dirname "$SERVER_CONF_FILE")" '.awg0.rollback.XXXXXX' 2>/dev/null) || rollback_tmp=""
+                if [[ -n "$rollback_tmp" ]] \
+                    && cp -- "$_INSTALL_ROLLBACK_SERVER_BACKUP" "$rollback_tmp" \
+                    && chmod 600 "$rollback_tmp" && mv -f -- "$rollback_tmp" "$SERVER_CONF_FILE"; then
+                    rollback_config_restored=1
+                else
+                    rm -f -- "$rollback_tmp" 2>/dev/null || true
+                    printf '[ERROR] Could not atomically restore the previous awg0.conf from %s\n' \
+                        "$_INSTALL_ROLLBACK_SERVER_BACKUP" >&2
+                fi
+            fi
+        elif [[ "$rollback_can_restore" -eq 1 ]]; then
+            if [[ -L "$SERVER_CONF_FILE" ]]; then
+                printf '[ERROR] Refusing to remove an unexpected symlink in place of the new awg0.conf.\n' >&2
+            elif rm -f -- "$SERVER_CONF_FILE"; then
+                rollback_config_restored=1
+            else
+                printf '[ERROR] Could not remove awg0.conf from the aborted first install.\n' >&2
+            fi
+        fi
+
+        if [[ "$rollback_config_restored" -eq 1 ]]; then
+            # Bypass owns concrete routes in the policy table. Restore its
+            # bundle/routes after the new awg0 is down, but before rolling the
+            # WARP support interface back.
+            if declare -F rollback_warp_bypass_state >/dev/null 2>&1; then
+                rollback_warp_bypass_state || rollback_can_restore=0
+            elif [[ "${_AWG_BYPASS_TX_ACTIVE:-0}" -eq 1 ]]; then
+                printf '[ERROR] WARP bypass rollback function is unavailable; transaction left pending.\n' >&2
+                rollback_can_restore=0
+            fi
+            _install_restore_awg0_dependency || rollback_can_restore=0
+            _install_restore_upstream_config || rollback_can_restore=0
+            if declare -F rollback_warp_egress_state >/dev/null 2>&1; then
+                rollback_warp_egress_state || rollback_can_restore=0
+            elif [[ "${_AWG_WARP_TX_ACTIVE:-0}" -eq 1 ]]; then
+                printf '[ERROR] WARP egress rollback function is unavailable; transaction left pending.\n' >&2
+                rollback_can_restore=0
+            fi
+            if [[ "$_INSTALL_ROLLBACK_WARP_PARKED" -eq 1 ]]; then
+                _install_restore_parked_warp_ownership || rollback_can_restore=0
+            fi
+            _install_restore_stopped_old_support || rollback_can_restore=0
+            _install_restore_ufw_main_rule || rollback_can_restore=0
+            _install_remove_new_ufw_cascade_rule || rollback_can_restore=0
+
+            if [[ "$_INSTALL_ROLLBACK_AWG0_WAS_ENABLED" -eq 1 ]]; then
+                systemctl enable awg-quick@awg0 >/dev/null 2>&1 || rollback_can_restore=0
+            else
+                systemctl disable awg-quick@awg0 >/dev/null 2>&1 || rollback_can_restore=0
+            fi
+            if [[ "$rollback_can_restore" -eq 1 && "$_INSTALL_ROLLBACK_AWG0_WAS_ACTIVE" -eq 1 ]]; then
+                systemctl start awg-quick@awg0 >/dev/null 2>&1 || {
+                    printf '[ERROR] Could not automatically restore the previous awg0. Backup: %s\n' \
+                        "$_INSTALL_ROLLBACK_SERVER_BACKUP" >&2
+                    rollback_can_restore=0
+                }
+            elif [[ "$rollback_can_restore" -eq 1 && "$_INSTALL_ROLLBACK_AWG0_WAS_LINK" -eq 1 ]]; then
+                [[ -f "$SERVER_CONF_FILE" && ! -L "$SERVER_CONF_FILE" ]] \
+                    && timeout 15 awg-quick up "$SERVER_CONF_FILE" >/dev/null 2>&1 || {
+                        printf '[ERROR] Could not restore the manually started previous awg0.\n' >&2
+                        rollback_can_restore=0
+                    }
+            fi
+            # Restore the old DNS resolver/service only after its previous
+            # tunnel gateway is back. On a first install this removes the new
+            # attempt's DNS after the new awg0 has been fully removed.
+            if [[ "$rollback_can_restore" -eq 1 ]] \
+               && declare -F rollback_amnezia_dns_state >/dev/null 2>&1; then
+                rollback_amnezia_dns_state || {
+                    printf '[ERROR] Could not fully restore the previous AmneziaDNS state.\n' >&2
+                    rollback_can_restore=0
+                }
+            elif [[ "$rollback_can_restore" -eq 1 \
+                    && ( "${_AWG_DNS_TX_ACTIVE:-0}" -eq 1 \
+                         || "${_AWG_DNS_TX_EXTERNAL:-0}" -eq 1 ) ]]; then
+                printf '[ERROR] AmneziaDNS rollback function is unavailable; transaction left pending.\n' >&2
+                rollback_can_restore=0
+            fi
+            if [[ "$rollback_can_restore" -eq 1 ]]; then
+                rollback_state_tmp=$(mktemp -p "$(dirname "$STATE_FILE")" '.setup-state.rollback.XXXXXX' 2>/dev/null) || rollback_state_tmp=""
+                [[ -n "$rollback_state_tmp" ]] && printf '6\n' > "$rollback_state_tmp" \
+                    && mv -f -- "$rollback_state_tmp" "$STATE_FILE" || {
+                        rm -f -- "$rollback_state_tmp" 2>/dev/null || true
+                        printf '[ERROR] Network was restored, but setup_state could not be reset to step 6.\n' >&2
+                        rollback_can_restore=0
+                    }
+            fi
+            [[ "$rollback_can_restore" -eq 1 ]] && _INSTALL_ROLLBACK_AWG0=0
+        fi
+    fi
+
+    # Standalone upstream rollback covers the narrow window before the server
+    # transaction is armed. With an armed server it runs only after awg0 was
+    # safely stopped and its config restored.
+    if [[ "$_INSTALL_ROLLBACK_UPSTREAM" -eq 1 && "$rollback_attempted" -eq 0 ]]; then
+        _install_restore_upstream_config || true
+    fi
+    if [[ "$_INSTALL_ROLLBACK_DEP_ACTIVE" -eq 1 && "$rollback_attempted" -eq 0 ]]; then
+        _install_restore_awg0_dependency || true
+    fi
+    if [[ "$_INSTALL_ROLLBACK_UFW_MAIN_RULE" -eq 1 && "$rollback_attempted" -eq 0 ]]; then
+        _install_restore_ufw_main_rule || true
+    fi
+    if [[ "$_INSTALL_ROLLBACK_UFW_CASCADE_RULE" -eq 1 && "$rollback_attempted" -eq 0 ]]; then
+        _install_remove_new_ufw_cascade_rule || true
+    fi
+    if [[ "${_AWG_BYPASS_TX_ACTIVE:-0}" -eq 1 && "$rollback_attempted" -eq 0 ]] \
+       && declare -F rollback_warp_bypass_state >/dev/null 2>&1; then
+        rollback_warp_bypass_state || true
+    fi
+    if [[ "${_AWG_WARP_TX_ACTIVE:-0}" -eq 1 && "$rollback_attempted" -eq 0 ]] \
+       && declare -F rollback_warp_egress_state >/dev/null 2>&1; then
+        rollback_warp_egress_state || true
+    fi
+    if [[ ( "${_AWG_DNS_TX_ACTIVE:-0}" -eq 1 || "${_AWG_DNS_TX_EXTERNAL:-0}" -eq 1 ) \
+          && "$rollback_attempted" -eq 0 ]] \
+       && declare -F rollback_amnezia_dns_state >/dev/null 2>&1; then
+        rollback_amnezia_dns_state || true
+    elif [[ "${_AWG_DNS_TX_ACTIVE:-0}" -eq 0 && "${_AWG_DNS_TX_EXTERNAL:-0}" -eq 1 ]] \
+         && declare -F rollback_amnezia_dns_state >/dev/null 2>&1; then
+        # Snapshot intent without mutations is always safe to disarm.
+        rollback_amnezia_dns_state || true
+    fi
+    if [[ "$_INSTALL_ROLLBACK_WARP_PARKED" -eq 1 ]]; then
+        _install_restore_parked_warp_ownership || true
+    fi
+    # Preserve snapshots/backups while rollback is incomplete: the signal
+    # handler lets EXIT retry, and a normal fatal exit retains evidence for a
+    # subsequent installer run or manual recovery.
+    if [[ "$_INSTALL_ROLLBACK_AWG0" -eq 1 || "$_INSTALL_ROLLBACK_UPSTREAM" -eq 1 \
+          || "$_INSTALL_ROLLBACK_DEP_ACTIVE" -eq 1 || "$_INSTALL_ROLLBACK_OLD_SUPPORT" -eq 1 \
+          || "$_INSTALL_ROLLBACK_UFW_MAIN_RULE" -eq 1 \
+          || "$_INSTALL_ROLLBACK_UFW_CASCADE_RULE" -eq 1 \
+          || "$_INSTALL_ROLLBACK_WARP_PARKED" -eq 1 \
+          || "${_AWG_BYPASS_TX_ACTIVE:-0}" -eq 1 \
+          || "${_AWG_WARP_TX_ACTIVE:-0}" -eq 1 \
+          || "${_AWG_DNS_TX_ACTIVE:-0}" -eq 1 \
+          || "${_AWG_DNS_TX_EXTERNAL:-0}" -eq 1 ]]; then
+        _install_cleaned=0
+        printf '[WARN] Rollback is incomplete; snapshots were retained for retry.\n' >&2
+        return 0
+    fi
     local f
     for f in "${_install_temp_files[@]}"; do [[ -f "$f" ]] && rm -f "$f"; done
+    local d
+    for d in "${_install_temp_dirs[@]}"; do [[ -d "$d" ]] && rmdir "$d" 2>/dev/null || true; done
     # Clean up temporary files from awg_common.sh (if already sourced)
     type _awg_cleanup &>/dev/null && _awg_cleanup
+    _install_cleaned=2
 }
 # On INT/TERM the cleanup used to run but the script did NOT exit - execution
 # continued past the interrupted command (dangerous mid apt/dpkg/config edits)
@@ -101,12 +568,18 @@ while [[ $# -gt 0 ]]; do
         --allow-ipv6)        CLI_DISABLE_IPV6=0 ;;
         --disallow-ipv6)     CLI_DISABLE_IPV6=1 ;;
         --allow-ipv6-tunnel) CLI_ALLOW_IPV6_TUNNEL=1 ;;
+        --disallow-ipv6-tunnel) CLI_ALLOW_IPV6_TUNNEL=0 ;;
         --route-all)     CLI_ROUTING_MODE=1 ;;
         --route-amnezia) CLI_ROUTING_MODE=2 ;;
         --route-custom=*) CLI_ROUTING_MODE=3; CLI_CUSTOM_ROUTES="${1#*=}" ;;
+        --isolation=*)   CLI_ISOLATION="${1#*=}" ;;
         --endpoint=*)    CLI_ENDPOINT="${1#*=}" ;;
+        --server-name=*) CLI_SERVER_NAME="${1#*=}" ;;
+        --mobile)        CLI_MOBILE=1 ;;
         --yes|-y)        AUTO_YES=1 ;;
         --no-tweaks)     NO_TWEAKS=1; CLI_NO_TWEAKS=1 ;;
+        --no-cps)        NO_CPS=1; CLI_NO_CPS=1 ;;
+        --keep-packages) KEEP_PACKAGES=1; CLI_KEEP_PACKAGES=1 ;;
         --force|-f)      FORCE_REINSTALL=1 ;;
         --preset=*)      CLI_PRESET="${1#*=}" ;;
         --jc=*)          CLI_JC="${1#*=}" ;;
@@ -119,6 +592,7 @@ while [[ $# -gt 0 ]]; do
         --upstream-table=*)   CLI_UPSTREAM_TABLE="${1#*=}" ;;
         --upstream-fwmark=*)  CLI_UPSTREAM_FWMARK="${1#*=}" ;;
         --egress=*)           CLI_EGRESS="${1#*=}" ;;
+        --warp-iface=*)       CLI_WARP_IFACE="${1#*=}" ;;
         --warp-table=*)       CLI_WARP_TABLE="${1#*=}" ;;
         --warp-priority=*)    CLI_WARP_PRIORITY="${1#*=}" ;;
         --warp-bypass=*)      CLI_WARP_BYPASS="${1#*=}" ;;
@@ -204,10 +678,16 @@ apt_update_tolerant() {
     # Filter error lines. Ignore:
     #   1. Lines about source packages (deb-src / /source/ / Sources)
     #   2. Generic 'Some index files failed to download' — symptom, not cause
+    # Additionally exclude known informational W: lines that are never the
+    # CAUSE of rc!=0 but used to survive the filters and turn a tolerable
+    # failure (e.g. deb-src 404 with duplicated sources) into a false fatal:
+    #   - "Target ... is configured multiple times" (duplicate sources entries)
+    #   - "... stored in legacy trusted.gpg keyring" (old key format)
     non_src_errors=$(printf '%s\n' "$err_output" \
         | grep -E '^(E:|Err:|W:)' \
         | grep -vE '(deb-src|/source/|Sources([^[:alpha:]]|$))' \
-        | grep -vE 'Some index files failed to download' || true)
+        | grep -vE 'Some index files failed to download' \
+        | grep -vE '^W: (Target .* is configured multiple times|.* stored in legacy trusted\.gpg)' || true)
 
     # Remember pre-PPA-filter state — we need to distinguish "real APT errors,
     # but all on Amnezia PPA" (tolerant OK) from "no classifiable errors at all"
@@ -307,20 +787,32 @@ Options:
   --ssh-port=PORT       SSH port for the UFW rule (auto-detected by default;
                         comma-separated list). Use if SSH runs on a non-standard
                         port and auto-detection is unavailable
-  --subnet=SUBNET       Tunnel subnet, /24 only (e.g. 10.9.9.1/24) non-interactively
+  --subnet=SUBNET       Tunnel subnet, CIDR /16-/30 (e.g. 10.9.0.0/16) non-interactively
   --allow-ipv6          Keep IPv6 enabled non-interactively
   --disallow-ipv6       Force-disable IPv6 non-interactively
   --allow-ipv6-tunnel   Enable dual-stack IPv6 inside the tunnel (ULA, opt-in)
+                        Not supported with --role=entry or --egress=warp
+  --disallow-ipv6-tunnel Disable a previously enabled in-tunnel IPv6 setup
   --route-all           Use 'All traffic' mode non-interactively
   --route-amnezia       Use 'Amnezia' mode non-interactively
   --route-custom=NETS   Use 'Custom' mode non-interactively
+  --isolation=on|off    Isolate VPN clients from each other (default on).
+                        off: the tunnel subnet is added to client AllowedIPs
   --endpoint=ADDR       External server endpoint: FQDN, IPv4 or [IPv6] (NAT)
+  --server-name=NAME    Server name shown in the Amnezia app on vpn:// import
+                        (default 'AWG Server'; no quotes or control characters)
+  --mobile              Mobile setup in one flag: --preset=mobile + port 443/udp
+                        (mobile carriers often kill non-standard UDP ports).
+                        An explicit --port=N wins over port 443
   -y, --yes             Auto-confirm (reboots, UFW, etc.)
   -f, --force           Force reinstall on top of an already-running AmneziaWG
                         (by default a run on a configured server aborts;
                         ENV: AWG_FORCE_REINSTALL=1 is equivalent to the flag)
-  --no-tweaks           Skip optional hardening/optimization (UFW, Fail2Ban);
-                        the minimal forwarding sysctl is always applied
+  --no-tweaks           Skip the system cleanup, the optimization and the hardening
+                        (UFW, Fail2Ban); the minimal forwarding sysctl is always applied
+  --keep-packages       Do not remove system packages (snapd and others), but keep
+                        the firewall, Fail2Ban and the optimization. Removing snapd
+                        takes installed snaps and their data in /var/snap with it
   --preset=TYPE         Obfuscation parameter preset: default, mobile
                         mobile: Jc=3, narrow Jmax — for mobile carriers (Tele2, Yota, Megafon)
   --jc=N               Set Jc manually (1-128, overrides preset)
@@ -333,6 +825,8 @@ Options:
                                 Masks the AWG handshake as ordinary QUIC browser
                                 traffic. Strongest mode against mobile carrier
                                 DPI. Pair with --preset=mobile --port=500.
+  --no-cps              Disable CPS (the I1 parameter) - needed if the desktop
+                        AmneziaVPN on macOS hangs on connect (issue #159)
 
 Multi-hop (cascade of two AWG servers):
   --role=ROLE           single (default) | exit | entry
@@ -349,8 +843,9 @@ WARP egress (for role=exit or single — NOT compatible with role=entry):
                         brings up wg-quick@wgcf with Table=off, and policy-routes
                         AWG client traffic into WARP. External sites see a
                         Cloudflare IP instead of the VPS IP.
+  --warp-iface=NAME     WARP interface name (default wgcf)
   --warp-table=N        routing table for WARP traffic (default 2408)
-  --warp-priority=N     ip rule priority for WARP (default 789)
+  --warp-priority=N     WARP ip rule priority, 1..32764 (default 789)
   --warp-bypass=SPEC    WARP exceptions (traffic exits via main NIC directly).
                         Useful against CDNs that rate-limit or block WARP
                         address ranges (the classic case is YouTube /
@@ -392,7 +887,7 @@ Examples:
   sudo bash install_amneziawg_en.sh --uninstall                 # Uninstall
   sudo bash install_amneziawg_en.sh --diagnostic                # Diagnostics
 
-Repository: https://github.com/bivlked/amneziawg-installer
+Fork: https://github.com/SNPR/amneziawg-installer (upstream: bivlked)
 EOF
     # Explicit --help exits 0; an unknown argument exits 1 (false success in CI).
     exit "${HELP_EXIT_RC:-0}"
@@ -425,7 +920,7 @@ request_reboot() {
 
     # Capture boot_id before the 1→2 reboot gate. On step 2 entry we
     # compare it with the current boot_id — if they match, the user did
-    # not reboot, which means apt full-upgrade staged a new kernel on
+    # not reboot, which means the step 1 upgrade may have staged a kernel on
     # disk but the running kernel is still the old one. DKMS would build
     # the module against the old kernel and modprobe would fail after
     # the next reboot. Fail fast instead.
@@ -448,7 +943,7 @@ request_reboot() {
     else
         log "Auto-confirming reboot (--yes)."
     fi
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    if [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
         log "Reboot initiated..."
         sleep 5
         if ! reboot; then die "Reboot command failed."; fi
@@ -457,6 +952,23 @@ request_reboot() {
         log "Reboot cancelled. Reboot manually and run the script again."
         exit 1
     fi
+}
+
+# Early container detection (LXC/OpenVZ/Docker/WSL) - 4pda case: on a
+# container VDS the install used to reach step 3 and die with a raw
+# 'modprobe: FATAL: Module amneziawg not found' with no explanation. AmneziaWG
+# installs a kernel module via DKMS, and containers share the host kernel and
+# cannot load their own modules - it is more honest to stop right away.
+# systemd-detect-virt exists on all supported Ubuntu/Debian; if it is somehow
+# missing, the check is skipped (soft degradation, the install is not blocked).
+check_container() {
+    command -v systemd-detect-virt &>/dev/null || return 0
+    local virt
+    virt=$(systemd-detect-virt --container 2>/dev/null) || true
+    [[ -z "$virt" || "$virt" == "none" ]] && return 0
+    log_error "Container detected: ${virt}."
+    log_error "AmneziaWG requires loading a kernel module (DKMS), and containers (LXC/OpenVZ/Docker/WSL) share the host kernel and cannot load their own modules."
+    die "Use a full VPS (KVM/QEMU) or bare-metal. The container option is userspace amneziawg-go: ADVANCED.en.md, section 'LXC / Docker via amneziawg-go'."
 }
 
 check_os_version() {
@@ -503,11 +1015,71 @@ check_os_version() {
         log_warn "Detected $OS_ID $OS_VERSION ($OS_CODENAME). Script tested on Ubuntu 24.04/25.10/26.04 and Debian 12/13."
         if [[ "$AUTO_YES" -eq 0 ]]; then
             read -rp "Continue? [y/N]: " confirm < /dev/tty
-            if ! [[ "$confirm" =~ ^[Yy]$ ]]; then die "Cancelled."; fi
+            if ! [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then die "Cancelled."; fi
         else
             log "Continuing on $OS_ID $OS_VERSION (--yes)."
         fi
     fi
+}
+
+check_kernel_version() {
+    # The AmneziaWG 2.0 module is built via DKMS against the host kernel. On
+    # kernels older than 5.15 (Ubuntu < 22.04, e.g. 5.4 on 20.04) the build
+    # usually fails at step 2 with an opaque package-failure. Warn EXPLICITLY and
+    # early, before updates and reboots (issue #163). Not a die: on some older
+    # kernels the module still builds (HWE and such), so WARN + confirm.
+    local kver kmaj kmin
+    kver=$(uname -r)
+    if [[ "$kver" =~ ^([0-9]+)\.([0-9]+) ]]; then
+        kmaj=${BASH_REMATCH[1]}; kmin=${BASH_REMATCH[2]}
+    else
+        log_warn "Could not parse the kernel version ('$kver') - skipping the minimum-version check."
+        return 0
+    fi
+    if (( kmaj < 5 || (kmaj == 5 && kmin < 15) )); then
+        log_warn "Kernel $kver is older than 5.15 - usually too old for the AmneziaWG 2.0 module."
+        log_warn "The DKMS module build on such a kernel most often fails. Reinstall the VPS on Ubuntu 24.04 LTS or Debian 12 (or newer). Matrix: Ubuntu 24.04/25.10/26.04, Debian 12/13."
+        if [[ "$AUTO_YES" -eq 0 ]]; then
+            read -rp "Continue anyway? [y/N]: " confirm < /dev/tty
+            if ! [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then die "Cancelled: kernel $kver is too old for the AmneziaWG 2.0 module."; fi
+        else
+            log "Continuing on kernel $kver (--yes)."
+        fi
+    else
+        log "Kernel $kver (OK for the AmneziaWG 2.0 module)."
+    fi
+}
+
+# shellcheck disable=SC2120  # called without args in the installer (uses uname -r); bats passes versions
+_kernel_supports_awg3() {
+    # Returns 0 if the kernel version is >= 6.7 - there we take the module from the
+    # PPA as is. Returns 1 if the kernel is older than 6.7 - there we go the pinned
+    # 2.0 route.
+    # ⚠️ The name is historical, do not read it literally. The 6.7 threshold comes
+    # from 30-31 jul 2026: the 3.0 code called nla_put_uint, absent before mainline
+    # v6.7, and on 6.1 (Debian 12) the build died with 'implicit declaration of
+    # nla_put_uint'. Upstream fixed that on 31 jul (v3.0.20260731-04), and the 3.0
+    # module DOES build on 6.1 now - verified on a stand on 1 aug. The threshold is
+    # kept deliberately: within a day the 3.0 line managed to break and fix the
+    # build on old kernels specifically, so that is where it is least proven, while
+    # the pinned 2.0 is checked against an immutable commit. Drop the threshold
+    # after validating 3.0, not because the build passes again.
+    # Arg $1: kernel release (default uname -r). An unparseable version is treated
+    # as "NOT supported" -> pinned 2.0 (it builds on ANY of our kernels, so the
+    # conservative choice never breaks connectivity, it only withholds 3.0 features
+    # which H0 does not ship anyway).
+    # Pure function with no external deps (bats: extracted via sed-range + source).
+    local kver="${1:-$(uname -r)}" kmaj kmin
+    local min_maj=6 min_min=7
+    if [[ "$kver" =~ ^([0-9]+)\.([0-9]+) ]]; then
+        kmaj=${BASH_REMATCH[1]}; kmin=${BASH_REMATCH[2]}
+    else
+        return 1
+    fi
+    if (( kmaj > min_maj || (kmaj == min_maj && kmin >= min_min) )); then
+        return 0
+    fi
+    return 1
 }
 
 check_free_space() {
@@ -523,7 +1095,7 @@ check_free_space() {
         log_warn "Available $avail MB. Recommended >= $req MB."
         if [[ "$AUTO_YES" -eq 0 ]]; then
             read -rp "Continue? [y/N]: " confirm < /dev/tty
-            if ! [[ "$confirm" =~ ^[Yy]$ ]]; then die "Cancelled."; fi
+            if ! [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then die "Cancelled."; fi
         else
             log "Continuing with $avail MB (--yes)."
         fi
@@ -645,19 +1217,64 @@ detect_native_ipv6() {
     fi
 }
 
+# Only a compressed ULA /64 (...::/64) is supported: this is the shape the
+# renderer and client allocator can transform deterministically. The first
+# 16-bit group must be in fc00::/7; 1-4 groups may precede the `::`.
+validate_ipv6_tunnel_subnet() {
+    local subnet="$1" head prefix first group
+    local -a groups
+    [[ "$subnet" =~ ^([0-9A-Fa-f:]+)::/([0-9]{1,3})$ ]] || return 1
+    head="${BASH_REMATCH[1]}"
+    prefix="${BASH_REMATCH[2]}"
+    [[ "$prefix" == "64" && "$head" != :* && "$head" != *: ]] || return 1
+    IFS=':' read -r -a groups <<< "$head"
+    (( ${#groups[@]} >= 1 && ${#groups[@]} <= 4 )) || return 1
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    first=$(( 16#${groups[0]} ))
+    (( first >= 0xfc00 && first <= 0xfdff ))
+}
+
 configure_ipv6_tunnel() {
-    if [[ "$CLI_ALLOW_IPV6_TUNNEL" -eq 1 ]]; then
-        ALLOW_IPV6_TUNNEL=1
-    elif [[ -z "${ALLOW_IPV6_TUNNEL:-}" ]]; then
-        ALLOW_IPV6_TUNNEL=0
-    fi
+    case "$CLI_ALLOW_IPV6_TUNNEL" in
+        1) ALLOW_IPV6_TUNNEL=1 ;;
+        0) ALLOW_IPV6_TUNNEL=0 ;;
+        default)
+            case "${ALLOW_IPV6_TUNNEL:-}" in
+                "") ALLOW_IPV6_TUNNEL=0 ;;
+                0|1) : ;;
+                *)
+                    log_warn "ALLOW_IPV6_TUNNEL='${ALLOW_IPV6_TUNNEL}' in $CONFIG_FILE is invalid (expected 0|1) — disabling in-tunnel IPv6."
+                    ALLOW_IPV6_TUNNEL=0
+                    ;;
+            esac
+            ;;
+        *) die "Internal CLI_ALLOW_IPV6_TUNNEL='$CLI_ALLOW_IPV6_TUNNEL' error." ;;
+    esac
     : "${IPV6_SUBNET:=fddd:2c4:2c4:2c4::/64}"
+    if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 ]]; then
+        validate_ipv6_tunnel_subnet "$IPV6_SUBNET" \
+            || die "Invalid IPV6_SUBNET='$IPV6_SUBNET'. Expected a ULA /64 such as fddd:2c4:2c4:2c4::/64."
+    elif ! validate_ipv6_tunnel_subnet "$IPV6_SUBNET"; then
+        log_warn "Unused IPV6_SUBNET='$IPV6_SUBNET' is invalid; normalizing it while the IPv6 tunnel is disabled."
+        IPV6_SUBNET='fddd:2c4:2c4:2c4::/64'
+    fi
+
+    # Reject incompatible modes BEFORE the sysctl writes below: an invalid CLI
+    # combination must not alter host IPv6 state before it fails.
+    if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 && "${AWG_ROLE:-single}" == "entry" ]]; then
+        die "--allow-ipv6-tunnel is not supported with --role=entry yet: the upstream cascade routes IPv4 only. Use --disallow-ipv6-tunnel."
+    fi
+    if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 && "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        die "--allow-ipv6-tunnel is not supported with --egress=warp yet: WARP policy routing is IPv4-only. Use --disallow-ipv6-tunnel."
+    fi
     # The IPv6 tunnel requires host IPv6 enabled. Override --disallow-ipv6 AND
     # actively re-enable IPv6 at runtime BEFORE detection/render: on an upgrade
     # from a default past install (IPv6 was runtime-disabled), the kernel hides
     # all IPv6 addresses, so detect_native_ipv6 would false-negative and a client
     # would be rendered with an IPv6 Address while the kernel has IPv6 off
-    # (awg-quick restart can fail). weaq P1.
+    # (awg-quick restart can fail).
     if [[ "$ALLOW_IPV6_TUNNEL" -eq 1 ]]; then
         if [[ "$DISABLE_IPV6" -eq 1 ]]; then
             log_warn "--allow-ipv6-tunnel requires host IPv6 forwarding; overriding --disallow-ipv6 (DISABLE_IPV6=0)"
@@ -704,8 +1321,10 @@ safe_load_config() {
                 OS_ID|OS_VERSION|OS_CODENAME|AWG_PORT|AWG_TUNNEL_SUBNET|\
                 DISABLE_IPV6|ALLOWED_IPS_MODE|ALLOWED_IPS|AWG_ENDPOINT|AWG_MTU|\
                 AWG_Jc|AWG_Jmin|AWG_Jmax|AWG_S1|AWG_S2|AWG_S3|AWG_S4|\
-                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_PRESET|NO_TWEAKS|AWG_APPLY_MODE|\
+                AWG_H1|AWG_H2|AWG_H3|AWG_H4|AWG_I1|AWG_I1_MODE|AWG_I2|AWG_I3|AWG_I4|AWG_I5|AWG_PRESET|NO_TWEAKS|NO_CPS|KEEP_PACKAGES|\
+                AWG_APPLY_MODE|\
                 ALLOW_IPV6_TUNNEL|IPV6_SUBNET|SERVER_HAS_NATIVE_IPV6|\
+                PREV_AWG_PORT|CLIENT_ISOLATION|CLIENT_ISOLATION_NET|AWG_SERVER_NAME|\
                 AWG_ROLE|AWG_UPSTREAM_IFACE|AWG_UPSTREAM_TABLE|AWG_UPSTREAM_FWMARK|AWG_UPSTREAM_PRIORITY|\
                 AWG_EGRESS|AWG_WARP_IFACE|AWG_WARP_TABLE|AWG_WARP_PRIORITY|AWG_WARP_BYPASS|\
                 AWG_AMNEZIA_DNS)
@@ -768,22 +1387,739 @@ validate_port() {
     fi
 }
 
+# Routing table IDs are interpolated into `ip route/rule` commands. Bound the
+# decimal representation before arithmetic (overflow-safe) and keep the three
+# reserved Linux tables out of custom policy routing.
+validate_policy_table() {
+    local value="$1"
+    [[ "$value" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+    (( 10#$value <= 4294967295 )) || return 1
+    (( 10#$value < 253 || 10#$value > 255 ))
+}
+
+validate_policy_priority() {
+    local value="$1"
+    [[ "$value" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+    # The source lookup and its fail-closed blackhole guard occupy P and P+1.
+    # Both must precede Linux's main-table rule at priority 32766.
+    (( 10#$value <= 32764 ))
+}
+
+validate_fwmark() {
+    local value="$1" numeric
+    if [[ "$value" =~ ^0x[0-9a-fA-F]{1,8}$ ]]; then
+        numeric=$(( value ))
+    elif [[ "$value" =~ ^[1-9][0-9]{0,9}$ ]] && (( 10#$value <= 4294967295 )); then
+        numeric=$(( 10#$value ))
+    else
+        return 1
+    fi
+    (( numeric != 0 && numeric != 0xca6c ))
+}
+
+# Atomic root-owned interface-name marker for cleanup after a reboot. Preserve
+# an existing marker: it describes an older unfinished migration and must not
+# be overwritten by a newer run.
+write_pending_iface_marker() {
+    local marker="$1" iface="$2" tmp existing=""
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] || return 1
+    if [[ -e "$marker" || -L "$marker" ]]; then
+        [[ -f "$marker" && ! -L "$marker" ]] || return 1
+        IFS= read -r existing < "$marker" || existing=""
+        [[ "$existing" == "$iface" ]]
+        return $?
+    fi
+    tmp=$(mktemp -p "$AWG_DIR" ".iface-marker.XXXXXX") || return 1
+    _install_temp_files+=("$tmp")
+    printf '%s\n' "$iface" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$marker"
+}
+
+# A pending marker is a one-slot migration journal. If the saved init still
+# requires that exact interface, a crash happened before the new init commit
+# (or the operator returned to that interface): cleaning it would delete the
+# current egress. Cancel such a marker before applying CLI overrides. A marker
+# for a different saved interface is a real outstanding cleanup and is kept.
+reconcile_pending_mode_markers() {
+    local config_exists="$1" saved_role="$2" saved_upstream="$3"
+    local saved_egress="$4" saved_warp="$5" marker iface=""
+
+    marker="$AWG_DIR/.upstream_cleanup_pending"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+        [[ "$config_exists" -eq 1 && -f "$marker" && ! -L "$marker" ]] || return 1
+        IFS= read -r iface < "$marker" || iface=""
+        [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] || return 1
+        if [[ "$saved_role" == "entry" && "$saved_upstream" == "$iface" ]]; then
+            rm -f -- "$marker" || return 1
+            log_warn "Removed a stale upstream cleanup marker for current iface ${iface}; current support will not be deleted."
+        fi
+    fi
+
+    marker="$AWG_DIR/.warp_cleanup_pending"
+    if [[ -e "$marker" || -L "$marker" ]]; then
+        [[ "$config_exists" -eq 1 && -f "$marker" && ! -L "$marker" ]] || return 1
+        IFS= read -r iface < "$marker" || iface=""
+        [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] || return 1
+        if [[ "$saved_egress" == "warp" && "$saved_warp" == "$iface" ]]; then
+            if [[ -e "$AWG_DIR/.warp_cleanup_service_owner" || -L "$AWG_DIR/.warp_cleanup_service_owner" \
+                  || -e "$AWG_DIR/.warp_cleanup_created_config_owner" || -L "$AWG_DIR/.warp_cleanup_created_config_owner" \
+                  || -e "$AWG_DIR/.warp_cleanup_managed_config_owner" || -L "$AWG_DIR/.warp_cleanup_managed_config_owner" ]]; then
+                _INSTALL_ROLLBACK_WARP_PARKED=1
+                _install_restore_parked_warp_ownership || return 1
+            fi
+            rm -f -- "$marker" || return 1
+            log_warn "Removed a stale WARP cleanup marker for current iface ${iface}; current egress will not be deleted."
+        fi
+    fi
+    return 0
+}
+
+# A main NIC may be a VLAN interface (for example eth0.100), while managed
+# tunnel names deliberately use a stricter grammar. Keep a separate validator
+# for the UFW marker with the same atomic/no-symlink guarantees.
+write_pending_main_iface_marker() {
+    local marker="$AWG_DIR/.ufw_main_cleanup_pending" iface="$1" tmp existing=""
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$ ]] || return 1
+    if [[ -e "$marker" || -L "$marker" ]]; then
+        [[ -f "$marker" && ! -L "$marker" ]] || return 1
+        IFS= read -r existing < "$marker" || existing=""
+        [[ "$existing" == "$iface" ]]
+        return $?
+    fi
+    tmp=$(mktemp -p "$AWG_DIR" '.ufw-main-marker.XXXXXX') || return 1
+    _install_temp_files+=("$tmp")
+    printf '%s\n' "$iface" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$marker"
+}
+
+# Stop the previous upstream marked by initialize_setup for deferred cleanup,
+# but do not disable or delete it. This runs only after the old awg0 is down;
+# EXIT restores its exact active/link/enabled state.
+stop_pending_old_upstream_for_transition() {
+    local marker="$AWG_DIR/.upstream_cleanup_pending" iface="" unit="" conf=""
+    local state="" link_present=0
+    [[ -e "$marker" || -L "$marker" ]] || return 0
+    [[ -f "$marker" && ! -L "$marker" ]] \
+        || { log_error "Unsafe upstream cleanup marker: $marker"; return 1; }
+    IFS= read -r iface < "$marker" || iface=""
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] \
+        || { log_error "Invalid previous upstream iface in cleanup marker."; return 1; }
+    if [[ "${AWG_ROLE:-single}" == "entry" && "${AWG_UPSTREAM_IFACE:-awg1}" == "$iface" ]]; then
+        log_error "Cleanup marker points at the currently required upstream ${iface}; stop cancelled."
+        return 1
+    fi
+    unit="awg-quick@${iface}"
+    conf="/etc/amnezia/amneziawg/${iface}.conf"
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    command -v ip >/dev/null 2>&1 && ip link show dev "$iface" >/dev/null 2>&1 \
+        && link_present=1
+    systemctl is-enabled --quiet "$unit" 2>/dev/null \
+        && _INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ENABLED=1 \
+        || _INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ENABLED=0
+    [[ "$state" =~ ^(active|activating|deactivating|reloading)$ ]] \
+        && _INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ACTIVE=1 \
+        || _INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ACTIVE=0
+    _INSTALL_ROLLBACK_OLD_SUPPORT_WAS_LINK="$link_present"
+    _INSTALL_ROLLBACK_OLD_SUPPORT_IFACE="$iface"
+    _INSTALL_ROLLBACK_OLD_SUPPORT=1
+
+    if [[ "$_INSTALL_ROLLBACK_OLD_SUPPORT_WAS_ACTIVE" -eq 1 ]]; then
+        log "Temporarily stopping previous upstream ${iface} until the new awg0 commit..."
+        systemctl stop "$unit" \
+            || { log_error "Could not stop previous upstream ${iface}."; return 1; }
+    elif [[ "$state" != "inactive" && "$state" != "failed" && "$state" != "unknown" ]]; then
+        log_error "Could not determine previous upstream ${iface} state reliably: ${state:-no response}"
+        return 1
+    fi
+
+    if command -v ip >/dev/null 2>&1 && ip link show dev "$iface" >/dev/null 2>&1; then
+        [[ -f "$conf" && ! -L "$conf" ]] \
+            && timeout 15 awg-quick down "$conf" >/dev/null 2>&1 || {
+                log_error "Previous upstream ${iface} remains live; the new awg0 will not be started."
+                return 1
+            }
+    fi
+    if command -v ip >/dev/null 2>&1 && ip link show dev "$iface" >/dev/null 2>&1; then
+        log_error "Previous upstream interface ${iface} remained after stop."
+        return 1
+    fi
+    return 0
+}
+
+# Free the regular marker for a new WARP iface without removing the old unit
+# or its config. The parked marker survives reboots/crashes and is removed only
+# after the new awg0 has been started and verified.
+_park_one_pending_warp_marker() {
+    local live="$1" parked="$2" old_value="$3" new_value="$4" label="$5"
+    local live_value="" parked_value=""
+
+    if [[ -e "$parked" || -L "$parked" ]]; then
+        _INSTALL_ROLLBACK_WARP_PARKED=1
+        [[ -f "$parked" && ! -L "$parked" ]] \
+            || { log_error "Unsafe parked WARP ${label} marker: $parked"; return 1; }
+        parked_value=$(<"$parked")
+        [[ "$parked_value" == "$old_value" ]] \
+            || { log_error "Parked WARP ${label} marker does not match the previous iface."; return 1; }
+    fi
+
+    [[ -e "$live" || -L "$live" ]] || return 0
+    [[ -f "$live" && ! -L "$live" ]] \
+        || { log_error "Unsafe WARP ${label} marker: $live"; return 1; }
+    live_value=$(<"$live")
+    [[ "$live_value" == "$old_value" || "$live_value" == "$new_value" ]] \
+        || { log_error "WARP ${label} marker points to an unexpected resource: $live_value"; return 1; }
+
+    # A new-iface marker means this is a resume after parking had completed.
+    [[ "$live_value" == "$old_value" ]] || return 0
+    if [[ -e "$parked" ]]; then
+        rm -f -- "$live" || return 1
+    else
+        mv -f -- "$live" "$parked" || return 1
+        _INSTALL_ROLLBACK_WARP_PARKED=1
+    fi
+}
+
+park_pending_warp_ownership() {
+    local pending="$AWG_DIR/.warp_cleanup_pending" old_iface="" old_conf="" new_conf=""
+    [[ -e "$pending" || -L "$pending" ]] || return 0
+    [[ -f "$pending" && ! -L "$pending" ]] \
+        || { log_error "Unsafe WARP cleanup marker: $pending"; return 1; }
+    IFS= read -r old_iface < "$pending" || old_iface=""
+    [[ "$old_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$old_iface" != "awg0" ]] \
+        || { log_error "Invalid previous WARP iface in cleanup marker."; return 1; }
+    if [[ "${AWG_EGRESS:-direct}" == "warp" && "${AWG_WARP_IFACE:-wgcf}" == "$old_iface" ]]; then
+        log_error "Cleanup marker points at the currently required WARP ${old_iface}; parking cancelled."
+        return 1
+    fi
+
+    # Parking is required only for WARP->WARP with an iface rename. Other new
+    # modes do not use the regular WARP ownership markers during setup.
+    [[ "${AWG_EGRESS:-direct}" == "warp" && "${AWG_WARP_IFACE:-wgcf}" != "$old_iface" ]] \
+        || return 0
+    old_conf="/etc/wireguard/${old_iface}.conf"
+    new_conf="/etc/wireguard/${AWG_WARP_IFACE:-wgcf}.conf"
+
+    _park_one_pending_warp_marker \
+        "$AWG_DIR/.wgcf_enabled_by_installer" \
+        "$AWG_DIR/.warp_cleanup_service_owner" \
+        "$old_iface" "${AWG_WARP_IFACE:-wgcf}" "service" || return 1
+    _park_one_pending_warp_marker \
+        "$AWG_DIR/.wgcf_config_created_by_installer" \
+        "$AWG_DIR/.warp_cleanup_created_config_owner" \
+        "$old_conf" "$new_conf" "created-config" || return 1
+    _park_one_pending_warp_marker \
+        "$AWG_DIR/.wgcf_config_managed_by_installer" \
+        "$AWG_DIR/.warp_cleanup_managed_config_owner" \
+        "$old_conf" "$new_conf" "managed-config" || return 1
+
+    if [[ -e "$AWG_DIR/.warp_cleanup_created_config_owner" \
+          && -e "$AWG_DIR/.warp_cleanup_managed_config_owner" ]]; then
+        log_error "Previous WARP config is marked as both created and managed."
+        return 1
+    fi
+    log "Previous WARP iface '${old_iface}' ownership retained until post-commit cleanup."
+}
+
+# Stop an owned quick interface whether systemd or an operator brought it up.
+# Marker/config deletion is allowed only after both the link and transitional
+# unit state are proven absent.
+stop_owned_tunnel_runtime() {
+    local kind="$1" iface="$2" conf="$3" unit="" quick="" state=""
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] || return 1
+    case "$kind" in
+        awg) unit="awg-quick@${iface}"; quick="awg-quick" ;;
+        wg) unit="wg-quick@${iface}"; quick="wg-quick" ;;
+        *) return 1 ;;
+    esac
+    command -v ip >/dev/null 2>&1 || return 1
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    if [[ "$state" =~ ^(active|activating|deactivating|reloading)$ ]]; then
+        systemctl stop "$unit" || return 1
+    elif [[ "$state" != "inactive" && "$state" != "failed" && "$state" != "unknown" ]]; then
+        return 1
+    fi
+    if ip link show dev "$iface" >/dev/null 2>&1; then
+        [[ -f "$conf" && ! -L "$conf" ]] || return 1
+        timeout 15 "$quick" down "$conf" >/dev/null 2>&1 || return 1
+    fi
+    ip link show dev "$iface" >/dev/null 2>&1 && return 1
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    [[ "$state" == "inactive" || "$state" == "failed" || "$state" == "unknown" ]]
+}
+
+# Old support units are removed only after the new awg0 passes verification.
+# Any error retains the pending/ownership markers for a safe retry and does not
+# roll back the already-working new configuration.
+finalize_deferred_mode_cleanup() {
+    local cleanup_failed=0 pending="" old_iface=""
+
+    pending="$AWG_DIR/.upstream_cleanup_pending"
+    if [[ -e "$pending" || -L "$pending" ]]; then
+        if [[ ! -f "$pending" || -L "$pending" ]]; then
+            log_warn "Post-commit cleanup: unsafe upstream marker retained: $pending"
+            cleanup_failed=1
+        else
+            IFS= read -r old_iface < "$pending" || old_iface=""
+            if [[ ! "$old_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ || "$old_iface" == "awg0" ]]; then
+                log_warn "Post-commit cleanup: invalid upstream iface; marker retained."
+                cleanup_failed=1
+            elif [[ "${AWG_ROLE:-single}" == "entry" \
+                    && "${AWG_UPSTREAM_IFACE:-awg1}" == "$old_iface" ]]; then
+                log_warn "Post-commit cleanup: ${old_iface} is still the current upstream; marker retained without stop/delete."
+                cleanup_failed=1
+            elif ! stop_owned_tunnel_runtime awg "$old_iface" \
+                    "/etc/amnezia/amneziawg/${old_iface}.conf"; then
+                log_warn "Post-commit cleanup: old upstream ${old_iface} could not be removed from runtime completely; marker retained."
+                cleanup_failed=1
+            elif ! systemctl disable "awg-quick@${old_iface}" 2>/dev/null; then
+                log_warn "Post-commit cleanup: could not disable old upstream ${old_iface}; marker retained."
+                cleanup_failed=1
+            else
+                if command -v ufw &>/dev/null && ! ufw status 2>/dev/null | grep -q inactive \
+                   && ! delete_exact_owned_ufw_route "$old_iface" "AmneziaWG cascade awg0->${old_iface}"; then
+                    log_warn "Post-commit cleanup: cascade UFW rule ${old_iface} is ambiguous or foreign; marker retained."
+                    cleanup_failed=1
+                elif rm -f -- "$pending"; then
+                    log "Previous upstream ${old_iface} removed from autostart after the new awg0 commit."
+                else
+                    log_warn "Post-commit cleanup: could not clear upstream marker $pending."
+                    cleanup_failed=1
+                fi
+            fi
+        fi
+    fi
+
+    pending="$AWG_DIR/.warp_cleanup_pending"
+    if [[ -e "$pending" || -L "$pending" ]]; then
+        local old_conf="" service_unit="" service_source="" created_source="" managed_source=""
+        local regular_service="$AWG_DIR/.wgcf_enabled_by_installer"
+        local regular_created="$AWG_DIR/.wgcf_config_created_by_installer"
+        local regular_managed="$AWG_DIR/.wgcf_config_managed_by_installer"
+        local parked_service="$AWG_DIR/.warp_cleanup_service_owner"
+        local parked_created="$AWG_DIR/.warp_cleanup_created_config_owner"
+        local parked_managed="$AWG_DIR/.warp_cleanup_managed_config_owner"
+        local marker value expected_new_service="" expected_new_conf=""
+        local warp_preflight_ok=1
+
+        if [[ ! -f "$pending" || -L "$pending" ]]; then
+            log_warn "Post-commit cleanup: unsafe WARP marker retained: $pending"
+            warp_preflight_ok=0
+        else
+            IFS= read -r old_iface < "$pending" || old_iface=""
+            if [[ ! "$old_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ || "$old_iface" == "awg0" ]]; then
+                log_warn "Post-commit cleanup: invalid WARP iface; marker retained."
+                warp_preflight_ok=0
+            elif [[ "${AWG_EGRESS:-direct}" == "warp" \
+                    && "${AWG_WARP_IFACE:-wgcf}" == "$old_iface" ]]; then
+                log_warn "Post-commit cleanup: ${old_iface} is still the current WARP; marker retained without stop/delete."
+                warp_preflight_ok=0
+            fi
+        fi
+        old_conf="/etc/wireguard/${old_iface}.conf"
+        if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+            expected_new_service="${AWG_WARP_IFACE:-wgcf}"
+            expected_new_conf="/etc/wireguard/${AWG_WARP_IFACE:-wgcf}.conf"
+        fi
+
+        # Validate ALL markers before changing the old WARP unit/config.
+        for marker in "$parked_service" "$parked_created" "$parked_managed"; do
+            [[ -e "$marker" || -L "$marker" ]] || continue
+            if [[ ! -f "$marker" || -L "$marker" ]]; then
+                log_warn "Post-commit cleanup: unsafe parked marker retained: $marker"
+                warp_preflight_ok=0
+                continue
+            fi
+            value=$(<"$marker")
+            case "$marker" in
+                "$parked_service") [[ "$value" == "$old_iface" ]] && service_source="$marker" || warp_preflight_ok=0 ;;
+                "$parked_created") [[ "$value" == "$old_conf" ]] && created_source="$marker" || warp_preflight_ok=0 ;;
+                "$parked_managed") [[ "$value" == "$old_conf" ]] && managed_source="$marker" || warp_preflight_ok=0 ;;
+            esac
+        done
+        for marker in "$regular_service" "$regular_created" "$regular_managed"; do
+            [[ -e "$marker" || -L "$marker" ]] || continue
+            if [[ ! -f "$marker" || -L "$marker" ]]; then
+                log_warn "Post-commit cleanup: unsafe WARP marker retained: $marker"
+                warp_preflight_ok=0
+                continue
+            fi
+            value=$(<"$marker")
+            case "$marker" in
+                "$regular_service")
+                    if [[ "$value" == "$old_iface" && -z "$service_source" ]]; then service_source="$marker"
+                    elif [[ "$value" != "$old_iface" && "$value" != "$expected_new_service" ]]; then warp_preflight_ok=0
+                    fi ;;
+                "$regular_created")
+                    if [[ "$value" == "$old_conf" && -z "$created_source" ]]; then created_source="$marker"
+                    elif [[ "$value" != "$old_conf" && "$value" != "$expected_new_conf" ]]; then warp_preflight_ok=0
+                    fi ;;
+                "$regular_managed")
+                    if [[ "$value" == "$old_conf" && -z "$managed_source" ]]; then managed_source="$marker"
+                    elif [[ "$value" != "$old_conf" && "$value" != "$expected_new_conf" ]]; then warp_preflight_ok=0
+                    fi ;;
+            esac
+        done
+        if [[ -n "$created_source" && -n "$managed_source" ]]; then
+            log_warn "Post-commit cleanup: old WARP config is both created+managed; nothing was removed."
+            warp_preflight_ok=0
+        fi
+
+        if [[ "$warp_preflight_ok" -eq 1 ]]; then
+            service_unit="wg-quick@${old_iface}"
+            if [[ -n "$service_source" ]]; then
+                if ! stop_owned_tunnel_runtime wg "$old_iface" "$old_conf"; then
+                    log_warn "Post-commit cleanup: old WARP ${old_iface} could not be removed from runtime completely; ownership retained."
+                    warp_preflight_ok=0
+                elif ! systemctl disable "$service_unit" 2>/dev/null; then
+                    log_warn "Post-commit cleanup: could not disable old WARP ${old_iface}; ownership retained."
+                    warp_preflight_ok=0
+                fi
+            elif systemctl is-active --quiet "$service_unit" 2>/dev/null \
+                 || systemctl is-enabled --quiet "$service_unit" 2>/dev/null \
+                 || { command -v ip >/dev/null 2>&1 \
+                      && ip link show dev "$old_iface" >/dev/null 2>&1; }; then
+                log_warn "Post-commit cleanup: old WARP ${old_iface} is active/enabled/live without proven service ownership; retained."
+                warp_preflight_ok=0
+            fi
+        fi
+
+        if [[ "$warp_preflight_ok" -eq 1 ]]; then
+            if [[ -n "$created_source" ]] && ! rm -f -- "$old_conf"; then
+                log_warn "Post-commit cleanup: could not remove installer-created $old_conf."
+                warp_preflight_ok=0
+            fi
+        fi
+        if [[ "$warp_preflight_ok" -eq 1 ]]; then
+            if command -v ufw &>/dev/null && ! ufw status 2>/dev/null | grep -q inactive; then
+                delete_exact_owned_ufw_route "$old_iface" "AmneziaWG→WARP egress" \
+                    || warp_preflight_ok=0
+            fi
+            # Managed (but not created) configs are always retained; only the
+            # old resource's ownership markers are removed.
+            if [[ "$warp_preflight_ok" -eq 1 ]]; then
+                for marker in "$service_source" "$created_source" "$managed_source"; do
+                    [[ -n "$marker" ]] || continue
+                    rm -f -- "$marker" || warp_preflight_ok=0
+                done
+            fi
+            if [[ "$warp_preflight_ok" -eq 1 ]] && rm -f -- "$pending"; then
+                log "Previous WARP ${old_iface} cleaned up after the new awg0 commit."
+            else
+                log_warn "Post-commit cleanup: WARP markers retained for a later retry."
+                warp_preflight_ok=0
+            fi
+        fi
+        [[ "$warp_preflight_ok" -eq 1 ]] || cleanup_failed=1
+    fi
+
+    return "$cleanup_failed"
+}
+
+# awg0 must never race its egress tunnel during boot. A narrowly-owned
+# systemd drop-in gives systemd the ordering/activation edge while the
+# blackhole policy routes in awg0.conf remain the runtime fail-closed guard.
+configure_awg0_dependency() {
+    local required_unit="" marker_value="" tmp=""
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        required_unit="awg-quick@${AWG_UPSTREAM_IFACE:-awg1}.service"
+    elif [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        required_unit="wg-quick@${AWG_WARP_IFACE:-wgcf}.service"
+    fi
+
+    if [[ -e "$AWG0_DEPENDENCY_MARKER" || -L "$AWG0_DEPENDENCY_MARKER" ]]; then
+        [[ -f "$AWG0_DEPENDENCY_MARKER" && ! -L "$AWG0_DEPENDENCY_MARKER" ]] \
+            || { log_error "Invalid systemd dependency marker: $AWG0_DEPENDENCY_MARKER"; return 1; }
+        IFS= read -r marker_value < "$AWG0_DEPENDENCY_MARKER" || marker_value=""
+        [[ "$marker_value" == "$AWG0_DEPENDENCY_DROPIN" ]] \
+            || { log_error "Invalid path in the systemd dependency marker."; return 1; }
+    elif [[ -e "$AWG0_DEPENDENCY_DROPIN" || -L "$AWG0_DEPENDENCY_DROPIN" ]]; then
+        log_error "Refusing to overwrite foreign systemd drop-in $AWG0_DEPENDENCY_DROPIN"
+        return 1
+    fi
+
+    if [[ -z "$required_unit" ]]; then
+        if [[ -n "$marker_value" ]]; then
+            rm -f -- "$AWG0_DEPENDENCY_DROPIN" || return 1
+            rm -f -- "$AWG0_DEPENDENCY_MARKER" || return 1
+            rmdir "$(dirname "$AWG0_DEPENDENCY_DROPIN")" 2>/dev/null || true
+            systemctl daemon-reload || return 1
+        fi
+        return 0
+    fi
+
+    if [[ -z "$marker_value" ]]; then
+        printf '%s\n' "$AWG0_DEPENDENCY_DROPIN" > "$AWG0_DEPENDENCY_MARKER" \
+            && chmod 600 "$AWG0_DEPENDENCY_MARKER" \
+            || { rm -f "$AWG0_DEPENDENCY_MARKER"; return 1; }
+    fi
+    mkdir -p "$(dirname "$AWG0_DEPENDENCY_DROPIN")" || return 1
+    tmp=$(mktemp -p "$(dirname "$AWG0_DEPENDENCY_DROPIN")" '.awgchain-dependency.XXXXXX') \
+        || return 1
+    _install_temp_files+=("$tmp")
+    if ! printf '[Unit]\nRequires=%s\nAfter=%s\n' "$required_unit" "$required_unit" > "$tmp" \
+       || ! chmod 0644 "$tmp" \
+       || ! mv -f "$tmp" "$AWG0_DEPENDENCY_DROPIN"; then
+        rm -f "$tmp"
+        [[ -z "$marker_value" ]] && rm -f "$AWG0_DEPENDENCY_MARKER"
+        return 1
+    fi
+    systemctl daemon-reload || return 1
+    log "awg0 boot dependency configured: $required_unit"
+}
+
 validate_subnet() {
     local subnet="$1" o
-    # Octets without leading zeros: '010.008...' would otherwise be parsed as octal
-    # in [[ -gt ]] and slip past the check. Range is compared on plain decimal values.
-    if ! [[ "$subnet" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})/24$ ]]; then
-        die "Invalid subnet: '$subnet'. Only /24 is supported."
+    # Self-contained (step 0, BEFORE awg_common.sh is downloaded): does not use
+    # _valid_ipv4/_cidr_bounds. Octets without leading zeros ('010...' would
+    # otherwise be parsed as octal).
+    if ! [[ "$subnet" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})/([0-9]{1,2})$ ]]; then
+        die "Invalid subnet: '$subnet'. Expected CIDR /16-/30, e.g. 10.9.0.0/16."
     fi
-    for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
-        (( o <= 255 )) || die "Invalid subnet: '$subnet'. Octet out of range 0-255."
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}" prefix="${BASH_REMATCH[5]}"
+    for o in "$a" "$b" "$c" "$d"; do
+        (( 10#$o <= 255 )) || die "Invalid subnet: '$subnet'. Octet out of range 0-255."
     done
-    if [[ "${BASH_REMATCH[4]}" -eq 0 ]] || [[ "${BASH_REMATCH[4]}" -eq 255 ]]; then
-        die "Invalid subnet: '$subnet'. Last octet cannot be 0 (network address) or 255 (broadcast)."
+    (( 10#$prefix >= 16 && 10#$prefix <= 30 )) || die "Invalid subnet: '$subnet'. Only /16-/30 masks are supported."
+    # Inline arithmetic: the address must be network or network+1.
+    local ip=$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+    local mask=$(( (0xFFFFFFFF << (32 - 10#$prefix)) & 0xFFFFFFFF ))
+    local network=$(( ip & mask ))
+    local n1=$(( network + 1 ))
+    local srv="$(( (n1 >> 24) & 255 )).$(( (n1 >> 16) & 255 )).$(( (n1 >> 8) & 255 )).$(( n1 & 255 ))"
+    if (( ip != network && ip != n1 )); then
+        die "Invalid subnet: '$subnet'. Server address must be ${srv} (network+1), or specify the network."
     fi
-    if [[ "${BASH_REMATCH[4]}" -ne 1 ]]; then
-        die "Invalid subnet: '$subnet'. Last octet must be 1 (server address in subnet)."
+    # Normalize the global to <network+1>/<prefix> (server = network+1).
+    AWG_TUNNEL_SUBNET="${srv}/${prefix}"
+}
+
+# Tunnel network from a CIDR string (<network+1>/<prefix> -> <network>/<prefix>).
+# Needed for client isolation (issue #178): with isolation disabled, it is the
+# network address itself that goes into client AllowedIPs. Self-contained
+# (step 0, BEFORE awg_common.sh is loaded): does not use _cidr_bounds/_int_to_ipv4.
+tunnel_network_cidr() {
+    local subnet="${1:-$AWG_TUNNEL_SUBNET}"
+    if ! [[ "$subnet" =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})/([0-9]{1,2})$ ]]; then
+        return 1
     fi
+    local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}" prefix="${BASH_REMATCH[5]}"
+    (( 10#$prefix <= 32 )) || return 1
+    local o
+    for o in "$a" "$b" "$c" "$d"; do (( 10#$o <= 255 )) || return 1; done
+    local ip=$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+    local mask
+    if (( 10#$prefix == 0 )); then mask=0; else mask=$(( (0xFFFFFFFF << (32 - 10#$prefix)) & 0xFFFFFFFF )); fi
+    local net=$(( ip & mask ))
+    echo "$(( (net >> 24) & 255 )).$(( (net >> 16) & 255 )).$(( (net >> 8) & 255 )).$(( net & 255 ))/${prefix}"
+}
+
+# Explicit client isolation choice (issue #178). Priority:
+# CLI flag > saved config > interactive question (first run only, no --yes) >
+# 1 (isolated). An old config without the key = 1: before this feature,
+# split modes were isolated de facto, so the behaviour is preserved.
+configure_client_isolation() {
+    case "$CLI_ISOLATION" in
+        on)  CLIENT_ISOLATION=1; log "Client isolation from CLI: enabled." ;;
+        off) CLIENT_ISOLATION=0; log "Client isolation from CLI: disabled." ;;
+        default)
+            if [[ -n "${CLIENT_ISOLATION:-}" ]]; then
+                log "Client isolation (from config): $( [[ "$CLIENT_ISOLATION" -eq 1 ]] && echo enabled || echo disabled )."
+            elif [[ "${config_exists:-0}" -eq 1 ]]; then
+                CLIENT_ISOLATION=1
+                log "Client isolation: enabled (pre-v5.20 config - previous behaviour)."
+            elif [[ "$AUTO_YES" -eq 1 ]]; then
+                CLIENT_ISOLATION=1
+                log "Client isolation: enabled (--yes, default)."
+            else
+                local r_iso
+                read -rp "Isolate VPN clients from each other? [Y/n]: " r_iso < /dev/tty
+                case "$r_iso" in
+                    [nN]*) CLIENT_ISOLATION=0; log "Client isolation disabled: clients will see each other inside the VPN." ;;
+                    *)     CLIENT_ISOLATION=1; log "Client isolation enabled." ;;
+                esac
+            fi
+            ;;
+        *) die "Invalid --isolation='$CLI_ISOLATION'. Allowed: on|off." ;;
+    esac
+    export CLIENT_ISOLATION
+}
+
+# Brings ALLOWED_IPS in line with CLIENT_ISOLATION (idempotent, called on every
+# run after the routing mode is determined). Isolation OFF: the tunnel subnet
+# is appended to the list (modes 2/3; in mode 1, 0.0.0.0/0 already covers it).
+# Isolation ON: our token is removed from mode 2 (off->on round-trip); mode 3
+# is left untouched - the custom list belongs to the user, and isolation is
+# enforced by the server-side DROP rule regardless.
+# CLIENT_ISOLATION_NET tracks ownership of our token (empty if the token is
+# user-owned or isolation is enabled) - needed to clean up the previous route
+# when the tunnel subnet changes (issue #178, final audit).
+_apply_isolation_to_allowed_ips() {
+    local net
+    net=$(tunnel_network_cidr "$AWG_TUNNEL_SUBNET") || return 0
+    # Strip ALL whitespace, not just spaces: validate_cidr_list accepts tabs
+    # as separators, and a tab-carrying token would otherwise slip past the
+    # pattern match below - duplicating instead of a no-op (PR #179 review).
+    local compact=",${ALLOWED_IPS//[[:space:]]/},"
+
+    # Tunnel subnet changed: our previous token (persisted CLIENT_ISOLATION_NET)
+    # differs from the current network - remove it in any mode and regardless
+    # of the isolation state: by construction the token was added by us, not
+    # the user.
+    if [[ -n "${CLIENT_ISOLATION_NET:-}" && "$CLIENT_ISOLATION_NET" != "$net" ]]; then
+        if [[ "$compact" == *",${CLIENT_ISOLATION_NET},"* ]]; then
+            # A loop, not a single replace: a corrupted list may carry the
+            # token more than once - purge every copy (PR #179 review).
+            while [[ "$compact" == *",${CLIENT_ISOLATION_NET},"* ]]; do
+                compact="${compact/,${CLIENT_ISOLATION_NET},/,}"
+            done
+            compact="${compact#,}"; compact="${compact%,}"
+            ALLOWED_IPS="${compact//,/, }"
+            log "Tunnel subnet changed: previous route ${CLIENT_ISOLATION_NET} removed from client AllowedIPs."
+            compact=",${ALLOWED_IPS// /},"
+        fi
+        CLIENT_ISOLATION_NET=""
+    fi
+
+    if [[ "${CLIENT_ISOLATION:-1}" -eq 0 ]]; then
+        if [[ "$ALLOWED_IPS_MODE" == "1" ]]; then
+            CLIENT_ISOLATION_NET=""
+        elif [[ "$compact" == *",${net},"* ]]; then
+            # Already present: our previous token (CLIENT_ISOLATION_NET==net kept)
+            # or a user-owned one (CLIENT_ISOLATION_NET empty) - ownership unchanged.
+            :
+        else
+            ALLOWED_IPS="${ALLOWED_IPS}, ${net}"
+            CLIENT_ISOLATION_NET="$net"
+            log "Isolation disabled: tunnel subnet ${net} added to client AllowedIPs."
+        fi
+    else
+        # Isolation ON: mode 2 - the token is always removed (the list is
+        # generated by us); mode 3 - only if we added the token (ownership
+        # tracked in CLIENT_ISOLATION_NET).
+        if [[ "$compact" == *",${net},"* ]] \
+           && { [[ "$ALLOWED_IPS_MODE" == "2" ]] || [[ "${CLIENT_ISOLATION_NET:-}" == "$net" ]]; }; then
+            while [[ "$compact" == *",${net},"* ]]; do
+                compact="${compact/,${net},/,}"
+            done
+            compact="${compact#,}"; compact="${compact%,}"
+            ALLOWED_IPS="${compact//,/, }"
+            log "Isolation enabled: tunnel subnet ${net} removed from client AllowedIPs."
+        fi
+        CLIENT_ISOLATION_NET=""
+    fi
+    export CLIENT_ISOLATION_NET
+}
+
+# Server-name validation for the vpn:// URI (D#180): the description field is
+# shown in the Amnezia app after import. The constraints follow from storage
+# in awgsetup_cfg.init (the '...' wrapper) and JSON embedding: no quotes or
+# backslash, no control characters (the whole [[:cntrl:]] class: an ESC from
+# arrow keys in interactive input would break the JSON - je() does not escape
+# controls), no leading/trailing spaces (the client would show a visually
+# empty name). Length - up to 128 BYTES in the C locale (LC_ALL=C gives a
+# predictable count on any system locale; 128 bytes fit 64 two-byte UTF-8
+# characters).
+validate_server_name() {
+    local n="$1"
+    local LC_ALL=C
+    [[ -n "$n" ]] || return 1
+    (( ${#n} <= 128 )) || return 1
+    [[ "$n" == *"'"* || "$n" == *'"'* || "$n" == *'\'* ]] && return 1
+    [[ "$n" == *[[:cntrl:]]* ]] && return 1
+    [[ "$n" == " "* || "$n" == *" " ]] && return 1
+    return 0
+}
+
+# Trim surrounding whitespace (friendliness: an accidental trailing space in
+# --server-name or interactive input must not fail the install).
+_trim_ws() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# --mobile (D#38, field test 26 jun): mobile-setup shorthand =
+# --preset=mobile + port 443/udp. The main mobile problem is the port: on MTS
+# the default 39743/udp is dead while 443/udp (looks like QUIC/HTTP3) works.
+# Expanded into CLI_PRESET/CLI_PORT BEFORE their consumers: an explicit
+# user --port wins, a contradicting --preset is an error.
+resolve_mobile_flag() {
+    [[ "${CLI_MOBILE:-0}" -eq 1 ]] || return 0
+    if [[ -n "${CLI_PRESET:-}" && "$CLI_PRESET" != "mobile" ]]; then
+        die "--mobile is incompatible with --preset=${CLI_PRESET}: --mobile already implies preset mobile."
+    fi
+    CLI_PRESET="mobile"
+    if [[ -z "$CLI_PORT" ]]; then
+        CLI_PORT=443
+        log "--mobile: port 443/udp (mobile carriers often kill non-standard UDP ports)."
+    fi
+}
+
+# Server name in the Amnezia app (D#180). Priority: CLI flag > saved config >
+# interactive question (first run only, no --yes) > 'AWG Server'. A config
+# value is re-validated: the file can be hand-edited, and the name goes into
+# the vpn:// URI JSON.
+configure_server_name() {
+    local _name
+    if [[ -n "$CLI_SERVER_NAME" ]]; then
+        _name=$(_trim_ws "$CLI_SERVER_NAME")
+        validate_server_name "$_name" \
+            || die "Invalid --server-name: no quotes, backslash or control characters, at most 128 bytes."
+        AWG_SERVER_NAME="$_name"
+        log "Server name from CLI: ${AWG_SERVER_NAME}"
+    elif [[ -n "${AWG_SERVER_NAME:-}" ]]; then
+        _name=$(_trim_ws "$AWG_SERVER_NAME")
+        if validate_server_name "$_name"; then
+            AWG_SERVER_NAME="$_name"
+        else
+            log_warn "AWG_SERVER_NAME from $CONFIG_FILE is invalid, using 'AWG Server'."
+            AWG_SERVER_NAME="AWG Server"
+        fi
+    elif [[ "${config_exists:-0}" -eq 1 || "$AUTO_YES" -eq 1 ]]; then
+        AWG_SERVER_NAME="AWG Server"
+    else
+        local input_name
+        while true; do
+            read -rp "Server name in the Amnezia app [AWG Server]: " input_name < /dev/tty
+            input_name=$(_trim_ws "$input_name")
+            if [[ -z "$input_name" ]]; then AWG_SERVER_NAME="AWG Server"; break; fi
+            if validate_server_name "$input_name"; then AWG_SERVER_NAME="$input_name"; break; fi
+            log_warn "No quotes, backslash or control characters, at most 128 bytes. Try again."
+        done
+    fi
+    export AWG_SERVER_NAME
+}
+
+# Subnet-change guard: [Peer] blocks are carried over verbatim on reinstall
+# (render_server_config), and their addresses were issued in the OLD subnet.
+# Changing the subnet under live clients breaks them: old IPv4s can fall
+# outside the new range, and IPv6 suffixes can collide (the decimal /24
+# encoding vs hex for non-/24 masks yields two peers with the same ::x). So the
+# install aborts when peers exist and the subnet differs (PR #167 review).
+# Self-contained (step 0, BEFORE awg_common.sh is downloaded). The old
+# subnet is the first Address value in the awg0.conf [Interface]: it is the
+# normalized <network+1>/<prefix>, and the new AWG_TUNNEL_SUBNET has been
+# normalized by validate_subnet by the time of the call - a plain string
+# comparison is enough.
+guard_subnet_change_with_peers() {
+    [[ -f "$SERVER_CONF_FILE" ]] || return 0
+    grep -q '^\[Peer\]' "$SERVER_CONF_FILE" 2>/dev/null || return 0
+    local old_subnet
+    # Address may be dual-stack ("IPv4/n, IPv6/n") in any order - pick the IPv4
+    # element, not just the first comma field (an IPv6-first Address would
+    # otherwise look like a subnet change). No IPv4 -> empty -> fail closed below.
+    old_subnet=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$SERVER_CONF_FILE" 2>/dev/null \
+        | tr ',' '\n' | sed 's/[[:space:]]//g' \
+        | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$')
+    if [[ -z "$old_subnet" ]]; then
+        # Peers exist but the old subnet cannot be determined - fail closed: a
+        # silent continue would re-render the config in the new subnet and break
+        # the clients.
+        die "${SERVER_CONF_FILE} already contains peers, but the Address line in [Interface] is unreadable - the subnet-change check is impossible. Restore the Address line, or remove the clients (sudo bash $MANAGE_SCRIPT_PATH remove <name>), or run --uninstall and reinstall from scratch."
+    fi
+    if [[ "$old_subnet" != "$AWG_TUNNEL_SUBNET" ]]; then
+        die "The tunnel subnet changed (${old_subnet} -> ${AWG_TUNNEL_SUBNET}), but ${SERVER_CONF_FILE} already contains peers: their addresses were issued in the old subnet, and changing it breaks the clients. Options: keep the previous subnet; remove all clients (sudo bash $MANAGE_SCRIPT_PATH remove <name>); or run --uninstall and reinstall from scratch."
+    fi
+    return 0
 }
 
 # Endpoint validation (FQDN / IPv4 / [IPv6]).
@@ -897,7 +2233,11 @@ configure_routing_mode() {
            fi
            log "Selected mode: Custom ($ALLOWED_IPS)" ;;
         *) ALLOWED_IPS_MODE=2
-           ALLOWED_IPS="0.0.0.0/5, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, 160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, 172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, 192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, 192.170.0.0/15, 192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, 194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4, 8.8.8.8/32, 1.1.1.1/32"
+           # iOS breaks the tunnel if the list starts with 0.0.0.0/5: that block covers
+           # the reserved 0.0.0.0/8 which the iOS kernel chokes on, so it never reaches the
+           # rest of the routes. 1.0.0.0/8 + 2.0.0.0/7 + 4.0.0.0/6 is the same range minus the
+           # zero block (0.0.0.0/8 is non-routable anyway). Do not revert to 0.0.0.0/5 (Issue #42).
+           ALLOWED_IPS="1.0.0.0/8, 2.0.0.0/7, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, 12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, 160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, 172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, 192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, 192.170.0.0/15, 192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, 194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4, 8.8.8.8/32, 1.1.1.1/32"
            log "Selected mode: Amnezia List+DNS." ;;
     esac
     if [ -z "$ALLOWED_IPS" ]; then die "Failed to determine AllowedIPs."; fi
@@ -913,17 +2253,22 @@ rand_range() {
     local min=$1 max=$2
     local range=$((max - min + 1))
     local random_val
-    random_val=$(od -An -tu4 -N4 /dev/urandom | tr -d ' ')
+    random_val=$(od -An -tu4 -N4 /dev/urandom 2>/dev/null | tr -d ' ')
     if [[ -z "$random_val" || ! "$random_val" =~ ^[0-9]+$ ]]; then
-        # Fallback: combining two $RANDOM for 30-bit range
-        random_val=$(( (RANDOM << 15) | RANDOM ))
+        # Fallback: three $RANDOM (15 bits each) with XOR overlap cover bits
+        # 0-30, i.e. the full [0, 2^31-1]. The previous variant
+        # (RANDOM<<15|RANDOM) gave only 30 bits - the upper half of the H
+        # range could never come up.
+        random_val=$(( (RANDOM << 16) ^ (RANDOM << 8) ^ RANDOM ))
     fi
     echo $(( (random_val % range) + min ))
 }
 
 # Generate 4 non-overlapping ranges for AWG H1-H4.
 # Algorithm: 8 random values → sort → 4 (low, high) pairs.
-# Sorting guarantees low ≤ high and non-overlap between pairs.
+# Sorting gives low <= high; the strict checks below guarantee a gap between
+# pairs (touching bounds = overlap at a single point) and a lower bound >= 5
+# (values 1-4 are reserved for vanilla WireGuard message types).
 # Minimum width per range = 1000 (for proper obfuscation).
 # Prints 4 "low-high" lines to stdout. Returns 1 on failure.
 # Mitigates Russian DPI fingerprinting of static H values (#38).
@@ -967,10 +2312,14 @@ generate_awg_h_ranges() {
         sorted=$(printf '%s\n' "${arr[@]}" | sort -n)
         arr=()
         while IFS= read -r _v; do arr+=("$_v"); done <<< "$sorted"
-        if (( ${arr[1]} - ${arr[0]} >= 1000 )) && \
+        if (( ${arr[0]} >= 5 )) && \
+           (( ${arr[1]} - ${arr[0]} >= 1000 )) && \
            (( ${arr[3]} - ${arr[2]} >= 1000 )) && \
            (( ${arr[5]} - ${arr[4]} >= 1000 )) && \
-           (( ${arr[7]} - ${arr[6]} >= 1000 )); then
+           (( ${arr[7]} - ${arr[6]} >= 1000 )) && \
+           (( ${arr[2]} > ${arr[1]} )) && \
+           (( ${arr[4]} > ${arr[3]} )) && \
+           (( ${arr[6]} > ${arr[5]} )); then
             printf '%s-%s\n' "${arr[0]}" "${arr[1]}"
             printf '%s-%s\n' "${arr[2]}" "${arr[3]}"
             printf '%s-%s\n' "${arr[4]}" "${arr[5]}"
@@ -1054,6 +2403,27 @@ generate_cps_i1_quic() {
     return 0
 }
 
+# Change I1 only, without regenerating J/S/H or clearing manually configured
+# I2-I5. On a repeat run with only --i1-mode, the full generator would make all
+# previously issued client configs incompatible for no reason.
+generate_i1_for_mode() {
+    local mode="${1:-random}"
+    case "$mode" in
+        random)
+            AWG_I1=$(generate_cps_i1)
+            ;;
+        quic)
+            AWG_I1=$(generate_cps_i1_quic) || die "QUIC I1 generation failed"
+            log "  I1 mode: quic (fake QUIC v1 Initial, $(( (${#AWG_I1} - 6) / 2 )) bytes)"
+            ;;
+        *)
+            die "Invalid --i1-mode='$mode'. Allowed: random, quic."
+            ;;
+    esac
+    AWG_I1_MODE="$mode"
+    export AWG_I1 AWG_I1_MODE
+}
+
 # Generate all AWG 2.0 parameters
 generate_awg_params() {
     local preset="${CLI_PRESET:-default}"
@@ -1109,7 +2479,35 @@ generate_awg_params() {
         AWG_S2=$(rand_range 15 150)
     done
 
+    # ⚠️ The lower bounds of S3/S4 are incompatible with AmneziaWG 3.0 header
+    # protection. There the ChaCha20 nonce is never transmitted: it is taken from
+    # the first 12 bytes of the S padding of the message in question
+    # (HEADER_PROTECTION_NONCE_SIZE = 12), so both implementations REJECT a config
+    # where any of S1-S4 is below 12 while a header protection key is set. The
+    # kernel module returns -EINVAL (src/netlink.c, has_protection && val16 <
+    # HEADER_PROTECTION_NONCE_SIZE); amneziawg-go errors out in device/uapi.go
+    # (present since v3.0.0). So the failure is LOUD - there is no silent crypto
+    # weakening; verified against upstream sources on 2 aug 2026. While we stay on
+    # 2.0 and set no header protection key, these ranges are safe. WHEN header
+    # protection is enabled, raise both lower bounds to 12, otherwise a share of
+    # installs will simply fail to bring the interface up. Keep this in step with
+    # the _kernel_supports_awg3 gate.
     AWG_S3=$(rand_range 8 55)
+
+    # Second size collision: response+S2 != cookie+S3, that is S3 != S2+28.
+    # Message sizes (src/messages.h of the kernel module): init 148, response 92,
+    # cookie reply 64. The first two were measured on the wire, the cookie one is
+    # 4 (header) + 4 (receiver_index) + 24 (nonce) + 32 (cookie 16 + authtag 16).
+    # That gives three ways for the final packet sizes to match:
+    #   init/response   -> S2 = S1 + 56  (handled by the loop above)
+    #   response/cookie -> S3 = S2 + 28  (handled here)
+    #   init/cookie     -> S3 = S1 + 84  (unreachable: the minimum S1+84 is 99
+    #                                     while S3 tops out at 55, no loop needed)
+    # We regenerate S3 rather than S2, since S2 already passed the S1+56 check.
+    while [[ $((AWG_S2 + 28)) -eq $AWG_S3 ]]; do
+        AWG_S3=$(rand_range 8 55)
+    done
+
     AWG_S4=$(rand_range 4 27)
 
     # H1-H4: 4 random non-overlapping uint32 ranges.
@@ -1133,20 +2531,13 @@ generate_awg_params() {
     #                      carrier DPI. Server and clients receive the SAME
     #                      I1 via their configs; the AWG handshake follows
     #                      these bytes.
-    local _i1_mode="${CLI_I1_MODE:-${AWG_I1_MODE:-random}}"
-    case "$_i1_mode" in
-        random)
-            AWG_I1=$(generate_cps_i1)
-            ;;
-        quic)
-            AWG_I1=$(generate_cps_i1_quic) || die "QUIC I1 generation failed"
-            log "  I1 mode: quic (fake QUIC v1 Initial, $(( (${#AWG_I1} - 6) / 2 )) bytes)"
-            ;;
-        *)
-            die "Invalid --i1-mode='$_i1_mode'. Allowed: random, quic."
-            ;;
-    esac
-    AWG_I1_MODE="$_i1_mode"
+    generate_i1_for_mode "${CLI_I1_MODE:-${AWG_I1_MODE:-random}}"
+
+    # I2-I5 are NOT generated here (the admin sets them manually in awg0.conf, issue #71).
+    # A fresh param set (first install or --preset/--jc/--jmin/--jmax) clears any stale
+    # I2-I5 loaded from awgsetup_cfg.init so the new obfuscation set does not carry old
+    # values (--preset regenerates the whole set).
+    unset AWG_I2 AWG_I3 AWG_I4 AWG_I5
 
     export AWG_Jc AWG_Jmin AWG_Jmax AWG_S1 AWG_S2 AWG_S3 AWG_S4 AWG_PRESET
     export AWG_H1 AWG_H2 AWG_H3 AWG_H4 AWG_I1 AWG_I1_MODE
@@ -1171,6 +2562,527 @@ detect_hardware() {
     CPU_CORES=$(nproc)
     MAIN_NIC=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
     log "Hardware: RAM=${TOTAL_RAM_MB}MB, CPU=${CPU_CORES} cores, NIC=${MAIN_NIC}"
+}
+
+# _cleanup_package_list : the packages cleanup_system removes on this OS.
+# One source for both the cleanup and the step 0 question, otherwise they drift apart.
+# ⚠️ OS_ID deliberately has NO default: an unknown OS must not get the destructive
+# superset (snapd, lxd-agent-loader and wiping the snap directories). Empty = not Ubuntu.
+_cleanup_package_list() {
+    local list="modemmanager networkd-dispatcher unattended-upgrades packagekit udisks2"
+    [[ "${OS_ID:-}" == "ubuntu" ]] && list="snapd $list lxd-agent-loader"
+    printf '%s' "$list"
+}
+
+# _boot_critical_package_list : packages whose loss leaves the server unable to
+# boot or unable to reach the network. The core of the list comes from Issue
+# #223: there `apt full-upgrade` in step 1 removed packages including udev,
+# initramfs-tools and netplan.io among them, and the server stopped booting.
+# Without udev there is no /dev/disk/by-label, systemd never sees the partitions
+# that fstab refers to by label, and it drops into emergency mode (after 90
+# seconds of waiting by default, see DefaultDeviceTimeoutSec; both partitions
+# were waited for in parallel, not one after the other). Some names were added
+# on reasoning rather than from that incident: losing openssh-server,
+# systemd-resolved or ifupdown cuts off access just as reliably.
+#
+# How it gets there. cleanup_system purges its own list, and the ubuntu-server
+# meta-package turns out to be a reverse dependency of what is being removed, so
+# it goes along. On images where it was the only manual root, everything hanging
+# under it (ubuntu-standard, ubuntu-minimal and their dependencies) becomes "no
+# longer required". That alone is not a removal: apt lists such packages and
+# suggests `apt autoremove`. But while resolving dependencies for the upgrade
+# the resolver may pick removal over upgrading, and for a package nobody needs
+# any more that is the cheap choice. In Issue #223 it made exactly that choice.
+# We never reproduced the resolver's decision: the outcome is known, the motive
+# is not.
+#
+# ⚠️ The names ubuntu-server/ubuntu-minimal/ubuntu-standard exist only on
+# Ubuntu. Debian has no such chain, and there the list acts as ordinary
+# insurance: _installed_boot_critical simply will not find the absent ones.
+#
+# ⚠️ This list is NOT the hold list from cleanup_system: that one guards during
+# the purge, this one during the upgrade. They overlap; their purpose differs.
+_boot_critical_package_list() {
+    printf '%s' "udev initramfs-tools openssh-server netplan.io netplan-generator systemd-resolved ifupdown ubuntu-minimal ubuntu-standard"
+}
+
+# _pkg_present : 0 if the package is present in any working shape. We look at
+# the third Status field rather than at the "ok installed" substring: right
+# after a purge or an interrupted upgrade a package can sit as half-configured
+# or unpacked. For our purposes it is present and has to be protected.
+_pkg_present() {
+    local state
+    state="$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null | awk '{print $3}')"
+    case "$state" in
+        ""|not-installed|config-files) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# _installed_boot_critical : the ones actually installed on this system.
+# Prints one name per line; empty output is a reason to worry rather than a
+# normal outcome, since udev is present on virtually every server.
+_installed_boot_critical() {
+    local critical_list
+    critical_list="$(_boot_critical_package_list)"
+    local pkg
+    for pkg in $critical_list; do
+        if _pkg_present "$pkg"; then
+            printf '%s\n' "$pkg"
+        fi
+    done
+}
+
+# _pkg_installed_ok : 0 only if the package is fully installed AND configured.
+# The difference from _pkg_present is deliberate and the risk is asymmetric. For
+# the SNAPSHOT, "unpacked but not configured" counts as present: the package is
+# there and has to be protected. For the VERDICT before the reboot it does not:
+# initramfs-tools left unpacked means postinst never ran and no initramfs was
+# built for the new kernel. The server will not boot, though the package
+# formally "exists".
+_pkg_installed_ok() {
+    # We look at the THIRD field only. A full Status line is "<want> <error>
+    # <status>", and anchoring the whole "install ok installed" pins the want
+    # flag as well: `apt-mark hold` sets "hold ok installed", so a perfectly
+    # healthy package would read as lost. That is not theoretical here -
+    # cleanup_system goes out of its way to preserve operator holds. The
+    # installed state still rejects what this predicate exists for: unpacked,
+    # half-configured, half-installed, config-files.
+    [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null | awk '{print $3}')" == "installed" ]]
+}
+
+# The snapshot SURVIVES installer restarts and can only grow.
+#
+# The installer itself asks the user to run it again after a failure, and by
+# then a package may already be gone: apt can remove udev and then fail, in
+# which case the check at the end of the step never runs at all. A snapshot
+# taken afresh on the next run will not see the removed package, and the check
+# will compare the system against an impoverished baseline - staying silent
+# about exactly the state it was written for. So we merge with what was
+# recorded earlier.
+#
+# ONLY known names are taken from the file: a corrupted or substituted file must
+# not turn into a list of arbitrary packages to install.
+_boot_critical_snapshot() {
+    local now stored known union
+    now="$(_installed_boot_critical)"
+    stored=""
+    if [[ -e "$BOOT_CRITICAL_SNAPSHOT_FILE" && ! -r "$BOOT_CRITICAL_SNAPSHOT_FILE" ]]; then
+        # Otherwise an unreadable file is indistinguishable from a missing one:
+        # the list would quietly shrink and the function would immediately
+        # overwrite the history with it, while its contract is to only grow.
+        log_warn "$BOOT_CRITICAL_SNAPSHOT_FILE exists but cannot be read. The list from previous runs will not be taken into account."
+    elif [[ -r "$BOOT_CRITICAL_SNAPSHOT_FILE" ]]; then
+        known="$(_boot_critical_package_list | tr ' ' '\n')"
+        stored="$(grep -Fxf <(printf '%s\n' "$known") "$BOOT_CRITICAL_SNAPSHOT_FILE" 2>/dev/null || true)"
+    fi
+    union="$(printf '%s\n%s\n' "$now" "$stored" | grep -v '^$' | sort -u)"
+    if [[ -n "$union" ]]; then
+        mkdir -p "$AWG_DIR" 2>/dev/null || true
+        printf '%s\n' "$union" > "$BOOT_CRITICAL_SNAPSHOT_FILE" 2>/dev/null \
+            || log_warn "Could not save the protected package list to $BOOT_CRITICAL_SNAPSHOT_FILE. The check survives this run but not the next one."
+    fi
+    printf '%s' "$union"
+}
+
+# _verify_boot_critical : the last line of defence before the reboot. Takes the
+# snapshot made BEFORE the upgrade and compares it against the state right now.
+#
+# The call sits right next to request_reboot and must not drift away from it.
+# The whole point is that nothing capable of removing a package runs after it:
+# step 1 still has install_packages between the upgrade and the reboot, and that
+# calls apt install without --no-remove. A check placed before it would leave a
+# window of exactly the class it is meant to close.
+#
+# Why this is needed at all: apt is allowed to remove packages in order to
+# resolve dependencies, and in Issue #223 udev went that way - the server
+# stopped booting, and the reboot is one we trigger ourselves. So the catch
+# belongs here, while the server is still reachable: after the reboot the repair
+# would need the hosting provider's console.
+_verify_boot_critical() {
+    local critical_before="$1"
+    if [[ -z "$critical_before" ]]; then
+        log_warn "The protected package list is empty, there is nothing to compare against. That is abnormal for Ubuntu and Debian: check dpkg-query -W udev, the server may fail to boot after the reboot."
+        return 0
+    fi
+    local critical_lost=""
+    local pkg
+    for pkg in $critical_before; do
+        _pkg_installed_ok "$pkg" || critical_lost+="$pkg "
+    done
+    [[ -n "$critical_lost" ]] || return 0
+    critical_lost="${critical_lost% }"
+
+    # Before blaming the upgrade: a broken dpkg produces exactly the same
+    # picture, and a message saying "packages were removed" would send the
+    # diagnosis the wrong way.
+    _dpkg_usable || die "dpkg stopped answering, so there is no way to check the package state. Do NOT reboot the server. Run: dpkg --configure -a; apt-get check - then start the installer again."
+
+    log_warn "Packages the server cannot boot without have disappeared: $critical_lost"
+    log_warn "Restoring them..."
+    local restore_out restore_rc
+
+    # Stage 1: ONE transaction with every lost name at once.
+    # What matters is WHAT becomes a resolver goal. One at a time, `apt-get
+    # install udev` knows nothing about the other lost names: they are not
+    # goals, and apt is free to leave them absent. In one command they all
+    # become goals and apt looks for a version set that suits the group. In
+    # Issue #223 the per-package pass produced five refusals and a single
+    # transaction was never tried, which is the reason to start with it.
+    # ⚠️ Not a guarantee, for two reasons.
+    # First: if the old version is pinned by a package that is NOT in the lost
+    # list (in Issue #223 that was systemd-resolved, with a Depends on exactly
+    # 8.12 of both systemd and libsystemd-shared; the second link there is udev
+    # declaring Breaks on a systemd older than 8.17, and together the two
+    # conditions locked the group), it does not become a goal here either. apt
+    # MAY touch it anyway and sometimes does, but that is its
+    # choice, not an obligation: it prefers to leave non-goal packages alone.
+    # Second: --no-remove aborts the transaction on ANY removal in the plan, not
+    # only on removing something protected. A solution of the form "drop the
+    # package in the way and install the group" is rejected outright.
+    # Hence stage 2 below, and the final verdict from the full-set re-check. The
+    # flag is still needed: restoring one package must not cost another.
+    restore_out="$(DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove $critical_lost 2>&1)"
+    restore_rc=$?
+    # The wording is cautious on purpose: a zero from apt means "there was
+    # nothing to do" just as much as "done". Whether the packages are back is
+    # decided by stage 2 below and the full-set re-check, not by this line.
+    if [[ "$restore_rc" -eq 0 ]]; then
+        log "The single transaction completed without errors."
+    elif [[ -n "$restore_out" ]]; then
+        log_warn "Single transaction did not work (code $restore_rc), trying one by one. apt said: $(printf '%s' "$restore_out" | tr '\n' ' ' | tail -c 300)"
+    else
+        log_warn "Single transaction did not work (code $restore_rc) and apt produced no output. Trying one by one."
+    fi
+
+    # Stage 2: one at a time, and only for those still missing.
+    # A separate pass is needed because a single name with no installation
+    # candidate aborts the whole transaction, and then nothing is restored,
+    # including packages that install perfectly well. This lesson is already
+    # paid for in this project: cleanup_system (defined BELOW in this file)
+    # installs netplan.io and netplan-generator separately, because on Debian
+    # 12 the latter does not exist and it kills the whole transaction.
+    for pkg in $critical_lost; do
+        _pkg_installed_ok "$pkg" && continue
+        restore_out="$(DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove "$pkg" 2>&1)"
+        restore_rc=$?
+        if [[ "$restore_rc" -eq 0 ]] && _pkg_installed_ok "$pkg"; then
+            log "Restored: $pkg"
+        elif [[ "$restore_rc" -eq 0 ]]; then
+            # apt also returns zero when it decided there was nothing to do.
+            # Without this branch the log would contradict itself: "Restored"
+            # and three lines below "Boot-critical packages missing".
+            log_warn "apt reported success, but $pkg is still not installed."
+        elif [[ -n "$restore_out" ]]; then
+            # Single line: log_msg timestamps only the first one, and a
+            # multi-line answer breaks the log format exactly where it will
+            # later be parsed.
+            log_warn "Failed to install $pkg (code $restore_rc). apt said: $(printf '%s' "$restore_out" | tr '\n' ' ' | tail -c 300)"
+        else
+            log_warn "Failed to install $pkg (code $restore_rc) and apt produced no output: the command probably did not run at all."
+        fi
+    done
+
+    # Re-check the WHOLE set, not just what went missing. The direct route to
+    # losing a neighbour is closed by --no-remove above; this is the fallback for
+    # the day that stops holding.
+    local still_lost=""
+    for pkg in $critical_before; do
+        _pkg_installed_ok "$pkg" || still_lost+="$pkg "
+    done
+    if [[ -n "$still_lost" ]]; then
+        still_lost="${still_lost% }"
+        log_error "Do NOT reboot the server: in its current state it will not come back."
+        log_error "Boot-critical packages missing: $still_lost"
+        log_error "Try installing them in ONE command, every name at once: sudo apt-get install $still_lost"
+        log_error "One command rather than one at a time: that way apt picks versions for the whole group at once."
+        log_error "No -y on purpose: if apt then wants to REMOVE something, read the list before you confirm. Losing one more of the packages above only makes things worse."
+        log_error "If apt answers that a package not in your command is in the way (of the form 'X : Breaks: Y' or 'X : Depends: Y'), add Y to the same command: in Issue #223 that turned out to be systemd, which is not in the list above."
+        log_error "If apt refuses because of held packages, release the hold: sudo apt-mark unhold <name>"
+        log_error "If a package is gone from the repositories (renamed by a release upgrade), drop its name from $BOOT_CRITICAL_SNAPSHOT_FILE"
+        die "Stopping while the server is still reachable. Deal with the above, then run the installer again."
+    fi
+    log "Boot-critical packages restored."
+}
+
+
+# _die_upgrade_failed : name the cause of a failed upgrade and stop.
+#
+# Pulled out into its own function for a reason, not for tidiness. While this
+# reasoning lived inline inside step1_update_and_optimize, tests could only
+# check it by grepping the source, and an outside review showed that almost any
+# mutation inside survived the whole suite green: deleting the second lock
+# measurement, inverting the condition, dropping -s, dropping timeout. A test
+# can load a function whole and assert WHICH verdict is printed for WHICH state.
+#
+# The rule of this block: name the cause by evidence, not by guess. The previous
+# version blamed the dpkg lock unconditionally, including when fuser had found
+# nothing, and sent the investigation the wrong way: in Issue #223 the real
+# answer was a resolver refusal.
+_die_upgrade_failed() {
+    local lock_holder apt_why apt_why_rc
+    # Measure AGAIN rather than reusing the sample taken before the retry:
+    # dpkg --configure -a and a whole second apt run happened in between, and
+    # the process found earlier may have exited while a new one appeared.
+    lock_holder="$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null | tr -s ' ' || true)"
+    if [[ -n "$lock_holder" ]]; then
+        die "System update failed and the dpkg lock is held by:${lock_holder}. Wait for those processes to finish or run: systemctl stop unattended-upgrades; dpkg --configure -a - then run the script again."
+    fi
+    # The dry run (-s) asks apt whether a plan resolves. Its refusal usually
+    # means dependencies, but not always: an unparsable sources.list, missing
+    # package lists or a damaged dpkg state fail exactly the same way. So its
+    # answer is QUOTED, not interpreted.
+    # The timeout belongs here, on the fatal path: the real attempts above go
+    # without one deliberately, while hanging here is not acceptable - that SSH
+    # session may be all the user has left. timeout itself is always there,
+    # coreutils is Essential.
+    apt_why="$(timeout 120 env DEBIAN_FRONTEND=noninteractive apt-get upgrade -s --with-new-pkgs 2>&1)"
+    apt_why_rc=$?
+    if [[ "$apt_why_rc" -eq 0 ]]; then
+        die "System update failed, but the dependencies resolve on a re-check, so they are not the cause. Look at the apt output on screen, it is not written to the log file: usually network or mirror, disk space on / or /boot, or the package's own script."
+    fi
+    if [[ -n "$apt_why" ]]; then
+        die "System update failed. The dependency re-check answered: $(printf '%s' "$apt_why" | tr '\n' ' ' | tail -c 400)"
+    fi
+    # Third outcome: the check failed and said nothing. Claiming anything about
+    # dependencies here is exactly how an unknown turns into a confident wrong
+    # diagnosis.
+    die "System update failed, and the dependency re-check did not answer either (code $apt_why_rc, no output; code 124 means it did not finish within 120 seconds). Look at the apt output on screen, it is not written to the log file."
+}
+
+# _warn_kept_back : say out loud that not everything was upgraded.
+# apt-get upgrade leaves a package at its current version when upgrading it
+# would require removing a neighbour, and returns ZERO while doing so. That is
+# the deliberate trade (see the upgrade block in step 1), but staying silent
+# about it is not acceptable: with full-upgrade this outcome was rare (it held
+# back little beyond packages under hold and whatever Ubuntu itself phases),
+# whereas with upgrade it is routine, and without a dedicated line it would pass
+# entirely unnoticed. A warning, not a failure: the server boots either way, but
+# this list is what decides a future investigation.
+#
+# ⚠️ apt gives no machine-readable list of what it held back, so this uses
+# upgradable, which is a SUPERSET: packages under hold and packages stuck on an
+# unresolvable chain land there too. Passing it off as something narrower is not
+# acceptable, and the message below does not.
+_warn_kept_back() {
+    local raw rc kept list
+    raw="$(apt list --upgradable 2>/dev/null)"
+    rc=$?
+    # Take the exit code from apt ITSELF, not from the pipeline: in a pipeline
+    # it comes from awk unless pipefail is set, and then a failing apt reads as
+    # "nothing to upgrade". The branch below decides between silence and a
+    # warning, so it must not rest on a global shell option.
+    if [[ "$rc" -ne 0 ]]; then
+        # A failure of the check itself must not turn into contented silence:
+        # this function exists for diagnosability, so its own failure has to be
+        # audible.
+        log_warn "Could not obtain the list of packages left behind (apt list returned $rc). Check by hand: apt list --upgradable"
+        return 0
+    fi
+    kept="$(printf '%s\n' "$raw" | awk -F/ '/\//{printf "%s ", $1}')"
+    [[ -n "${kept// /}" ]] || return 0
+    list="${kept% }"
+    # Truncation is EXPLICIT and marked: on a server with months of pending
+    # updates this list runs into thousands of characters, and silent truncation
+    # nearby has already been called out as a defect.
+    if [[ "${#list}" -gt 400 ]]; then
+        list="${list:0:400}... (truncated, full list: apt list --upgradable)"
+    fi
+    log "Not every package was upgraded, these stayed at their current versions: $list"
+    log "Most often this means upgrading such a package would have to remove another one, which we deliberately do not do (Issue #223), or that the release is still being phased in. The list is not exhaustive though: packages under hold and packages stuck on unresolvable dependencies show up here too. If the list is not empty and it worries you, look at the reason: apt-get -s upgrade"
+}
+
+# _boot_critical_guard : take the snapshot and verify it. The wrapper exists for
+# the places that have not taken a snapshot yet, which is step 2.
+#
+# ⚠️ The self-tests sit HERE, before the assignment, and not inside
+# _boot_critical_snapshot, and that matters: a die inside a command
+# substitution would only end the subshell, the script would carry on with an
+# empty snapshot, and the fatal check would silently become optional.
+_boot_critical_guard() {
+    _dpkg_usable || die "dpkg does not answer, and without it there is no way to tell whether udev and initramfs-tools survive the reboot (Issue #223). Run: dpkg --configure -a; apt-get check - then start the installer again."
+    _pkg_present dpkg || die "Could not determine package state (dpkg-query or awk do not behave as expected). Without it there is no way to be sure the server will boot (Issue #223)."
+    local snapshot
+    snapshot="$(_boot_critical_snapshot)"
+    _verify_boot_critical "$snapshot"
+}
+
+# _dpkg_usable : 0 if dpkg answers can be trusted.
+# Telling "package not installed" from "dpkg database is broken" by return code is NOT
+# possible: measured on Ubuntu 24.04, both give rc=1. So ask about a package that is
+# certainly installed: if even that one is missing, the mechanism is broken, not the
+# packages. Without this an empty list would silently skip the question, and step 1
+# would later run with a working dpkg and remove what was never asked about.
+_dpkg_usable() {
+    command -v dpkg-query >/dev/null 2>&1 || return 1
+    dpkg-query -W -f='${Status}' dpkg 2>/dev/null | grep -q "ok installed"
+}
+
+# _cloud_init_removable : 0 if an installed cloud-init will actually be removed.
+# cloud-init sits outside the list above: it is removed only when it does NOT manage the
+# network. That answer is needed in two places, the cleanup itself and the step 0
+# question, so it lives here. Otherwise consent would be asked about one set while a
+# different one gets removed, which is exactly the complaint behind issue #213.
+# 🔴 Any FAILED check means "manages the network, leave it alone". The costs are not
+# symmetric: a cloud-init left in place costs tens of megabytes, one removed by mistake
+# costs the network after the next reboot on a remote server. That is why ls by glob is
+# gone from here: it returns rc=2 both when the directory is missing and when nothing matched.
+_cloud_init_removable() {
+    dpkg-query -W -f='${Status}' cloud-init 2>/dev/null | grep -q "ok installed" || return 1
+    local f
+    if [ -d /etc/netplan ]; then
+        [ -r /etc/netplan ] || return 1
+        for f in /etc/netplan/*cloud-init*; do
+            [ -e "$f" ] && return 1
+        done
+        grep -rq "cloud-init" /etc/netplan/ 2>/dev/null
+        case $? in
+            0) return 1 ;;
+            1) : ;;
+            *) return 1 ;;
+        esac
+    fi
+    if [ -f /etc/network/interfaces ] && grep -q "cloud-init" /etc/network/interfaces 2>/dev/null; then
+        return 1
+    fi
+    # On Debian cloud-init writes here rather than into the main file.
+    if [ -d /etc/network/interfaces.d ] \
+       && grep -rq "cloud-init" /etc/network/interfaces.d/ 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# _snaps_dir_readable : 0 if the snap directory exists and is readable.
+# An empty answer from _user_snaps with an unreadable directory means "could not look",
+# not "no snaps". Confusing the two is not allowed: the default of a destructive question
+# depends on it.
+_snaps_dir_readable() {
+    [ -d /var/lib/snapd/snaps ] && [ -r /var/lib/snapd/snaps ]
+}
+
+# _user_snaps : names of snaps installed by the USER, one per line, WITHOUT duplicates.
+# The directory holds one file per RETAINED REVISION, so without the dedup a snap that
+# has ever been refreshed would appear in the warning several times in a row.
+# Only snaps that carry no user data count as base ones: snapd, bare and core*.
+# 🔴 lxd is NOT filtered: LXD from a snap keeps its containers and their data in
+# /var/snap/lxd, and calling such a host "nothing to lose" means wiping them silently.
+# ⚠️ Read the files rather than the output of 'snap list': the snap binary may already be
+# gone from an earlier run, and the list would silently come back empty.
+_user_snaps() {
+    local f name
+    for f in /var/lib/snapd/snaps/*.snap; do
+        [ -e "$f" ] || continue
+        name="${f##*/}"; name="${name%_*.snap}"
+        case "$name" in
+            snapd|bare|core|core[0-9]*) continue ;;
+        esac
+        printf '%s\n' "$name"
+    done | sort -u
+}
+
+# Consent for removing system packages (issue #213). Asked at STEP 0, where the other
+# questions already live: everything after that should run without a human present.
+# The answer is stored in awgsetup_cfg.init so a repeated or resumed run does not ask
+# again and, more importantly, does not read silence as consent.
+configure_package_cleanup() {
+    [[ "$NO_TWEAKS" -eq 1 ]] && return 0
+    # The decision already exists: a command line flag or a record from an earlier run.
+    [[ -n "$KEEP_PACKAGES" ]] && return 0
+
+    if ! _dpkg_usable; then
+        KEEP_PACKAGES=1
+        log_warn "Could not query dpkg, so I will leave the system packages alone."
+        return 0
+    fi
+
+    local installed=() pkg
+    for pkg in $(_cleanup_package_list); do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            installed+=("$pkg")
+        fi
+    done
+    # cloud-init is removed by a separate branch of the cleanup and only when it does not
+    # manage the network, so it joins the list under the same condition: the question has
+    # to be about exactly what will actually be removed.
+    if _cloud_init_removable; then
+        installed+=("cloud-init")
+    fi
+
+    # The snap directories are wiped by a separate rm -rf that does NOT depend on snapd
+    # making the list above: the package may sit in 'deinstall ok config-files' state.
+    local snap_dirs=0
+    if [[ "${OS_ID:-}" == "ubuntu" ]] && { [ -d /snap ] || [ -d /var/snap ]; }; then
+        snap_dirs=1
+    fi
+
+    if [ ${#installed[@]} -eq 0 ] && [ "$snap_dirs" -eq 0 ]; then
+        KEEP_PACKAGES=0
+        return 0
+    fi
+
+    # Look for the user snaps only when something threatens them: on Debian snapd is not in the list.
+    local snaps="" snaps_unknown=0
+    if [ "$snap_dirs" -eq 1 ] || [[ " ${installed[*]} " == *" snapd "* ]]; then
+        if _snaps_dir_readable; then
+            snaps="$(_user_snaps | tr '\n' ' ')"; snaps="${snaps% }"
+        else
+            snaps_unknown=1
+        fi
+    fi
+
+    log_warn "The server is being set up as single-purpose, so these packages will be removed:"
+    [ ${#installed[@]} -gt 0 ] && log_warn "  ${installed[*]}"
+    if [ "$snap_dirs" -eq 1 ]; then
+        log_warn "  Plus the /snap, /var/snap and /var/lib/snapd directories with every snap and its data."
+        if [ "$snaps_unknown" -eq 1 ]; then
+            log_warn "  Could not check what you have installed: the snap directory is not accessible."
+        elif [[ -n "$snaps" ]]; then
+            log_warn "  Your snaps that would be lost: $snaps"
+        fi
+    fi
+    if [[ " ${installed[*]} " == *" cloud-init "* ]]; then
+        log_warn "  Removing cloud-init also wipes the /etc/cloud and /var/lib/cloud directories."
+    fi
+
+    if [[ "$AUTO_YES" -eq 1 ]]; then
+        KEEP_PACKAGES=0
+        log "Removal auto-confirmed (--yes). To keep the packages: --keep-packages."
+        return 0
+    fi
+
+    # Something to lose means removing ONLY on an explicit yes (an allowlist, like every
+    # other destructive question in the script). The earlier version tested the answer for
+    # the letter n, so "no thanks", a stray key or any answer in another language meant REMOVE.
+    local risky=0
+    if [[ -n "$snaps" ]] || [ "$snaps_unknown" -eq 1 ]; then risky=1; fi
+
+    local answer="" hint="[Y/n]"
+    [ "$risky" -eq 1 ] && hint="[y/N]"
+    if ! read -rp "Remove these packages? $hint: " answer < /dev/tty; then
+        KEEP_PACKAGES=1
+        log_warn "No terminal available, could not ask - keeping the packages."
+        return 0
+    fi
+    # Trim spaces and CR: an answer from putty arrives with a trailing \r.
+    answer="$(printf '%s' "$answer" | tr -d '[:space:]')"
+
+    if [ "$risky" -eq 1 ]; then
+        case "$answer" in
+            [Yy]|[Yy][Ee][Ss]|да|Да|ДА|д|Д) KEEP_PACKAGES=0 ;;
+            *)                              KEEP_PACKAGES=1 ;;
+        esac
+    else
+        case "$answer" in
+            [Nn]|[Nn][Oo]|нет|Нет|НЕТ|не|Не|н|Н) KEEP_PACKAGES=1 ;;
+            *)                                    KEEP_PACKAGES=0 ;;
+        esac
+    fi
+
+    if [[ "$KEEP_PACKAGES" -eq 1 ]]; then
+        log "Keeping the packages. The firewall, Fail2Ban and the optimization stay in place."
+    fi
+    return 0
 }
 
 # Remove unnecessary packages and services
@@ -1212,10 +3124,8 @@ cleanup_system() {
     # snapd and lxd-agent-loader — Ubuntu only, not present on Debian
     local packages_to_remove=()
     local pkg
-    local cleanup_list="modemmanager networkd-dispatcher unattended-upgrades packagekit udisks2"
-    if [[ "${OS_ID:-ubuntu}" == "ubuntu" ]]; then
-        cleanup_list="snapd $cleanup_list lxd-agent-loader"
-    fi
+    local cleanup_list
+    cleanup_list="$(_cleanup_package_list)"
     for pkg in $cleanup_list; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
             packages_to_remove+=("$pkg")
@@ -1228,7 +3138,7 @@ cleanup_system() {
     fi
 
     # Cleaning snap artifacts (Ubuntu only)
-    if [[ "${OS_ID:-ubuntu}" == "ubuntu" && -d /snap ]]; then
+    if [[ "${OS_ID:-}" == "ubuntu" && -d /snap ]]; then
         log "Cleaning snap artifacts..."
         rm -rf /snap /var/snap /var/lib/snapd 2>/dev/null || log_warn "snap cleanup error"
     fi
@@ -1236,16 +3146,7 @@ cleanup_system() {
     # cloud-init: remove only if NOT managing network
     # Conservative approach: check cloud-init markers first, then renderer
     if dpkg-query -W -f='${Status}' cloud-init 2>/dev/null | grep -q "ok installed"; then
-        local cloud_manages_network=0
-        # Check cloud-init markers (priority — safety)
-        if ls /etc/netplan/*cloud-init* &>/dev/null 2>&1; then
-            cloud_manages_network=1
-        elif grep -rq "cloud-init" /etc/netplan/ 2>/dev/null; then
-            cloud_manages_network=1
-        elif [[ -f /etc/network/interfaces ]] && grep -q "cloud-init" /etc/network/interfaces 2>/dev/null; then
-            cloud_manages_network=1
-        fi
-        if [[ $cloud_manages_network -eq 0 ]]; then
+        if _cloud_init_removable; then
             log "Removing cloud-init (network doesn't depend on it)..."
             DEBIAN_FRONTEND=noninteractive apt-get purge -y cloud-init 2>/dev/null || log_warn "cloud-init removal error"
             rm -rf /etc/cloud /var/lib/cloud 2>/dev/null
@@ -1358,6 +3259,15 @@ optimize_swap() {
         # left in a comment).
         if ! awk '!/^[[:space:]]*#/ && $1 == "/swapfile" && $3 == "swap" {found=1} END {exit !(found+0)}' \
              /etc/fstab; then
+            # Make sure the file ends with a newline. Without it our entry
+            # would be glued onto the last fstab line, turning it into a
+            # single malformed record of 11 fields instead of six. Command
+            # substitution strips trailing newlines, so a properly
+            # terminated file yields an empty string and no extra newline
+            # is added.
+            if [[ -s /etc/fstab && -n "$(tail -c1 /etc/fstab)" ]]; then
+                echo >> /etc/fstab
+            fi
             echo '/swapfile none swap sw 0 0' >> /etc/fstab
         fi
         log "Swap file created: ${target_swap_mb}MB"
@@ -1652,6 +3562,8 @@ setup_improved_firewall() {
     log "SSH port(s) for the UFW rule: ${ssh_ports}"
 
     local ufw_errors=0
+    # Do not remove the old UDP port or old awg0→main route here: EXIT may
+    # still need the previous awg0. Both are cleaned up in step7.
     if ufw status 2>/dev/null | grep -q inactive; then
         log "UFW is inactive. Configuring..."
         ufw default deny incoming  || { log_warn "UFW: failed to set default deny incoming"; ufw_errors=1; }
@@ -1660,7 +3572,7 @@ setup_improved_firewall() {
             ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
         done
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN" || { log_warn "UFW: failed to allow VPN port"; ufw_errors=1; }
-        if [[ -n "$main_nic" ]]; then
+        if [[ -n "$main_nic" ]] && ufw_main_route_required; then
             ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
                 || { log_warn "UFW: failed to add route rule"; ufw_errors=1; }
             log "VPN routing rule added (awg0 → ${main_nic})."
@@ -1688,12 +3600,12 @@ setup_improved_firewall() {
         else
             log "Auto-enabling UFW (--yes)."
         fi
-        if ! [[ "$confirm_ufw" =~ ^[Yy]$ ]]; then
+        if ! [[ "$confirm_ufw" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
             log_warn "UFW configured but not activated by your choice."
             log_warn "The server is running WITHOUT a firewall. Enable later: sudo ufw enable"
             return 0
         fi
-        if ! ufw enable <<< "y"; then die "UFW enable error."; fi
+        if ! ufw --force enable; then die "UFW enable error."; fi
         log "UFW enabled."
         # Marker: UFW was enabled by our installer (not by the user beforehand).
         # Used in step_uninstall to decide whether disabling UFW is safe.
@@ -1707,7 +3619,7 @@ setup_improved_firewall() {
             ufw limit "${_sp}/tcp" comment "SSH Rate Limit" || { log_warn "UFW: failed to limit SSH (port ${_sp})"; ufw_errors=1; }
         done
         ufw allow "${AWG_PORT}/udp" comment "AmneziaWG VPN" || { log_warn "UFW: failed to allow VPN port"; ufw_errors=1; }
-        if [[ -n "$main_nic" ]]; then
+        if [[ -n "$main_nic" ]] && ufw_main_route_required; then
             ufw route allow in on awg0 out on "$main_nic" comment "AmneziaWG Routing" \
                 || { log_warn "UFW: failed to add route rule"; ufw_errors=1; }
         fi
@@ -1750,10 +3662,27 @@ secure_files() {
 
 setup_fail2ban() {
     log "Configuring Fail2Ban..."
-    if ! command -v fail2ban-client &>/dev/null; then install_packages fail2ban; fi
+    if ! command -v fail2ban-client &>/dev/null; then
+        install_packages fail2ban
+        # Marker: the fail2ban package was installed by our installer (rather
+        # than being present before it). step_uninstall purges fail2ban only
+        # when the marker exists, so it never wipes SSH protection the user
+        # had set up beforehand (symmetric to .ufw_enabled_by_installer).
+        if command -v fail2ban-client &>/dev/null; then
+            touch "$AWG_DIR/.fail2ban_installed_by_installer" 2>/dev/null || \
+                log_warn "Failed to create the fail2ban marker - uninstall will not remove the fail2ban package."
+        fi
+    fi
     if ! command -v fail2ban-client &>/dev/null; then
         log_warn "Fail2Ban not installed, skipping."
         return 1
+    fi
+
+    # banaction=ufw only takes effect with UFW active: if the user declined to
+    # enable UFW at step 4, bans land in an inactive ruleset and effectively
+    # do nothing (while fail2ban itself looks "green").
+    if ufw status 2>/dev/null | grep -q inactive; then
+        log_warn "UFW is not active: fail2ban bans (banaction=ufw) have no effect while UFW is off. Enable with: sudo ufw enable"
     fi
 
     # Debian: journald instead of rsyslog, needs python3-systemd
@@ -1802,8 +3731,13 @@ check_service_status() {
         ok=0
     fi
 
-    if ! ip addr show awg0 &>/dev/null; then
-        log_error "Interface awg0 not found!"
+    if ! systemctl is-active --quiet awg-quick@awg0; then
+        log_error "awg-quick@awg0 is not active!"
+        ok=0
+    fi
+
+    if ! ip link show up dev awg0 &>/dev/null; then
+        log_error "Interface awg0 is missing or not UP!"
         ok=0
     fi
 
@@ -1845,15 +3779,94 @@ check_service_status() {
 # Diagnostics
 # ==============================================================================
 
+# The report is meant to be pasted into a PUBLIC issue: our own bug template asks
+# for its contents. Key values are stripped by one shared function rather than by
+# separate masking inside each section: sections get added over time and masking
+# done inside one of them drifts apart from the rest. That is exactly how
+# PresharedKey ended up in the report in clear text while PrivateKey was masked on
+# the line next to it.
+# Applied at TWO points (one implementation, not two sources of truth): at the
+# report boundary and separately to the server config.
+# NOTE: the second point covers the server config ONLY. awg show output and the
+# journal do not pass through it, so those are what would leak if the outer
+# pipeline were ever detached.
+# NOTE: the AWG_ENDPOINT masking further down this function is a deliberate
+# exception to the "one function" rule: it hides an address rather than a key.
+#
+# The expressions are CONTEXT BOUND. An unanchored version stripped a value wherever
+# a key name appeared and damaged unrelated fields: the server name is free text
+# allowing spaces and equals signs, so an AWG_SERVER_NAME line containing the text
+# "PrivateKey = Office" lost both the value and its closing quote. Client names are
+# protected from that by the ^[a-zA-Z0-9_-]+$ validation (which lives in
+# manage_amneziawg.sh and awg_common.sh, not here), but a hand-edited #_Name may
+# contain anything.
+#
+# Four contexts:
+#   1. a configuration line AT START OF LINE, with an optional comment marker. The
+#      marker is needed NOT because awg would parse such a line: it discards it
+#      entirely (config_read_line truncates at the first hash BEFORE parsing). It is
+#      needed because the value physically sits in a file that gets pasted into a
+#      public issue. Masked TO END OF LINE: parsing strips whitespace beforehand, so
+#      a record like "PrivateKey = AA BB=" is valid and cutting at the first space
+#      would have left the tail of the key in the report.
+#   2. an awg show label at start of line. HeaderProtectionKey is mandatory here:
+#      awg show prints it IN CLEAR TEXT (show.c: key() instead of masked_key()),
+#      unlike the private and preshared keys which it hides itself. This also
+#      settles WG_HIDE_KEYS=never.
+#   3. "Line unrecognized: ..." - unanchored. awg prints the line to stderr ALREADY
+#      CLEANED (truncated at the hash, whitespace removed) and wrapped in a backtick
+#      and a quote. Hence the ".?" in the expression: it skips that backtick.
+#      DO NOT REMOVE ".?": without it the real line does not match at all.
+#      The error branch fires on ANY unrecognized line: a typo in a key name, a key
+#      in the wrong section (PrivateKey inside [Peer] goes to stderr in full), a key
+#      from another implementation. A hand-added third-line parameter is one case
+#      among them, not the only one.
+#   4. "Key is not the correct length or format: ..." - same place, but the message
+#      carries NO key name at all, so it cannot be matched by one.
+# NOTE: the anchors on 1 and 2 mean those forms are NOT caught in the Service Status
+# section, where systemctl status adds its own timestamped prefix. The journal
+# section does not suffer from this: journalctl is called there with --output=cat,
+# that is, without a prefix.
+# Case insensitivity (flag I) because config parsing is case insensitive too
+# (strncasecmp).
+#
+# FOUR UPSTREAM STRING LITERALS carry the whole thing: "private key:",
+# "header protection key:", "Line unrecognized:", "Key is not the correct length or
+# format:". Checked against amneziawg-tools ee0f0a9 (src/config.c, src/show.c) on
+# 25 aug 2026. If any of them is reworded upstream the filter silently stops
+# matching, and the tests stay green because they hard-code the same strings.
+# RE-CHECK when bumping amneziawg-tools.
+_mask_report_secrets() {
+    sed -E \
+        -e 's/^([[:space:]]*#?[[:space:]]*(PrivateKey|PresharedKey|HeaderProtectionKey)[[:space:]]*=[[:space:]]*).*/\1[HIDDEN]/I' \
+        -e 's/^([[:space:]]*(private key|preshared key|header protection key)[[:space:]]*:[[:space:]]*).*/\1(hidden)/I' \
+        -e 's/(Line unrecognized:[[:space:]]*.?(PrivateKey|PresharedKey|HeaderProtectionKey)[[:space:]]*=[[:space:]]*).*/\1[HIDDEN]/I' \
+        -e 's/(Key is not the correct length or format:[[:space:]]*).*/\1[HIDDEN]/I'
+}
+
 create_diagnostic_report() {
+    # --diagnostic runs BEFORE initialize_setup (home of the main root check):
+    # as a regular user every log_msg write into /root/awg fails, the report
+    # is not created, and exit 0 would look like a false success.
+    if [ "$(id -u)" -ne 0 ]; then die "Run the script as root (sudo bash $0 --diagnostic)."; fi
     log "Creating diagnostics..."
-    local rf
+    local rf _diag_umask
     rf="$AWG_DIR/diag_$(date +%F_%T).txt"
+    # The file is created by redirection BEFORE chmod, so its mode at creation
+    # time comes from the umask. Same idiom as for keys in awg_common.sh: narrow
+    # the permissions up front instead of repairing them afterwards. --diagnostic
+    # runs BEFORE secure_files, so /root/awg may exist with default permissions
+    # and the 0644 window is genuinely reachable.
+    _diag_umask=$(umask); umask 077
     {
         echo "=== AMNEZIAWG 2.0 DIAGNOSTIC REPORT ==="
         echo ""
-        echo "!!! WARNING: This report contains IP addresses, ports and routes."
-        echo "!!! Review and redact private data before posting to public issues."
+        echo "!!! WARNING: PrivateKey, PresharedKey and HeaderProtectionKey values are"
+        echo "!!! stripped wherever they are labelled by name or by an awg show label."
+        echo "!!! What stays in the report: IP addresses, ports, routes, obfuscation"
+        echo "!!! parameters, client names and public keys. The server endpoint is"
+        echo "!!! additionally hidden. Review what of that you do not want to be"
+        echo "!!! public before posting to a public issue."
         echo ""
         echo "Generated: $(date)"
         echo "Hostname: $(hostname)"
@@ -1876,9 +3889,11 @@ create_diagnostic_report() {
         fi
         echo ""
         echo "--- Server Config ($SERVER_CONF_FILE) ---"
-        # Mask private key
+        # Second enforcement point, SAME function: one implementation, two places.
+        # That is not a second source of truth, and if the outer filter is ever
+        # detached from the block, the riskiest raw input stays covered.
         if [[ -f "$SERVER_CONF_FILE" ]]; then
-            sed 's/PrivateKey = .*/PrivateKey = [HIDDEN]/' "$SERVER_CONF_FILE"
+            _mask_report_secrets < "$SERVER_CONF_FILE" || echo "ERROR: could not read or filter $SERVER_CONF_FILE"
         else
             echo "File not found"
         fi
@@ -1904,6 +3919,55 @@ create_diagnostic_report() {
         echo "--- Routing Table ---"
         ip route 2>/dev/null
         echo ""
+        echo "--- Cascade / Split Routing ---"
+        # The cascade (CASCADE.en.md) lives outside awg0.conf: its own table, mark, ipset and mangle
+        # rules. Without this block the report cannot tell whether the split is applied (issue #212).
+        if [ -f "$AWG_DIR/awg-routing.sh" ] || ip link show awg1 &>/dev/null; then
+            # is-active prints "inactive" AND returns non-zero, so $(... || echo N/A) would emit
+            # BOTH strings at once. Take the output as is; N/A only when it comes back empty.
+            local _casc_active _casc_enabled _casc_out
+            _casc_active=$(systemctl is-active awg-routing 2>/dev/null || true)
+            _casc_enabled=$(systemctl is-enabled awg-routing 2>/dev/null || true)
+            echo "unit awg-routing: active=${_casc_active:-N/A}, enabled=${_casc_enabled:-N/A}"
+            # "not found" and "could not check" are kept apart on purpose: silencing stderr and
+            # printing the same line would turn a failed command into a claim that the rules are
+            # absent, sending triage the wrong way. grep -m10 instead of | head -10: it does not
+            # break the pipe, so pipefail cannot return 141 and fire the || branch after output.
+            if _casc_out=$(ip rule show 2>&1); then
+                grep -w fwmark <<< "$_casc_out" || echo "ip rule: no rules by mark"
+            else
+                echo "ip rule: CHECK FAILED: $(head -1 <<< "$_casc_out")"
+            fi
+            echo "table 100: $(ip route show table 100 2>/dev/null | tr '\n' '; ')"
+            echo "ipset sets: $(ipset list -n 2>/dev/null | tr '\n' ' ' || echo 'N/A')"
+            if _casc_out=$(ipset list ru 2>&1); then
+                grep "Number of entries" <<< "$_casc_out" || echo "ipset ru: entry counter not found"
+            else
+                echo "ipset ru: set not present ($(head -1 <<< "$_casc_out"))"
+            fi
+            echo "ru.zone: $(stat -c '%y, %s bytes' "$AWG_DIR/ru.zone" 2>/dev/null || echo 'no file')"
+            if _casc_out=$(iptables -t mangle -S PREROUTING 2>&1); then
+                grep -m10 -E "match-set|MARK" <<< "$_casc_out" || echo "mangle PREROUTING: no cascade rules"
+            else
+                echo "mangle PREROUTING: CHECK FAILED: $(head -1 <<< "$_casc_out")"
+            fi
+            # Grep for "-o awg1" rather than MASQUERADE: a plain MASQUERADE on the external
+            # interface is added by the installer itself in PostUp, it exists on EVERY install, and
+            # matching it would make the "no rules" branch unreachable while the report showed NAT
+            # as present with the cascade rule missing. NAT must be checked: the script applies it
+            # LAST, so a run cut short
+            # leaves everything else in place but not that rule. The symptom is deceptive: Russian
+            # sites work and nothing else does, while a report without this line would show a
+            # perfectly healthy cascade.
+            if _casc_out=$(iptables -t nat -S POSTROUTING 2>&1); then
+                grep -m10 -- "-o awg1" <<< "$_casc_out" || echo "nat POSTROUTING: no cascade rule (-o awg1)"
+            else
+                echo "nat POSTROUTING: CHECK FAILED: $(head -1 <<< "$_casc_out")"
+            fi
+        else
+            echo "not configured"
+        fi
+        echo ""
         echo "--- Kernel Params ---"
         sysctl net.ipv4.ip_forward net.ipv6.conf.all.disable_ipv6 2>/dev/null
         echo ""
@@ -1920,7 +3984,8 @@ create_diagnostic_report() {
         modinfo amneziawg 2>/dev/null || echo "N/A"
         echo ""
         echo "=== END ==="
-    } > "$rf" || log_error "Report write error."
+    } | _mask_report_secrets > "$rf" || die "Report write error: $rf"
+    umask "$_diag_umask"
     chmod 600 "$rf" || log_warn "Report chmod error."
     log "Report: $rf"
 }
@@ -1943,16 +4008,29 @@ step_uninstall() {
     else
         log "Auto-confirming uninstall (--yes)."
     fi
-    if [[ -z "$backup" || "$backup" =~ ^[Yy]$ ]]; then
-        local bf
+    if [[ -z "$backup" || "$backup" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
+        local bf _bp
+        local -a _backup_paths=("${AWG_DIR#/}")
+        for _bp in \
+            etc/amnezia \
+            etc/wireguard \
+            etc/dnsmasq.d/amneziawg.conf \
+            etc/systemd/resolved.conf.d/amneziawg.conf \
+            etc/default/awg-warp-bypass \
+            etc/systemd/system/awg-warp-bypass.service \
+            etc/systemd/system/awg-warp-bypass.timer \
+            etc/systemd/system/awg-quick@awg0.service.d/10-awgchain-dependency.conf \
+            usr/local/sbin/awg-warp-bypass.sh \
+            usr/local/bin/wgcf; do
+            [[ -e "/$_bp" ]] && _backup_paths+=("$_bp")
+        done
         bf="$HOME/awg_uninstall_backup_$(date +%F_%H-%M-%S).tar.gz"
         log "Creating backup: $bf"
-        if tar -czf "$bf" -C / etc/amnezia "$AWG_DIR" --ignore-failed-read 2>/dev/null \
-            && chmod 600 "$bf"; then
-            log "Backup created: $bf"
-        else
-            log_warn "Backup failed — check $bf manually before continuing"
+        if ! tar -czf "$bf" -C / "${_backup_paths[@]}" 2>/dev/null || ! chmod 600 "$bf"; then
+            rm -f "$bf"
+            die "The requested backup failed; uninstall cancelled without deleting components."
         fi
+        log "Backup created: $bf"
     fi
     # Load --no-tweaks flag from saved configuration
     local saved_no_tweaks=0
@@ -1962,62 +4040,239 @@ step_uninstall() {
         saved_no_tweaks=${saved_no_tweaks:-0}
     fi
     log "Stopping service..."
-    systemctl stop awg-quick@awg0 2>/dev/null
-    systemctl disable awg-quick@awg0 2>/dev/null
-    # Multi-hop: tear down the upstream interface too, when role=entry
-    local _up_iface=""
+    command -v ip >/dev/null 2>&1 \
+        || die "The ip command is required for mandatory live-awg0 verification; uninstall cancelled."
+    local _uninstall_awg0_state=""
+    _uninstall_awg0_state=$(systemctl is-active awg-quick@awg0 2>/dev/null || true)
+    if [[ "$_uninstall_awg0_state" =~ ^(active|activating|deactivating|reloading)$ ]]; then
+        systemctl stop awg-quick@awg0 || die "Could not stop active awg-quick@awg0; uninstall cancelled."
+    fi
+    if command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1; then
+        [[ -f "$SERVER_CONF_FILE" && ! -L "$SERVER_CONF_FILE" ]] \
+            && timeout 15 awg-quick down "$SERVER_CONF_FILE" >/dev/null 2>&1 \
+            || die "Live awg0 could not be removed safely with the expected config; uninstall cancelled."
+    fi
+    if systemctl is-active --quiet awg-quick@awg0 2>/dev/null \
+        || { command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1; }; then
+        die "awg0 is still active/live; support/config teardown cancelled."
+    fi
+    # Isolation DROP rules (issue #178): the on-disk config's PostDown may no
+    # longer contain -D DROP (an on->off reinstall interrupted between steps
+    # 6 and 7) - drain stale rules explicitly, same as step 7.
+    while iptables -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null; do :; done
+    while ip6tables -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null; do :; done
+    systemctl disable awg-quick@awg0 2>/dev/null \
+        || die "Could not disable awg-quick@awg0; uninstall cancelled before config removal."
+    # Remove only the drop-in whose ownership is proven by the exact marker.
+    # A foreign file at the same path without a marker is left untouched.
+    if [[ -e "$AWG0_DEPENDENCY_MARKER" || -L "$AWG0_DEPENDENCY_MARKER" ]]; then
+        local _dependency_path=""
+        [[ -f "$AWG0_DEPENDENCY_MARKER" && ! -L "$AWG0_DEPENDENCY_MARKER" ]] \
+            || die "Invalid systemd dependency marker; uninstall cancelled."
+        IFS= read -r _dependency_path < "$AWG0_DEPENDENCY_MARKER" || _dependency_path=""
+        [[ "$_dependency_path" == "$AWG0_DEPENDENCY_DROPIN" ]] \
+            || die "Invalid path in the systemd dependency marker; uninstall cancelled."
+        rm -f -- "$AWG0_DEPENDENCY_DROPIN" || die "Could not remove the awg0 dependency drop-in."
+        rm -f -- "$AWG0_DEPENDENCY_MARKER" || die "Could not clear the awg0 dependency marker."
+        rmdir "$(dirname "$AWG0_DEPENDENCY_DROPIN")" 2>/dev/null || true
+        systemctl daemon-reload || die "systemctl daemon-reload failed after awg0 dependency removal."
+    fi
+    # Remove DNS and bypass before WARP: their timer/routes must not outlive
+    # egress, and exact teardown requires the current common library.
+    if [[ -e "$AWG_DIR/.amnezia_dns_enabled_by_installer" || -L "$AWG_DIR/.amnezia_dns_enabled_by_installer" \
+          || -e "$AWG_DIR/.warp_bypass_enabled_by_installer" || -L "$AWG_DIR/.warp_bypass_enabled_by_installer" ]]; then
+        local _cleanup_common="$COMMON_SCRIPT_PATH" _local_common=""
+        if [[ -n "$INSTALLER_DIR" ]]; then
+            _local_common="$INSTALLER_DIR/${COMMON_SCRIPT_URL##*/}"
+            [[ -f "$_local_common" ]] && _cleanup_common="$_local_common"
+        fi
+        [[ -f "$_cleanup_common" && ! -L "$_cleanup_common" ]] \
+            || die "The current awg_common_en.sh is required for safe DNS/WARP bypass cleanup."
+        # shellcheck source=/dev/null
+        source "$_cleanup_common" || die "Could not load $_cleanup_common for cleanup."
+        declare -F teardown_amnezia_dns >/dev/null 2>&1 \
+            && teardown_amnezia_dns || die "Safe AmneziaDNS removal failed."
+        declare -F teardown_warp_bypass >/dev/null 2>&1 \
+            && teardown_warp_bypass || die "Safe WARP bypass removal failed."
+    fi
+    # Multi-hop: tear down the upstream interface only when the saved role is
+    # entry. AWG_UPSTREAM_IFACE is persisted for single too, so checking the
+    # name alone could stop an unrelated awg-quick@awg1 on uninstall.
+    local _saved_role="" _saved_egress="" _up_iface="" _warp_iface=""
     if [[ -f "$CONFIG_FILE" ]]; then
+        _saved_role=$(safe_read_config_key "AWG_ROLE" "$CONFIG_FILE" 2>/dev/null || echo "")
+        _saved_egress=$(safe_read_config_key "AWG_EGRESS" "$CONFIG_FILE" 2>/dev/null || echo "")
         _up_iface=$(safe_read_config_key "AWG_UPSTREAM_IFACE" "$CONFIG_FILE" 2>/dev/null || echo "")
+        _warp_iface=$(safe_read_config_key "AWG_WARP_IFACE" "$CONFIG_FILE" 2>/dev/null || echo "")
     fi
     _up_iface="${_up_iface:-awg1}"
-    if [[ "$_up_iface" != "awg0" ]] && systemctl list-unit-files "awg-quick@${_up_iface}.service" 2>/dev/null | grep -q "${_up_iface}"; then
-        log "Stopping upstream interface ${_up_iface}..."
-        systemctl stop "awg-quick@${_up_iface}" 2>/dev/null
-        systemctl disable "awg-quick@${_up_iface}" 2>/dev/null
-    fi
-    # WARP egress: tear down wgcf ONLY if it was brought up by our installer.
-    # The $AWG_DIR/.wgcf_enabled_by_installer marker protects a user's
-    # pre-existing wgcf from destructive removal.
-    if [[ -f "$AWG_DIR/.wgcf_enabled_by_installer" ]]; then
-        log "Stopping Cloudflare WARP (wg-quick@wgcf)..."
-        systemctl stop wg-quick@wgcf 2>/dev/null
-        systemctl disable wg-quick@wgcf 2>/dev/null
-        rm -f /etc/wireguard/wgcf.conf /etc/wireguard/wgcf-account.toml
-        rm -f /usr/local/bin/wgcf
-        rm -f "$AWG_DIR/.wgcf_enabled_by_installer"
-        log "WARP removed."
-    fi
-    if [[ -f "$AWG_DIR/.warp_bypass_enabled_by_installer" ]]; then
-        log "Removing WARP bypass (service + timer)..."
-        systemctl stop awg-warp-bypass.timer 2>/dev/null
-        systemctl disable awg-warp-bypass.timer 2>/dev/null
-        systemctl stop awg-warp-bypass.service 2>/dev/null
-        systemctl disable awg-warp-bypass.service 2>/dev/null
-        rm -f /etc/systemd/system/awg-warp-bypass.service \
-              /etc/systemd/system/awg-warp-bypass.timer \
-              /usr/local/sbin/awg-warp-bypass.sh \
-              /etc/amnezia/amneziawg/warp-bypass.conf \
-              /etc/default/awg-warp-bypass
-        rm -f "$AWG_DIR/.warp_bypass_enabled_by_installer"
-        systemctl daemon-reload 2>/dev/null
-        log "WARP bypass removed."
-    fi
-    if [[ -f "$AWG_DIR/.amnezia_dns_enabled_by_installer" ]]; then
-        log "Removing AmneziaDNS (dnsmasq config on the tunnel gateway)..."
-        rm -f /etc/dnsmasq.d/amneziawg.conf
-        # The systemd-resolved drop-in was only placed on an actual port-53
-        # collision. Remove unconditionally: a file under our name is ours.
-        if [[ -f /etc/systemd/resolved.conf.d/amneziawg.conf ]]; then
-            rm -f /etc/systemd/resolved.conf.d/amneziawg.conf
-            systemctl restart systemd-resolved 2>/dev/null || true
+    _warp_iface="${_warp_iface:-wgcf}"
+    local _pending_up_marker="$AWG_DIR/.upstream_cleanup_pending" _pending_up_iface=""
+    if [[ -e "$_pending_up_marker" || -L "$_pending_up_marker" ]]; then
+        [[ -f "$_pending_up_marker" && ! -L "$_pending_up_marker" ]] \
+            || die "Unsafe upstream cleanup marker; uninstall cancelled."
+        IFS= read -r _pending_up_iface < "$_pending_up_marker" || _pending_up_iface=""
+        if [[ "$_pending_up_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$_pending_up_iface" != "awg0" ]]; then
+            stop_owned_tunnel_runtime awg "$_pending_up_iface" \
+                "/etc/amnezia/amneziawg/${_pending_up_iface}.conf" \
+                || die "Could not remove previous upstream ${_pending_up_iface} from runtime completely; uninstall cancelled."
+            systemctl disable "awg-quick@${_pending_up_iface}" 2>/dev/null \
+                || die "Could not disable previous upstream ${_pending_up_iface}; marker retained."
+            if command -v ufw >/dev/null 2>&1 && ! ufw status 2>/dev/null | grep -q inactive; then
+                delete_owned_ufw_route_if_present "$_pending_up_iface" \
+                    "AmneziaWG cascade awg0->${_pending_up_iface}" \
+                    || die "Previous upstream owned UFW route is ambiguous; uninstall cancelled."
+            fi
+            rm -f "$_pending_up_marker" || die "Could not clear upstream cleanup marker."
+        else
+            die "Invalid upstream cleanup marker; safe uninstall is not possible."
         fi
-        systemctl restart dnsmasq 2>/dev/null || true
-        # We do NOT remove the dnsmasq package: the user may have installed
-        # it before our installer for other purposes. An empty dnsmasq after
-        # our uninstall is expected.
-        rm -f "$AWG_DIR/.amnezia_dns_enabled_by_installer"
-        log "AmneziaDNS removed (dnsmasq package kept, /etc/dnsmasq.d/amneziawg.conf deleted)."
     fi
+    # An interrupted WARP→WARP migration keeps old-iface ownership in parked
+    # markers. Clean it BEFORE processing the new iface's regular markers;
+    # otherwise removing AWG_DIR would destroy the only proof of old ownership.
+    local _pending_warp_marker="$AWG_DIR/.warp_cleanup_pending" _pending_warp_iface=""
+    if [[ -e "$_pending_warp_marker" || -L "$_pending_warp_marker" ]]; then
+        [[ -f "$_pending_warp_marker" && ! -L "$_pending_warp_marker" ]] \
+            || die "Unsafe WARP cleanup marker; uninstall cancelled."
+        IFS= read -r _pending_warp_iface < "$_pending_warp_marker" || _pending_warp_iface=""
+        [[ "$_pending_warp_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ \
+           && "$_pending_warp_iface" != "awg0" ]] \
+            || die "Invalid WARP cleanup marker; safe uninstall is not possible."
+        if [[ "$_saved_egress" == "warp" && "$_warp_iface" == "$_pending_warp_iface" ]]; then
+            # A crash before the init commit leaves the current iface in the
+            # cleanup journal. Restore its parked ownership to the regular
+            # markers; the owned-current teardown below then removes it once.
+            if [[ -e "$AWG_DIR/.warp_cleanup_service_owner" || -L "$AWG_DIR/.warp_cleanup_service_owner" \
+                  || -e "$AWG_DIR/.warp_cleanup_created_config_owner" || -L "$AWG_DIR/.warp_cleanup_created_config_owner" \
+                  || -e "$AWG_DIR/.warp_cleanup_managed_config_owner" || -L "$AWG_DIR/.warp_cleanup_managed_config_owner" ]]; then
+                _INSTALL_ROLLBACK_WARP_PARKED=1
+                _install_restore_parked_warp_ownership \
+                    || die "Could not restore current WARP ownership; uninstall cancelled."
+            fi
+            rm -f -- "$_pending_warp_marker" \
+                || die "Could not clear the stale current WARP cleanup marker."
+        else
+            local AWG_EGRESS="${_saved_egress:-direct}"
+            local AWG_WARP_IFACE="${_warp_iface:-wgcf}"
+            finalize_deferred_mode_cleanup \
+                || die "Could not safely clean the pending WARP migration; ownership retained and uninstall cancelled."
+        fi
+    fi
+    if [[ "$_saved_role" == "entry" && "$_up_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ \
+          && "$_up_iface" != "awg0" ]]; then
+        log "Stopping upstream interface ${_up_iface}..."
+        stop_owned_tunnel_runtime awg "$_up_iface" "/etc/amnezia/amneziawg/${_up_iface}.conf" \
+            || die "Could not remove upstream ${_up_iface} from runtime completely; uninstall cancelled."
+        systemctl disable "awg-quick@${_up_iface}" 2>/dev/null \
+            || die "Could not disable upstream ${_up_iface}; uninstall cancelled before config removal."
+        if command -v ufw >/dev/null 2>&1 && ! ufw status 2>/dev/null | grep -q inactive; then
+            delete_owned_ufw_route_if_present "$_up_iface" \
+                "AmneziaWG cascade awg0->${_up_iface}" \
+                || die "Upstream ${_up_iface} owned UFW route is ambiguous; uninstall cancelled."
+        fi
+    fi
+    # WARP egress: every resource we create gets its own root-owned marker.
+    # A single broad flag is not enough: the wgcf binary/account/config or the
+    # unit itself may have existed before this install. Marker contents are
+    # checked against a narrow path allowlist; symlink markers are ignored.
+    local _warp_service_marker="$AWG_DIR/.wgcf_enabled_by_installer"
+    local _warp_binary_marker="$AWG_DIR/.wgcf_binary_installed_by_installer"
+    local _warp_config_marker="$AWG_DIR/.wgcf_config_created_by_installer"
+    local _warp_managed_config_marker="$AWG_DIR/.wgcf_config_managed_by_installer"
+    local _warp_account_marker="$AWG_DIR/.wgcf_account_created_by_installer"
+    local _owned_warp_iface="" _owned_warp_path="" _warp_owned_removed=0 _warp_service_stopped=0
+    if [[ -e "$_warp_service_marker" || -L "$_warp_service_marker" ]]; then
+        [[ -f "$_warp_service_marker" && ! -L "$_warp_service_marker" ]] \
+            || die "Invalid WARP service marker; uninstall cancelled."
+        IFS= read -r _owned_warp_iface < "$_warp_service_marker" || _owned_warp_iface=""
+        # An empty legacy marker did not preserve the unit's original state and
+        # cannot prove ownership: preserve service/config/binary/account.
+        if [[ -z "$_owned_warp_iface" ]]; then
+            log "Empty legacy WARP marker is ambiguous; preserving wg-quick service as pre-existing."
+        elif [[ "$_owned_warp_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ \
+              && "$_owned_warp_iface" != "awg0" ]]; then
+            log "Stopping Cloudflare WARP (wg-quick@${_owned_warp_iface})..."
+            stop_owned_tunnel_runtime wg "$_owned_warp_iface" \
+                "/etc/wireguard/${_owned_warp_iface}.conf" \
+                || die "Could not remove WARP ${_owned_warp_iface} from runtime completely; uninstall cancelled."
+            systemctl disable "wg-quick@${_owned_warp_iface}" 2>/dev/null \
+                || die "Could not disable WARP ${_owned_warp_iface}; ownership marker retained."
+            _warp_service_stopped=1
+            _warp_owned_removed=1
+        else
+            die "Invalid WARP service marker; uninstall cancelled."
+        fi
+        rm -f "$_warp_service_marker" || die "Could not clear WARP service marker."
+    fi
+    if [[ -e "$_warp_config_marker" || -L "$_warp_config_marker" ]]; then
+        [[ -f "$_warp_config_marker" && ! -L "$_warp_config_marker" ]] \
+            || die "Invalid WARP config marker; uninstall cancelled."
+        IFS= read -r _owned_warp_path < "$_warp_config_marker" || _owned_warp_path=""
+        if [[ "$_owned_warp_path" =~ ^/etc/wireguard/([a-zA-Z][a-zA-Z0-9_-]{0,14})\.conf$ \
+              && "${BASH_REMATCH[1]}" != "awg0" ]]; then
+            local _created_warp_iface="${BASH_REMATCH[1]}"
+            if [[ "$_warp_service_stopped" -eq 1 && "$_owned_warp_iface" != "$_created_warp_iface" ]]; then
+                die "WARP service/config ownership markers point to different interfaces; uninstall cancelled."
+            fi
+            if [[ "$_warp_service_stopped" -eq 0 ]] \
+               && { systemctl is-active --quiet "wg-quick@${_created_warp_iface}" 2>/dev/null \
+                    || systemctl is-enabled --quiet "wg-quick@${_created_warp_iface}" 2>/dev/null \
+                    || { command -v ip >/dev/null 2>&1 \
+                         && ip link show dev "$_created_warp_iface" >/dev/null 2>&1; }; }; then
+                die "Installer-created WARP config is used by an active/enabled/live interface without service ownership; uninstall cancelled."
+            fi
+            rm -f -- "$_owned_warp_path" || die "Could not remove $_owned_warp_path."
+            _warp_owned_removed=1
+        else
+            die "Invalid WARP config marker; uninstall cancelled."
+        fi
+        rm -f "$_warp_config_marker" || die "Could not clear WARP config marker."
+    fi
+    if [[ -e "$_warp_managed_config_marker" || -L "$_warp_managed_config_marker" ]]; then
+        [[ -f "$_warp_managed_config_marker" && ! -L "$_warp_managed_config_marker" ]] \
+            || die "Invalid WARP managed-config marker; uninstall cancelled."
+        IFS= read -r _owned_warp_path < "$_warp_managed_config_marker" || _owned_warp_path=""
+        if [[ "$_owned_warp_path" =~ ^/etc/wireguard/([a-zA-Z][a-zA-Z0-9_-]{0,14})\.conf$ \
+              && "${BASH_REMATCH[1]}" != "awg0" ]]; then
+            log "Preserving managed legacy WARP config: $_owned_warp_path"
+        else
+            die "Invalid path in WARP managed-config marker; uninstall cancelled."
+        fi
+        rm -f "$_warp_managed_config_marker" \
+            || die "Could not clear WARP managed-config marker."
+    fi
+    if [[ -e "$_warp_account_marker" || -L "$_warp_account_marker" ]]; then
+        [[ -f "$_warp_account_marker" && ! -L "$_warp_account_marker" ]] \
+            || die "Invalid WARP account marker; uninstall cancelled."
+        IFS= read -r _owned_warp_path < "$_warp_account_marker" || _owned_warp_path=""
+        if [[ "$_owned_warp_path" == "/etc/wireguard/wgcf-account.toml" ]]; then
+            rm -f -- "$_owned_warp_path" || die "Could not remove $_owned_warp_path."
+            _warp_owned_removed=1
+        else
+            die "Invalid WARP account marker; uninstall cancelled."
+        fi
+        rm -f "$_warp_account_marker" || die "Could not clear WARP account marker."
+    fi
+    if [[ -e "$_warp_binary_marker" || -L "$_warp_binary_marker" ]]; then
+        [[ -f "$_warp_binary_marker" && ! -L "$_warp_binary_marker" ]] \
+            || die "Invalid WARP binary marker; uninstall cancelled."
+        IFS= read -r _owned_warp_path < "$_warp_binary_marker" || _owned_warp_path=""
+        if [[ "$_owned_warp_path" == "/usr/local/bin/wgcf" ]]; then
+            rm -f -- "$_owned_warp_path" || die "Could not remove $_owned_warp_path."
+            _warp_owned_removed=1
+        else
+            die "Invalid WARP binary marker; uninstall cancelled."
+        fi
+        rm -f "$_warp_binary_marker" || die "Could not clear WARP binary marker."
+    fi
+    if [[ "$_saved_egress" == "warp" && "$_warp_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ \
+          && "$_warp_iface" != "awg0" ]] \
+       && command -v ufw >/dev/null 2>&1 && ! ufw status 2>/dev/null | grep -q inactive; then
+        delete_owned_ufw_route_if_present "$_warp_iface" "AmneziaWG→WARP egress" \
+            || die "WARP ${_warp_iface} owned UFW route is ambiguous; uninstall cancelled."
+    fi
+    [[ "$_warp_owned_removed" -eq 1 ]] && log "Installer-owned WARP components removed."
     modprobe -r amneziawg 2>/dev/null || true
     # v5.12.0+: kernel module auto-repair on kernel upgrade.
     # Remove apt hook and systemd unit BEFORE apt purge so the hook does not
@@ -2042,8 +4297,7 @@ step_uninstall() {
     rm -f /var/log/amneziawg-ensure-module.log* 2>/dev/null || true
     rm -rf /var/lib/amneziawg 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
-    if [[ "$saved_no_tweaks" -eq 0 ]]; then
-        log "Cleaning up AmneziaWG UFW rules..."
+    log "Cleaning up AmneziaWG UFW rules..."
         if command -v ufw &>/dev/null; then
             local port_to_del
             if [[ -f "$CONFIG_FILE" ]]; then
@@ -2051,18 +4305,19 @@ step_uninstall() {
                 port_to_del=$(safe_read_config_key "AWG_PORT" "$CONFIG_FILE")
             fi
             port_to_del=${port_to_del:-39743}
-            # Removing our rules is ALWAYS performed (idempotent)
-            ufw delete allow "${port_to_del}/udp" 2>/dev/null
-            # To delete a route rule we need an exact match with how it was created:
-            # "ufw route allow in on awg0 out on <nic>". Without "out on", UFW will
-            # not find the rule and it stays in ufw status. Discussion #41.
+            delete_owned_ufw_udp_allow_if_present "$port_to_del" "AmneziaWG VPN" \
+                || die "UFW allow ${port_to_del}/udp is foreign or ambiguous; it was preserved and uninstall cancelled."
+            # Delete a route only when its shape and installer comment prove
+            # ownership unambiguously. Preserve legacy uncommented rules and
+            # foreign same-shaped rules instead of guessing during uninstall.
             local _nic
             _nic=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
-            if [[ -n "$_nic" ]]; then
-                ufw route delete allow in on awg0 out on "$_nic" 2>/dev/null
+            if [[ "$_nic" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$ && "$_nic" != "awg0" ]]; then
+                delete_owned_ufw_route_if_present "$_nic" "AmneziaWG Routing" \
+                    || die "UFW route awg0→${_nic} is foreign or ambiguous; it was preserved and uninstall cancelled."
+            else
+                log_warn "The main interface could not be determined; any legacy UFW route was preserved."
             fi
-            # Fallback: try deleting without out on (for compatibility with older rules)
-            ufw route delete allow in on awg0 2>/dev/null
 
             # ufw disable runs ONLY if UFW was enabled by our installer.
             # Protects against destructive uninstall on a VPS where UFW was used
@@ -2076,17 +4331,42 @@ step_uninstall() {
                 log "Leaving UFW active (was active before installation, or older installer version)."
             fi
         fi
+    if [[ "$saved_no_tweaks" -eq 0 ]]; then
         log "Removing Fail2Ban bans..."
         if command -v fail2ban-client &>/dev/null; then
             fail2ban-client unban --all 2>/dev/null || true
             systemctl stop fail2ban 2>/dev/null
         fi
     else
-        log "Skipping UFW/Fail2Ban (installed with --no-tweaks)."
+        log "Skipping Fail2Ban (installed with --no-tweaks); owned UFW rules were removed."
     fi
     log "Removing packages..."
+    # Clear the hold on the PPA packages (set by the H0 pinned path) BEFORE the PPA
+    # is removed: `apt-mark unhold` needs an installed or candidate version, and once
+    # the PPA (below) is gone the candidate disappears and apt-mark fails with
+    # 'Can't select ... version', leaving the hold in dpkg selections -> that blocks
+    # a future reinstall. The dpkg fallback clears the selection directly if the PPA
+    # was already removed by a prior run.
+    local _hp
+    for _hp in amneziawg amneziawg-dkms; do
+        apt-mark unhold "$_hp" >/dev/null 2>&1 || true
+        if dpkg --get-selections "$_hp" 2>/dev/null | grep -q '[[:space:]]hold$'; then
+            echo "$_hp deinstall" | dpkg --set-selections >/dev/null 2>&1 || true
+        fi
+    done
     if [[ "$saved_no_tweaks" -eq 0 ]]; then
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools fail2ban qrencode 2>/dev/null || log_warn "Purge error."
+        local _purge_pkgs=(amneziawg-dkms amneziawg-tools qrencode)
+        # Purge fail2ban only if we installed it ourselves (marker from
+        # setup_fail2ban) - otherwise SSH protection the user had before the
+        # installer must not disappear together with the VPN. Our jail file
+        # is removed below in any case. Backwards compat: old installs
+        # without the marker keep fail2ban installed.
+        if [[ -f "$AWG_DIR/.fail2ban_installed_by_installer" ]]; then
+            _purge_pkgs+=(fail2ban)
+        else
+            log "fail2ban left installed (was present before the installer or an older installer version)."
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${_purge_pkgs[@]}" 2>/dev/null || log_warn "Purge error."
     else
         DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg-tools qrencode 2>/dev/null || log_warn "Purge error."
     fi
@@ -2110,12 +4390,36 @@ step_uninstall() {
         # If a user still has a jail.local from very old installer versions,
         # leave it for them to deal with.
         rm -f /etc/fail2ban/jail.d/amneziawg.conf 2>/dev/null
+        # If fail2ban was not purged (it predates us) - restart it without our
+        # jail: it was stopped above (systemctl stop fail2ban).
+        if command -v fail2ban-client &>/dev/null && [[ ! -f "$AWG_DIR/.fail2ban_installed_by_installer" ]]; then
+            systemctl restart fail2ban 2>/dev/null || log_warn "Failed to restart fail2ban after removing our jail."
+        fi
     fi
     log "Removing DKMS..."
-    rm -rf /var/lib/dkms/amneziawg* || log_warn "DKMS removal error."
+    # Properly deregister the DKMS module (any amneziawg/* version) and remove the
+    # source tree in /usr/src, not just the state in /var/lib/dkms. The hold on the
+    # PPA packages was cleared above (before PPA removal). `dkms status`:
+    # 'amneziawg/1.0.0, <kern>...'.
+    if command -v dkms >/dev/null 2>&1; then
+        local _dv
+        while IFS= read -r _dv; do
+            [[ -n "$_dv" ]] || continue
+            if ! dkms remove -m amneziawg -v "$_dv" --all >/dev/null 2>&1; then
+                log_warn "dkms remove amneziawg/$_dv failed - cleaning files manually."
+            fi
+        done < <(dkms status 2>/dev/null | awk -F'[,/ ]+' '/^amneziawg[,/]/{print $2}' | sort -u)
+    fi
+    rm -rf /var/lib/dkms/amneziawg* /usr/src/amneziawg-* || log_warn "DKMS removal error."
+    # Clean up any leftover built .ko (if dkms remove did not run) + depmod.
+    find /lib/modules -name 'amneziawg.ko*' -path '*/updates/dkms/*' -delete 2>/dev/null || true
+    command -v depmod >/dev/null 2>&1 && depmod -a >/dev/null 2>&1 || true
     log "Restoring sysctl..."
-    if grep -q "disable_ipv6" /etc/sysctl.conf 2>/dev/null; then
-        sed -i '/disable_ipv6/d' /etc/sysctl.conf || log_warn "sed sysctl.conf error"
+    # Only the exact lines legacy versions of our installer wrote (=1 for
+    # all/default/lo). Previously ANY line containing disable_ipv6 was removed -
+    # including lines added by the user themselves (e.g. an =0 override).
+    if grep -qE '^net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$' /etc/sysctl.conf 2>/dev/null; then
+        sed -i -E '/^net\.ipv6\.conf\.(all|default|lo)\.disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$/d' /etc/sysctl.conf || log_warn "sed sysctl.conf error"
     fi
     sysctl -p --system 2>/dev/null
     rm -f /etc/apt/sources.list.d/*.bak-* "$AWG_DIR"/ubuntu.sources.bak-* 2>/dev/null || true
@@ -2160,6 +4464,8 @@ initialize_setup() {
     log "Log file: $LOG_FILE"
 
     check_os_version
+    check_container
+    check_kernel_version
     check_free_space
 
     local default_port=39743
@@ -2173,6 +4479,35 @@ initialize_setup() {
     ALLOWED_IPS_MODE="default"
     ALLOWED_IPS=""
     AWG_ENDPOINT=""
+    CLIENT_ISOLATION=""
+    # Hard reset (not ${VAR:-}): the internal ownership marker must not be
+    # inherited from the environment - an externally exported variable would
+    # otherwise reach the AllowedIPs route removal (PR #179 review).
+    CLIENT_ISOLATION_NET=""
+
+    # Hard reset before the config is loaded: the value must not come from env.
+    AWG_SERVER_NAME=""
+    ALLOW_IPV6_TUNNEL=""
+    IPV6_SUBNET=""
+    SERVER_HAS_NATIVE_IPV6=""
+
+    # Fork-specific routing state follows the same rule: only the root-owned
+    # init file and explicit CLI flags may select cascade/WARP/DNS behaviour.
+    # Inheriting these values from `sudo -E` could otherwise rewrite firewall
+    # and policy-routing rules without any matching command-line option.
+    AWG_I1_MODE=""
+    AWG_ROLE=""
+    AWG_UPSTREAM_CONF=""
+    AWG_UPSTREAM_IFACE=""
+    AWG_UPSTREAM_TABLE=""
+    AWG_UPSTREAM_FWMARK=""
+    AWG_UPSTREAM_PRIORITY=""
+    AWG_EGRESS=""
+    AWG_WARP_IFACE=""
+    AWG_WARP_TABLE=""
+    AWG_WARP_PRIORITY=""
+    AWG_WARP_BYPASS=""
+    AWG_AMNEZIA_DNS=""
 
     # Load config
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -2186,17 +4521,116 @@ initialize_setup() {
         ALLOWED_IPS_MODE=${ALLOWED_IPS_MODE:-"default"}
         ALLOWED_IPS=${ALLOWED_IPS:-""}
         AWG_ENDPOINT=${AWG_ENDPOINT:-""}
+        # CLIENT_ISOLATION from the config: strictly 0|1 (the whitelist parser
+        # does not check values, and configs get edited by hand). Otherwise the
+        # arithmetic context [[ "on" -eq 1 ]] dereferences the string as an
+        # empty variable (=0) and silently INVERTS the security setting: wrote
+        # on - got off (PR #179 review).
+        case "${CLIENT_ISOLATION:-}" in
+            ""|0|1) : ;;
+            *)
+                log_warn "CLIENT_ISOLATION='$CLIENT_ISOLATION' in $CONFIG_FILE is invalid (0|1 allowed) - enabling isolation (safe default)."
+                CLIENT_ISOLATION=1
+                ;;
+        esac
+        # CLIENT_ISOLATION_NET is an internal ownership marker: exactly one
+        # canonical IPv4 CIDR (tunnel_network_cidr output). Comma-carrying
+        # garbage would let the substring replace in
+        # _apply_isolation_to_allowed_ips eat adjacent user routes in a single
+        # substitution (PR #179 review).
+        if [[ -n "${CLIENT_ISOLATION_NET:-}" ]] \
+           && [[ "$(tunnel_network_cidr "$CLIENT_ISOLATION_NET" || true)" != "$CLIENT_ISOLATION_NET" ]]; then
+            log_warn "CLIENT_ISOLATION_NET='$CLIENT_ISOLATION_NET' in $CONFIG_FILE is invalid (a single canonical CIDR expected) - resetting."
+            CLIENT_ISOLATION_NET=""
+        fi
         log "Settings loaded from file."
     else
         log "Configuration file $CONFIG_FILE not found."
     fi
 
+    case "$CLI_I1_MODE" in
+        ""|random|quic) : ;;
+        *) die "Invalid --i1-mode='$CLI_I1_MODE'. Allowed values: random or quic." ;;
+    esac
+    # Legacy configs have no AWG_I1_MODE key. Recover it from the I1 shape and
+    # do not persist a malformed enum value. I1 itself is deliberately left
+    # untouched here: it is part of existing clients' wire contract.
+    if [[ "$config_exists" -eq 1 ]]; then
+        case "${AWG_I1_MODE:-}" in
+            random|quic) : ;;
+            "")
+                if [[ "${AWG_I1:-}" == "<b 0x"*">" ]]; then AWG_I1_MODE=quic; else AWG_I1_MODE=random; fi
+                ;;
+            *)
+                log_warn "AWG_I1_MODE='$AWG_I1_MODE' in $CONFIG_FILE is invalid — recovering the mode from the existing I1."
+                if [[ "${AWG_I1:-}" == "<b 0x"*">" ]]; then AWG_I1_MODE=quic; else AWG_I1_MODE=random; fi
+                ;;
+        esac
+    fi
+
+    # Preserve the old fork-routing state for deferred cleanup after possible
+    # reboots in steps 1/2. The new init is written below, so capture these
+    # values before applying CLI overrides.
+    local _cfg_awg_role="" _cfg_upstream_iface="" _cfg_awg_egress="" _cfg_warp_iface=""
+    if [[ "$config_exists" -eq 1 ]]; then
+        _cfg_awg_role="${AWG_ROLE:-single}"
+        _cfg_upstream_iface="${AWG_UPSTREAM_IFACE:-awg1}"
+        _cfg_awg_egress="${AWG_EGRESS:-direct}"
+        _cfg_warp_iface="${AWG_WARP_IFACE:-wgcf}"
+    fi
+    reconcile_pending_mode_markers \
+        "$config_exists" "$_cfg_awg_role" "$_cfg_upstream_iface" \
+        "$_cfg_awg_egress" "$_cfg_warp_iface" \
+        || die "The pending cleanup journal is corrupt or conflicts with the current fork mode; live egress was not changed."
+
+    # The old port from awgsetup_cfg.init: step 4 needs it to delete the stale
+    # UFW rule on a port change (Issue #175). Captured BEFORE the CLI override,
+    # otherwise the old value is lost for good - uninstall reads the already
+    # rewritten config and never learns the old port. PREV_AWG_PORT may already
+    # be loaded from awgsetup_cfg.init via safe_load_config - that is a pending
+    # delete from a previous run: step 1 ends in request_reboot, only a value
+    # written to disk survives until step 4 (PR #176).
+    PREV_AWG_PORT="${PREV_AWG_PORT:-}"
+    _cfg_awg_port=""
+    if [[ "$config_exists" -eq 1 ]]; then _cfg_awg_port="$AWG_PORT"; fi
+
+    # Previous isolation value - for the change warning (issue #178).
+    # A legacy config without the key = 1 (isolated): otherwise a legacy ->
+    # --isolation=off transition would not warn about regen.
+    _cfg_client_isolation=""
+    if [[ "$config_exists" -eq 1 ]]; then _cfg_client_isolation="${CLIENT_ISOLATION:-1}"; fi
+
+    # Previous server name - for the change warning (D#180).
+    # A legacy config without the key = 'AWG Server' (the old hardcode).
+    _cfg_server_name=""
+    if [[ "$config_exists" -eq 1 ]]; then _cfg_server_name="${AWG_SERVER_NAME:-AWG Server}"; fi
+
+    # --mobile expands into CLI_PRESET/CLI_PORT before their consumers.
+    resolve_mobile_flag
+
     # CLI override
     AWG_PORT=${CLI_PORT:-$AWG_PORT}
+    # The port changed in this run - the previous value becomes a pending
+    # delete. If the port was changed back (matches the pending value), the
+    # delete is cancelled: the rule is needed again.
+    if [[ -n "$_cfg_awg_port" && "$_cfg_awg_port" != "$AWG_PORT" ]]; then
+        PREV_AWG_PORT="$_cfg_awg_port"
+    fi
+    if [[ "$PREV_AWG_PORT" == "$AWG_PORT" ]]; then PREV_AWG_PORT=""; fi
     AWG_TUNNEL_SUBNET=${CLI_SUBNET:-$AWG_TUNNEL_SUBNET}
     if [[ "$CLI_DISABLE_IPV6" != "default" ]]; then DISABLE_IPV6=$CLI_DISABLE_IPV6; fi
     if [[ "$CLI_ROUTING_MODE" != "default" ]]; then
         ALLOWED_IPS_MODE=$CLI_ROUTING_MODE
+        # An explicit CLI mode overrides the list too: previously --route-all/
+        # --route-amnezia on reinstall changed only the mode while ALLOWED_IPS
+        # kept the old value from awgsetup_cfg.init - the flag silently had no
+        # effect (Issue #170). An empty list forces configure_routing_mode to
+        # recompute it for the new mode.
+        ALLOWED_IPS=""
+        # Ownership dies with the list it described: otherwise a stale
+        # CLIENT_ISOLATION_NET could claim a user's token from a fresh
+        # --route-custom list (issue #178).
+        CLIENT_ISOLATION_NET=""
         if [[ "$CLI_ROUTING_MODE" -eq 3 ]]; then ALLOWED_IPS=$CLI_CUSTOM_ROUTES; fi
     fi
     if [[ -n "$CLI_ENDPOINT" ]]; then
@@ -2206,6 +4640,7 @@ initialize_setup() {
         AWG_ENDPOINT=$CLI_ENDPOINT
     fi
     if [[ "$CLI_NO_TWEAKS" -eq 1 ]]; then NO_TWEAKS=1; fi
+    if [[ "$CLI_KEEP_PACKAGES" -eq 1 ]]; then KEEP_PACKAGES=1; fi
 
     # Multi-hop: node role and upstream tunnel parameters.
     # CLI > saved config > defaults. Value 'single' requires no upstream fields;
@@ -2228,26 +4663,55 @@ initialize_setup() {
         if ! [[ "$AWG_UPSTREAM_IFACE" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]]; then
             die "Invalid --upstream-iface='$AWG_UPSTREAM_IFACE'."
         fi
-        if ! [[ "$AWG_UPSTREAM_TABLE" =~ ^[0-9]+$ ]] || [[ "$AWG_UPSTREAM_TABLE" -lt 1 ]] \
-           || [[ "$AWG_UPSTREAM_TABLE" -gt 4294967295 ]]; then
-            die "Invalid --upstream-table='$AWG_UPSTREAM_TABLE'."
+        if ! validate_policy_table "$AWG_UPSTREAM_TABLE"; then
+            die "Invalid --upstream-table='$AWG_UPSTREAM_TABLE' (1..4294967295 except reserved 253-255)."
         fi
-        if ! [[ "$AWG_UPSTREAM_FWMARK" =~ ^(0x[0-9a-fA-F]{1,8}|[0-9]+)$ ]]; then
-            die "Invalid --upstream-fwmark='$AWG_UPSTREAM_FWMARK' (expected 0xHHHH or a number)."
+        if ! validate_fwmark "$AWG_UPSTREAM_FWMARK"; then
+            die "Invalid --upstream-fwmark='$AWG_UPSTREAM_FWMARK' (non-zero uint32, not 0xca6c)."
+        fi
+        if ! validate_policy_priority "$AWG_UPSTREAM_PRIORITY"; then
+            die "Invalid AWG_UPSTREAM_PRIORITY='$AWG_UPSTREAM_PRIORITY' (1..32764; lookup and guard must precede main rule 32766)."
         fi
         # Upstream conf: CLI is mandatory only on the first run. If
         # awg1.conf already exists on disk (second run after reboot) we assume
         # it was created correctly earlier and do not require --upstream-conf.
         local _up_iface_conf="/etc/amnezia/amneziawg/${AWG_UPSTREAM_IFACE}.conf"
+        local _up_staged_conf="$AWG_DIR/.upstream-${AWG_UPSTREAM_IFACE}.pending.conf"
         if [[ -n "$CLI_UPSTREAM_CONF" ]]; then
             if [[ ! -f "$CLI_UPSTREAM_CONF" ]]; then
                 die "--upstream-conf not found: '$CLI_UPSTREAM_CONF'."
             fi
-            AWG_UPSTREAM_CONF="$CLI_UPSTREAM_CONF"
-            export AWG_UPSTREAM_CONF
+            # Steps 1/2 may reboot the VPS before step 6 renders this file.
+            # Copy it into root-owned AWG_DIR so the resumed run does not rely
+            # on the original path or on repeating the CLI argument.
+            local _up_stage_tmp
+            _up_stage_tmp=$(mktemp -p "$AWG_DIR" ".upstream-${AWG_UPSTREAM_IFACE}.XXXXXX") \
+                || die "Could not create the upstream staging file."
+            _install_temp_files+=("$_up_stage_tmp")
+            cp -- "$CLI_UPSTREAM_CONF" "$_up_stage_tmp" \
+                && chmod 600 "$_up_stage_tmp" \
+                && mv -f "$_up_stage_tmp" "$_up_staged_conf" \
+                || { rm -f "$_up_stage_tmp"; die "Could not safely stage --upstream-conf across reboot."; }
+            AWG_UPSTREAM_CONF="$_up_staged_conf"
+        elif [[ -s "$_up_staged_conf" ]]; then
+            AWG_UPSTREAM_CONF="$_up_staged_conf"
+        elif [[ -f "$_up_iface_conf" \
+                && ( -n "$CLI_UPSTREAM_TABLE" || -n "$CLI_UPSTREAM_FWMARK" ) ]]; then
+            # Policy-only intent must survive reboots in steps 1/2. Snapshot it
+            # in the pending path; process-local AWG_UPSTREAM_CONF was lost.
+            local _up_policy_tmp
+            _up_policy_tmp=$(mktemp -p "$AWG_DIR" ".upstream-policy-${AWG_UPSTREAM_IFACE}.XXXXXX") \
+                || die "Could not create a policy-only upstream staging file."
+            _install_temp_files+=("$_up_policy_tmp")
+            cp -- "$_up_iface_conf" "$_up_policy_tmp" \
+                && chmod 600 "$_up_policy_tmp" \
+                && mv -f "$_up_policy_tmp" "$_up_staged_conf" \
+                || { rm -f "$_up_policy_tmp"; die "Could not persist policy-only upstream intent across reboot."; }
+            AWG_UPSTREAM_CONF="$_up_staged_conf"
         elif [[ ! -f "$_up_iface_conf" ]]; then
             die "role=entry requires --upstream-conf=<file.conf> (from manage add on the exit node)."
         fi
+        export AWG_UPSTREAM_CONF
     fi
     export AWG_ROLE AWG_UPSTREAM_IFACE AWG_UPSTREAM_TABLE AWG_UPSTREAM_FWMARK AWG_UPSTREAM_PRIORITY
 
@@ -2264,22 +4728,23 @@ initialize_setup() {
     if [[ "$AWG_EGRESS" == "warp" && "$AWG_ROLE" == "entry" ]]; then
         die "--egress=warp is incompatible with --role=entry. Put WARP on the exit node (or single), not on entry."
     fi
-    AWG_WARP_IFACE="${AWG_WARP_IFACE:-wgcf}"
+    AWG_WARP_IFACE="${CLI_WARP_IFACE:-${AWG_WARP_IFACE:-wgcf}}"
     AWG_WARP_TABLE="${CLI_WARP_TABLE:-${AWG_WARP_TABLE:-2408}}"
     AWG_WARP_PRIORITY="${CLI_WARP_PRIORITY:-${AWG_WARP_PRIORITY:-789}}"
     if [[ "$AWG_EGRESS" == "warp" ]]; then
-        if ! [[ "$AWG_WARP_TABLE" =~ ^[0-9]+$ ]] || [[ "$AWG_WARP_TABLE" -lt 1 ]] \
-           || [[ "$AWG_WARP_TABLE" -gt 4294967295 ]]; then
-            die "Invalid --warp-table='$AWG_WARP_TABLE'."
+        if ! [[ "$AWG_WARP_IFACE" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] \
+           || [[ "$AWG_WARP_IFACE" == "awg0" || "$AWG_WARP_IFACE" == "wgcf-profile" ]]; then
+            die "Invalid AWG_WARP_IFACE='$AWG_WARP_IFACE'."
         fi
-        if ! [[ "$AWG_WARP_PRIORITY" =~ ^[0-9]+$ ]]; then
-            die "Invalid --warp-priority='$AWG_WARP_PRIORITY'."
+        if ! validate_policy_table "$AWG_WARP_TABLE"; then
+            die "Invalid --warp-table='$AWG_WARP_TABLE' (1..4294967295 except reserved 253-255)."
         fi
-        # Collision with the upstream table (123 on single/exit it isn't set,
-        # but guard the config anyway)
-        if [[ "$AWG_WARP_TABLE" == "${AWG_UPSTREAM_TABLE:-123}" ]]; then
-            die "--warp-table must not equal --upstream-table (${AWG_WARP_TABLE})."
+        if ! validate_policy_priority "$AWG_WARP_PRIORITY"; then
+            die "Invalid --warp-priority='$AWG_WARP_PRIORITY' (1..32764; lookup and guard must precede main rule 32766)."
         fi
+        # entry and WARP are mutually exclusive, so a persisted upstream table
+        # is not an active consumer on single/exit and must not block the same
+        # table number for WARP.
     fi
     # --warp-bypass: comma-separated list of sources for WARP exceptions.
     # Each item: `youtube` | `custom:URL` | `custom:/path`.
@@ -2288,24 +4753,95 @@ initialize_setup() {
     if [[ "$AWG_WARP_BYPASS" != "none" && "$AWG_EGRESS" != "warp" ]]; then
         die "--warp-bypass only makes sense together with --egress=warp (no WARP to bypass otherwise)."
     fi
+    if (( ${#AWG_WARP_BYPASS} > 4096 )); then
+        die "--warp-bypass is too long (4096 characters maximum)."
+    fi
+    if [[ "$AWG_WARP_BYPASS" =~ [[:cntrl:]] ]]; then
+        die "--warp-bypass contains a control character."
+    fi
+    case "$AWG_WARP_BYPASS" in
+        *" "*|*"'"*|*'"'*|*\\*)
+            die "--warp-bypass does not allow spaces, quotes, or backslashes."
+            ;;
+    esac
+    if [[ "$AWG_WARP_BYPASS" == ,* || "$AWG_WARP_BYPASS" == *, \
+          || "$AWG_WARP_BYPASS" == *,,* ]]; then
+        die "--warp-bypass contains an empty list item."
+    fi
     if [[ "$AWG_WARP_BYPASS" != "none" ]]; then
-        local _OLDIFS="$IFS"
-        IFS=','
-        # shellcheck disable=SC2206  # intentional comma-split of the bypass spec list
-        local _specs=( $AWG_WARP_BYPASS )
-        IFS="$_OLDIFS"
+        local -a _specs=()
+        local _warp_bypass_url_re='^custom:https?://[A-Za-z0-9][A-Za-z0-9._~:/?#@!$&()*+;=%-]*$'
+        local _warp_bypass_path_re='^custom:/[A-Za-z0-9._~+/@%=-]+$'
+        IFS=',' read -r -a _specs <<< "$AWG_WARP_BYPASS"
         local _s
         for _s in "${_specs[@]}"; do
-            _s="${_s## }"; _s="${_s%% }"
-            [[ -z "$_s" ]] && continue
             case "$_s" in
                 youtube) ;;
-                custom:http://*|custom:https://*|custom:/*) ;;
-                *) die "Invalid --warp-bypass: '$_s'. Allowed: none, youtube, custom:URL, custom:/absolute/path — comma-separated." ;;
+                *)
+                    [[ "$_s" =~ $_warp_bypass_url_re || "$_s" =~ $_warp_bypass_path_re ]] \
+                        || die "Invalid --warp-bypass: '$_s'. Allowed: youtube, a safe custom:http(s)://URL, or custom:/absolute/path — comma-separated."
+                    ;;
             esac
         done
     fi
     export AWG_EGRESS AWG_WARP_IFACE AWG_WARP_TABLE AWG_WARP_PRIORITY AWG_WARP_BYPASS
+
+    # A fork-routing mode change may cross two reboots before step 6. Persist
+    # the old interface names so units carrying stale policy rules are stopped
+    # before the new awg0 is started.
+    local _fork_mode_transition=0
+    if [[ "$config_exists" -eq 1 ]] \
+       && { [[ "$_cfg_awg_role" != "$AWG_ROLE" ]] \
+            || [[ "$_cfg_awg_role" == "entry" && "$AWG_ROLE" == "entry" \
+                  && "$_cfg_upstream_iface" != "$AWG_UPSTREAM_IFACE" ]] \
+            || [[ "$_cfg_awg_egress" != "$AWG_EGRESS" ]] \
+            || [[ "$_cfg_awg_egress" == "warp" && "$AWG_EGRESS" == "warp" \
+                  && "$_cfg_warp_iface" != "$AWG_WARP_IFACE" ]]; }; then
+        _fork_mode_transition=1
+    fi
+    if [[ "$_fork_mode_transition" -eq 1 ]] \
+       && { [[ -e "$AWG_DIR/.upstream_cleanup_pending" || -L "$AWG_DIR/.upstream_cleanup_pending" ]] \
+            || [[ -e "$AWG_DIR/.warp_cleanup_pending" || -L "$AWG_DIR/.warp_cleanup_pending" ]] \
+            || [[ -e "$AWG_DIR/.ufw_main_cleanup_pending" || -L "$AWG_DIR/.ufw_main_cleanup_pending" ]]; }; then
+        die "A second fork-mode migration cannot start before the previous cleanup finishes. First rerun the installer without changing role/egress/iface."
+    fi
+    if [[ "$config_exists" -eq 1 && "$_cfg_awg_role" == "entry" \
+          && ( "$AWG_ROLE" != "entry" || "$AWG_UPSTREAM_IFACE" != "$_cfg_upstream_iface" ) ]]; then
+        write_pending_iface_marker "$AWG_DIR/.upstream_cleanup_pending" "$_cfg_upstream_iface" \
+            || die "Could not preserve the old upstream iface for safe post-reboot cleanup."
+    fi
+    if [[ "$config_exists" -eq 1 && "$_cfg_awg_egress" == "warp" \
+          && ( "$AWG_EGRESS" != "warp" || "$AWG_WARP_IFACE" != "$_cfg_warp_iface" ) ]]; then
+        write_pending_iface_marker "$AWG_DIR/.warp_cleanup_pending" "$_cfg_warp_iface" \
+            || die "Could not preserve the old WARP iface for safe post-reboot cleanup."
+    fi
+    # awg0→main is needed by direct mode and only by WARP with an explicit
+    # bypass. In warp+bypass=none it would combine with main MASQUERADE into a
+    # fail-open path. Remove only a confirmed previous owned rule and only at
+    # the commit boundary so an early failure cannot damage rollback.
+    local _old_main_route_required=0 _new_main_route_required=0
+    # Older installer revisions added this route for every non-entry mode,
+    # including warp+bypass=none. Exact UFW comment/shape checks remain the
+    # final ownership boundary before deletion.
+    if [[ "$config_exists" -eq 1 && "$_cfg_awg_role" =~ ^(single|exit)$ \
+          && "$_cfg_awg_egress" =~ ^(direct|warp)$ ]]; then
+        _old_main_route_required=1
+    fi
+    if [[ "$AWG_ROLE" =~ ^(single|exit)$ ]] \
+       && { [[ "$AWG_EGRESS" == "direct" ]] \
+            || [[ "$AWG_EGRESS" == "warp" && "$AWG_WARP_BYPASS" != "none" ]]; }; then
+        _new_main_route_required=1
+    fi
+    if [[ "$_old_main_route_required" -eq 1 && "$_new_main_route_required" -eq 0 ]]; then
+        local _old_main_nic=""
+        _old_main_nic=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+        if [[ "$_old_main_nic" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$ ]]; then
+            write_pending_main_iface_marker "$_old_main_nic" \
+                || die "Could not retain the previous main iface for deferred UFW cleanup."
+        else
+            log_warn "Could not safely determine the previous main iface; preserving the UFW awg0→main rule."
+        fi
+    fi
 
     # AmneziaDNS: local dnsmasq on the tunnel-gateway IP + vpn:// URI with
     # isThirdPartyConfig=false so the Amnezia VPN client unlocks the
@@ -2337,14 +4873,27 @@ initialize_setup() {
     # Request settings from user only on first run
     if [[ "$config_exists" -eq 0 ]]; then
         log "Requesting settings from user (first run)."
+        # Interactive input: a typo does not kill the install (the validator
+        # runs in a subshell -> die prints the error but only terminates the
+        # subshell, and the prompt repeats). The final validate_* calls
+        # outside the loop stay authoritative for CLI/config values (die is
+        # appropriate there).
         if [[ "$AUTO_YES" -eq 0 ]]; then
-            read -rp "Enter AmneziaWG UDP port (1-65535) [${AWG_PORT}]: " input_port < /dev/tty
-            if [[ -n "$input_port" ]]; then AWG_PORT=$input_port; fi
+            while true; do
+                read -rp "Enter AmneziaWG UDP port (1-65535) [${AWG_PORT}]: " input_port < /dev/tty
+                [[ -z "$input_port" ]] && break
+                if ( validate_port "$input_port" ); then AWG_PORT=$input_port; break; fi
+                log_warn "Please re-enter the port."
+            done
         fi
         validate_port "$AWG_PORT"
         if [[ "$AUTO_YES" -eq 0 ]]; then
-            read -rp "Enter tunnel subnet [${AWG_TUNNEL_SUBNET}]: " input_subnet < /dev/tty
-            if [[ -n "$input_subnet" ]]; then AWG_TUNNEL_SUBNET=$input_subnet; fi
+            while true; do
+                read -rp "Enter tunnel subnet [${AWG_TUNNEL_SUBNET}]: " input_subnet < /dev/tty
+                [[ -z "$input_subnet" ]] && break
+                if ( validate_subnet "$input_subnet" ); then AWG_TUNNEL_SUBNET=$input_subnet; break; fi
+                log_warn "Please re-enter the subnet."
+            done
         fi
         validate_subnet "$AWG_TUNNEL_SUBNET"
         if [[ "$DISABLE_IPV6" == "default" ]]; then configure_ipv6; fi
@@ -2358,11 +4907,35 @@ initialize_setup() {
         fi
     fi
 
+    # Consent for removing system packages is asked OUTSIDE the branching above.
+    # The call used to sit in the "no config" branch only, so a --force reinstall on an
+    # already configured server walked straight past the question: step99 deletes the
+    # state file, so a repeated run starts at step 1 and reaches the cleanup again. Configs
+    # written before 5.27.0 have no KEEP_PACKAGES entry at all, and its absence read as
+    # consent, which reproduced issue #213 on the very version that fixes it.
+    # The function itself returns immediately when the decision is already made.
+    if [[ -n "$KEEP_PACKAGES" && "$KEEP_PACKAGES" != "0" && "$KEEP_PACKAGES" != "1" ]]; then
+        log_warn "KEEP_PACKAGES in $CONFIG_FILE has an invalid value '$KEEP_PACKAGES' - assuming the packages must be kept."
+        KEEP_PACKAGES=1
+    fi
+    configure_package_cleanup
+
+    # Changing the subnet with live peers is forbidden - check before the
+    # init file is saved and before any on-disk changes (AWG_TUNNEL_SUBNET
+    # is final here).
+    guard_subnet_change_with_peers
+
     # Default values
     if [[ "$DISABLE_IPV6" == "default" ]]; then DISABLE_IPV6=1; fi
     configure_ipv6_tunnel
     if [[ "$ALLOWED_IPS_MODE" == "default" ]]; then ALLOWED_IPS_MODE=2; fi
     if [[ -z "$ALLOWED_IPS" ]]; then configure_routing_mode; fi
+
+    # Client isolation (issue #178): choice + AllowedIPs alignment. Called
+    # before validate_cidr_list below - an appended subnet goes through the
+    # same mandatory validation as the rest of the list.
+    configure_client_isolation
+    _apply_isolation_to_allowed_ips
 
     # Single mandatory AllowedIPs validation before saving the config: CLI
     # --route-custom on a first run assigned ALLOWED_IPS without checking it
@@ -2372,20 +4945,69 @@ initialize_setup() {
         die "Invalid ALLOWED_IPS: '$ALLOWED_IPS'. Expected a list x.x.x.x/y[,x.x.x.x/y]."
     fi
 
-    # Port check (skip if AWG service is already listening on this port)
-    if ! systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
-        check_port_availability "$AWG_PORT" || die "Port $AWG_PORT/udp is occupied."
+    # Server name for the vpn:// URI (D#180): source selection + validation.
+    configure_server_name
+
+    # For active awg0 skip the check only when it already listens on the
+    # requested port. A new --port is checked before the VPN is stopped.
+    local _live_awg_port=""
+    if systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
+        _live_awg_port=$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$SERVER_CONF_FILE" 2>/dev/null | tail -1)
+    fi
+    if [[ -n "$_live_awg_port" && "$_live_awg_port" == "$AWG_PORT" ]]; then
+        log "Active awg0 already listens on ${AWG_PORT}/udp — the expected service owns the port."
     else
-        log "AWG service is active — skipping port check."
+        check_port_availability "$AWG_PORT" || die "Port $AWG_PORT/udp is occupied."
     fi
 
     # AWG 2.0 parameter generation
-    # Regenerate if: first run OR explicit CLI override (--preset/--jc/--jmin/--jmax)
+    # Full regeneration: first run or a J/S/H-set override. A lone --i1-mode
+    # changes I1 only below and preserves every other parameter.
     if [[ -z "${AWG_Jc:-}" ]] || [[ -n "${CLI_PRESET:-}" ]] || [[ -n "${CLI_JC:-}" ]] \
         || [[ -n "${CLI_JMIN:-}" ]] || [[ -n "${CLI_JMAX:-}" ]]; then
+        # generate_awg_params regenerates the WHOLE set (S1-S4, H1-H4, I1),
+        # not just the requested parameter: on a reinstall over a live server
+        # every issued client config still holds the old H1-H4 and will stop
+        # connecting. Warn loudly.
+        if [[ "$config_exists" -eq 1 && -n "${AWG_Jc:-}" ]]; then
+            log_warn "WARNING: --preset/--jc/--jmin/--jmax on a reinstall regenerate ALL obfuscation parameters (including H1-H4/S1-S4/I1)."
+            log_warn "All existing client configs will stop connecting - reissue them after the install: sudo bash $MANAGE_SCRIPT_PATH regen"
+        fi
         generate_awg_params
+    elif [[ -n "${CLI_I1_MODE:-}" ]]; then
+        local _i1_matches_mode=0
+        case "$CLI_I1_MODE" in
+            random) [[ "${AWG_I1:-}" == "<r "*">" ]] && _i1_matches_mode=1 ;;
+            quic)   [[ "${AWG_I1:-}" == "<b 0x"*">" ]] && _i1_matches_mode=1 ;;
+        esac
+        if [[ "${AWG_I1_MODE:-random}" == "$CLI_I1_MODE" && "$_i1_matches_mode" -eq 1 ]]; then
+            log "I1 already matches --i1-mode=${CLI_I1_MODE}; preserving it (idempotent run)."
+        else
+            if [[ "$config_exists" -eq 1 ]]; then
+                log_warn "WARNING: --i1-mode=${CLI_I1_MODE} changes I1. Existing client configs will stop connecting - reissue them: sudo bash $MANAGE_SCRIPT_PATH regen"
+            fi
+            generate_i1_for_mode "$CLI_I1_MODE"
+        fi
     else
         log "AWG 2.0 parameters already set from config."
+    fi
+
+    # CPS (I1) toggle (issue #159): --no-cps drops the I1 parameter that makes the
+    # desktop AmneziaVPN on macOS hang on connect (mobile and CLI clients handle
+    # CPS fine). Only I1 is cleared, the rest of the obfuscation set (Jc/S1-S4/
+    # H1-H4) is left intact. Explicit --preset/--jc/--jmin/--jmax/--i1-mode without --no-cps
+    # re-enable CPS (a fresh set includes I1). Otherwise keep the state from init.
+    if [[ "${CLI_NO_CPS:-0}" -eq 1 ]]; then
+        NO_CPS=1
+    elif [[ -n "${CLI_PRESET:-}" || -n "${CLI_JC:-}" || -n "${CLI_JMIN:-}" || -n "${CLI_JMAX:-}" || -n "${CLI_I1_MODE:-}" ]]; then
+        NO_CPS=0
+    fi
+    if [[ "${NO_CPS:-0}" -eq 1 ]]; then
+        if [[ -n "${AWG_I1:-}" && "$config_exists" -eq 1 ]]; then
+            log_warn "WARNING: --no-cps drops the I1 (CPS) parameter. Existing client configs that still carry I1 will stop connecting - reissue them: sudo bash $MANAGE_SCRIPT_PATH regen"
+        fi
+        AWG_I1=''
+        log "CPS (I1) disabled (--no-cps / persisted NO_CPS=1): the desktop AmneziaVPN on macOS does not support CPS."
     fi
 
     # Save configuration
@@ -2408,7 +5030,10 @@ export AWG_TUNNEL_SUBNET='${AWG_TUNNEL_SUBNET}'
 export DISABLE_IPV6=${DISABLE_IPV6}
 export ALLOWED_IPS_MODE=${ALLOWED_IPS_MODE}
 export ALLOWED_IPS='${ALLOWED_IPS}'
+export CLIENT_ISOLATION=${CLIENT_ISOLATION:-1}
+export CLIENT_ISOLATION_NET='${CLIENT_ISOLATION_NET:-}'
 export AWG_ENDPOINT='${AWG_ENDPOINT}'
+export AWG_SERVER_NAME='${AWG_SERVER_NAME:-AWG Server}'
 export AWG_MTU=${AWG_MTU:-1280}
 # AWG 2.0 Parameters
 export AWG_Jc=${AWG_Jc}
@@ -2424,8 +5049,14 @@ export AWG_H3='${AWG_H3}'
 export AWG_H4='${AWG_H4}'
 export AWG_I1='${AWG_I1}'
 export AWG_I1_MODE='${AWG_I1_MODE:-random}'
+export AWG_I2='${AWG_I2:-}'
+export AWG_I3='${AWG_I3:-}'
+export AWG_I4='${AWG_I4:-}'
+export AWG_I5='${AWG_I5:-}'
 export AWG_PRESET='${AWG_PRESET:-default}'
 export NO_TWEAKS=${NO_TWEAKS}
+export KEEP_PACKAGES=${KEEP_PACKAGES:-1}
+export NO_CPS=${NO_CPS}
 export AWG_APPLY_MODE='${AWG_APPLY_MODE:-syncconf}'
 # Multi-hop (cascade)
 export AWG_ROLE='${AWG_ROLE:-single}'
@@ -2446,6 +5077,14 @@ export ALLOW_IPV6_TUNNEL=${ALLOW_IPV6_TUNNEL:-0}
 export IPV6_SUBNET='${IPV6_SUBNET}'
 export SERVER_HAS_NATIVE_IPV6=${SERVER_HAS_NATIVE_IPV6:-0}
 EOF
+    # The pending delete of the old port's UFW rule must survive a reboot:
+    # step 4 runs in a different process after 1-2 reboots, a process variable
+    # does not live that long (PR #176). Post-commit cleanup removes the key
+    # only after an exact-owned UFW delete succeeds.
+    if [[ "$PREV_AWG_PORT" =~ ^[0-9]+$ ]]; then
+        echo "export PREV_AWG_PORT=${PREV_AWG_PORT}" >> "$temp_conf" \
+            || die "Error writing PREV_AWG_PORT to $temp_conf"
+    fi
     if ! mv "$temp_conf" "$CONFIG_FILE"; then
         rm -f "$temp_conf"
         die "Error saving $CONFIG_FILE"
@@ -2457,6 +5096,38 @@ EOF
     log "Subnet: ${AWG_TUNNEL_SUBNET}"
     log "IPv6 disable: $DISABLE_IPV6"
     log "AllowedIPs mode: $ALLOWED_IPS_MODE"
+    log "Client isolation: $( [[ "${CLIENT_ISOLATION:-1}" -eq 1 ]] && echo enabled || echo disabled )"
+
+    log "Server name: ${AWG_SERVER_NAME}"
+    # Changing the routing mode is a client-config operation: new clients get
+    # the new list, but for existing ones regen deliberately preserves
+    # AllowedIPs (per-client modify customizations). Hint the explicit way to
+    # apply the new mode to everyone (Issue #170).
+    if [[ "$config_exists" -eq 1 && "$CLI_ROUTING_MODE" != "default" ]]; then
+        log_warn "Routing mode changed. Existing client configs keep their old AllowedIPs."
+        log_warn "Apply the new mode to all clients: sudo bash $MANAGE_SCRIPT_PATH regen --reset-routes"
+    fi
+    # Isolation change - the same operation on client configs as a routing
+    # mode change: new clients get the new list, existing ones only via
+    # regen --reset-routes (issue #178).
+    if [[ "$config_exists" -eq 1 \
+          && "$_cfg_client_isolation" != "$CLIENT_ISOLATION" ]]; then
+        log_warn "Client isolation mode changed. Existing client configs keep their old AllowedIPs."
+        log_warn "Apply the new mode to all clients: sudo bash $MANAGE_SCRIPT_PATH regen --reset-routes"
+    fi
+    # Port change: step 6 skips clients that already exist, their Endpoint
+    # keeps the old port and they silently stop connecting. Hint the explicit
+    # reissue - mirrors the routing-mode change warning (#170).
+    if [[ "$config_exists" -eq 1 && -n "$PREV_AWG_PORT" ]]; then
+        log_warn "Port changed (${PREV_AWG_PORT} -> ${AWG_PORT}). Existing client configs keep the old port in Endpoint and will lose connectivity."
+        log_warn "Reissue all clients: sudo bash $MANAGE_SCRIPT_PATH regen"
+    fi
+    # Server-name change (D#180): affects only the vpn:// URI; existing
+    # .vpnuri files keep the old name until reissued.
+    if [[ "$config_exists" -eq 1 && "$_cfg_server_name" != "$AWG_SERVER_NAME" ]]; then
+        log_warn "Server name changed ('${_cfg_server_name}' -> '${AWG_SERVER_NAME}'). Existing vpn:// links keep the old name."
+        log_warn "Reissue with the new name: sudo bash $MANAGE_SCRIPT_PATH regen"
+    fi
 
     # Loading state
     if [[ -f "$STATE_FILE" ]]; then
@@ -2473,6 +5144,29 @@ EOF
         log "Starting from step 1."
         update_state 1
     fi
+
+    # Stale state (an interrupted step 7 leaves setup_state=7/99) + CLI flags
+    # affecting the firewall/configs: without the rollback the loop would skip
+    # steps 4-6, the new values would live only in awgsetup_cfg.init while
+    # awg0.conf, client configs and UFW rules silently kept the old ones
+    # (Issue #175). Roll back to step 4: firewall (port) + config regen (step 6).
+    if (( current_step > 4 )) && { [[ -n "$CLI_PORT" ]] || [[ -n "$CLI_SUBNET" ]] \
+        || [[ -n "$CLI_SSH_PORT" ]] || [[ "$CLI_ROUTING_MODE" != "default" ]] \
+        || [[ -n "$CLI_ENDPOINT" ]] || [[ "$CLI_DISABLE_IPV6" != "default" ]] \
+        || [[ "${CLI_ALLOW_IPV6_TUNNEL:-default}" != "default" ]] || [[ -n "${CLI_PRESET:-}" ]] \
+        || [[ -n "${CLI_JC:-}" ]] || [[ -n "${CLI_JMIN:-}" ]] || [[ -n "${CLI_JMAX:-}" ]] \
+        || [[ "${CLI_ISOLATION:-default}" != "default" ]] \
+        || [[ "${CLI_NO_CPS:-0}" -eq 1 ]] || [[ -n "${CLI_I1_MODE:-}" ]] \
+        || [[ -n "${CLI_ROLE:-}" ]] || [[ -n "${CLI_UPSTREAM_CONF:-}" ]] \
+        || [[ -n "${CLI_UPSTREAM_IFACE:-}" ]] || [[ -n "${CLI_UPSTREAM_TABLE:-}" ]] \
+        || [[ -n "${CLI_UPSTREAM_FWMARK:-}" ]] || [[ -n "${CLI_EGRESS:-}" ]] \
+        || [[ -n "${CLI_WARP_IFACE:-}" ]] || [[ -n "${CLI_WARP_TABLE:-}" ]] || [[ -n "${CLI_WARP_PRIORITY:-}" ]] \
+        || [[ -n "${CLI_WARP_BYPASS:-}" ]] || [[ -n "${CLI_AMNEZIA_DNS:-}" ]]; }; then
+        log_warn "Unfinished install (step $current_step) + configuration CLI flags: rolling back to step 4 so the firewall and configs are regenerated with the new values."
+        current_step=4
+        update_state 4
+    fi
+    _INSTALL_INITIAL_STEP="$current_step"
     log "Step 0 completed."
 }
 
@@ -2484,15 +5178,33 @@ step1_update_and_optimize() {
     update_state 1
     log "### STEP 1: System update, cleanup, and optimization ###"
 
+    # First-boot dpkg-lock resilience: unattended-upgrades and apt-daily often
+    # hold the lock for several minutes (issue #150 - apt full-upgrade used to
+    # fail immediately). DPkg::Lock::Timeout makes apt wait for the lock to be
+    # released instead of erroring out.
+    mkdir -p /etc/apt/apt.conf.d
+    printf 'DPkg::Lock::Timeout "300";\n' > /etc/apt/apt.conf.d/99-amneziawg-lock-timeout \
+        || log_warn "Failed to write apt lock-timeout (issue #150 mitigation)."
+
     # Clean unnecessary components (BEFORE update to save bandwidth/time)
-    if [[ "$NO_TWEAKS" -eq 0 ]]; then
-        cleanup_system
-    else
+    if [[ "$NO_TWEAKS" -eq 1 ]]; then
         log "Skipping system cleanup (--no-tweaks)."
+    elif [[ "$KEEP_PACKAGES" != "0" ]]; then
+        # Not a strict zero means either an explicit refusal or an unknown decision (empty
+        # or mangled value from a hand-edited config). Irreversible removal happens only on
+        # recorded consent; everything else is treated as "leave it alone".
+        log "Skipping the system cleanup: the packages are kept."
+        [[ -z "$KEEP_PACKAGES" ]]             && log_warn "No consent for removing system packages is recorded - removing nothing."
+    else
+        cleanup_system
     fi
+
 
     log "Updating package lists..."
     apt_update_tolerant || die "apt update error."
+    # Cache is fresh: install_packages below must not rerun apt update
+    # (sources do not change in step 1).
+    _APT_UPDATED=1
 
     log "Unlocking dpkg..."
     if ! apt-get check &>/dev/null; then
@@ -2500,9 +5212,77 @@ step1_update_and_optimize() {
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a || log_warn "dpkg --configure -a."
     fi
 
+    # The meta-packages that udev, initramfs-tools and the network stack hang
+    # from may have been orphaned: the cleanup above does that, but they can
+    # equally arrive orphaned with the image itself. So this block runs
+    # UNCONDITIONALLY, --no-tweaks and --keep-packages included, when no cleanup
+    # happened at all. Mark such packages manual again. The upgrade below can no
+    # longer drop them (the command was changed over Issue #223: apt-get
+    # upgrade has no such right), but the "no longer required" status stays a
+    # trap for later: any subsequent apt operation is free to act on it. Ours
+    # included - install_packages below calls apt install without --no-remove -
+    # and so is any autoremove the user runs afterwards.
+    # Manual rather than hold on purpose: a hold would block the upgrade, and
+    # upgrading them is exactly what we want; manual only clears the status.
+    # ⚠️ The marking guarantees nothing: apt may drop a manual package too while
+    # resolving dependencies. The guarantee is the _verify_boot_critical check
+    # before the reboot.
+    #
+    # This block sits AFTER the dpkg repair above, and that is not cosmetic: the
+    # snapshot is built by asking dpkg. A locked database still answers fine, but
+    # an unreachable or damaged one answers empty for everything at once, and the
+    # protection would then switch itself off silently along with the
+    # post-upgrade check, on exactly the machines where the defect bites. The
+    # self-test below catches that case too.
+    _dpkg_usable || die "dpkg does not answer, and without it there is no way to tell whether udev and initramfs-tools survive the upgrade (Issue #223). Run: dpkg --configure -a; apt-get check - then start the installer again."
+    # Self-test of the predicate. _dpkg_usable only answers for dpkg, while the
+    # predicate also leans on awk: a broken awk would return an empty status,
+    # that is "absent" for everything at once, and the guard would switch itself
+    # off in silence.
+    _pkg_present dpkg || die "Could not determine package state (dpkg-query or awk do not behave as expected). Without it there is no way to make sure the upgrade will not take udev away (Issue #223)."
+    local critical_before
+    critical_before="$(_boot_critical_snapshot)"
+    if [[ -n "$critical_before" ]]; then
+        log "Protected from removal: $(printf '%s' "$critical_before" | tr '\n' ' ')"
+        # udev is present on virtually every Ubuntu and Debian server. Its
+        # absence means not "nothing to protect" but that the machine may
+        # already be damaged, by an interrupted earlier run for instance.
+        _pkg_installed_ok udev \
+            || log_warn "udev is not installed or not configured. That is abnormal for Ubuntu and Debian: check dpkg-query -W udev, the server may fail to boot."
+        # Unquoted on purpose: the list arrives as newline-separated names and
+        # splitting it into arguments is exactly what is wanted here.
+        apt-mark manual $critical_before >/dev/null 2>&1 \
+            || log_warn "Failed to restore the manual mark on: $(printf '%s' "$critical_before" | tr '\n' ' ') - they stay flagged \"no longer required\", the check before the reboot will catch that."
+    else
+        log_warn "Not a single boot-critical package was found installed. That is unusual for Ubuntu and Debian; check: dpkg-query -W udev"
+    fi
     log "Updating system..."
-    DEBIAN_FRONTEND=noninteractive apt full-upgrade -y || die "apt full-upgrade error."
+    # Deliberately upgrade --with-new-pkgs rather than full-upgrade. The
+    # difference is not cosmetic: full-upgrade is by definition allowed to
+    # REMOVE installed packages to resolve dependencies, and in Issue #223 it
+    # used that right - it took udev away and the server stopped booting.
+    # upgrade has no such right at all: a package that cannot be upgraded
+    # without removing a neighbour is simply left at its current version.
+    # --with-new-pkgs keeps the only reason full-upgrade was needed here: a new
+    # kernel arrives as a package with a NEW name
+    # (linux-image-6.8.0-NNN-generic), and a plain upgrade refuses to install
+    # new names.
+    # The trade is deliberate: a VPN server does not need systemd to be the
+    # freshest, it needs the machine to boot. The pre-reboot verification below
+    # stays as the second line of defence.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --with-new-pkgs; then
+        local _lock_holder
+        _lock_holder="$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null | tr -s ' ' || true)"
+        if [[ -n "$_lock_holder" ]]; then
+            log_warn "dpkg-lock is held by:${_lock_holder} (usually first-boot unattended-upgrades)."
+        fi
+        log_warn "Update failed, fixing dpkg and retrying..."
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --with-new-pkgs || _die_upgrade_failed
+    fi
+    _warn_kept_back
     log "System updated."
+
 
     install_packages curl wget gpg sudo ethtool
 
@@ -2515,6 +5295,10 @@ step1_update_and_optimize() {
         log "Skipping optimization and hardening (--no-tweaks)."
         setup_minimal_sysctl
     fi
+
+    # Checked as the very last action of the step: nothing capable of
+    # removing a package runs after this line.
+    _verify_boot_critical "$critical_before"
 
     log "Step 1 completed successfully."
     request_reboot 2
@@ -2606,6 +5390,91 @@ _try_install_prebuilt_arm() {
     fi
 }
 
+# H0 (AWG 3.0, 31 jul 2026): on kernels < 6.7 the current PPA module is AmneziaWG
+# 3.0, and we deliberately keep it out of there (why exactly - see
+# _kernel_supports_awg3). We install the last pinned 2.0 module (the 1.0.x line)
+# from source via DKMS:
+#   1. git clone the pinned tag --depth=1;
+#   2. VERIFY the commit against AWG2_PIN_COMMIT (integrity: an immutable commit is
+#      more robust than the GitHub auto-tarball SHA, which changes on recompression);
+#   3. the upstream `make dkms-install` mechanism (lays it into /usr/src/amneziawg-1.0.0);
+#   4. dkms add/build/install for the current kernel;
+#   5. a modprobe check (built != loadable: Secure Boot may block it).
+# The source dkms.conf carries AUTOINSTALL=yes, so our amneziawg-ensure-module helper
+# (apt hook + systemd) rebuilds the pinned module on a kernel upgrade by itself - no
+# separate maintenance code is needed. Returns: 0 success, 1 failure (logged to ERROR).
+_install_pinned_awg2_module() {
+    local repo="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
+    local kver work got_commit
+    local dkms_ver="1.0.0"   # WIREGUARD_VERSION in the upstream Makefile (name of /usr/src/amneziawg-<ver>)
+    kver="$(uname -r)"
+
+    if ! command -v git >/dev/null 2>&1; then
+        log_error "git is not installed - cannot fetch the pinned module source."
+        return 1
+    fi
+
+    work="$(mktemp -d /tmp/awg2-pin-XXXXXX)" || { log_error "mktemp -d failed."; return 1; }
+
+    log "Cloning the pinned AmneziaWG 2.0 source ($AWG2_PIN_TAG)..."
+    if ! git clone --depth=1 --branch "$AWG2_PIN_TAG" "$repo" "$work/src" >/dev/null 2>&1; then
+        log_error "Failed to clone $repo (tag $AWG2_PIN_TAG). Check access to github.com."
+        rm -rf "$work"; return 1
+    fi
+
+    got_commit="$(git -C "$work/src" rev-parse HEAD 2>/dev/null || echo "")"
+    if [[ "$got_commit" != "$AWG2_PIN_COMMIT" ]]; then
+        log_error "Pin check failed: tag $AWG2_PIN_TAG -> commit '${got_commit:-<empty>}',"
+        log_error "expected $AWG2_PIN_COMMIT. Refusing (the tag may have been moved/tampered with)."
+        rm -rf "$work"; return 1
+    fi
+    log "Pinned commit confirmed: $got_commit"
+
+    # Lay out the DKMS source via the upstream mechanism (the Makefile is in src/).
+    # Save make output to a log: otherwise the real cause of a failure (environment /
+    # coreutils) is invisible - unlike the dkms build path, no make.log is created here.
+    local _mklog="/var/log/amneziawg-pin-dkms-install.log"
+    if ! make -C "$work/src/src" dkms-install PREFIX=/usr >"$_mklog" 2>&1; then
+        log_error "make dkms-install failed. Details: $_mklog"
+        rm -rf "$work"; return 1
+    fi
+    rm -rf "$work"
+
+    if [[ ! -f "/usr/src/amneziawg-${dkms_ver}/dkms.conf" ]]; then
+        log_error "/usr/src/amneziawg-${dkms_ver}/dkms.conf did not appear after dkms-install."
+        return 1
+    fi
+
+    # add is idempotent: on a re-run it is already added -> not fatal.
+    dkms add -m amneziawg -v "$dkms_ver" >/dev/null 2>&1 || true
+    # Idempotency (the installer is a resumable state machine): dkms build errors
+    # with "already built" for a kernel already done -> build ONLY if there is no
+    # build for this kernel yet. install --force below is idempotent by itself.
+    if dkms status -m amneziawg -v "$dkms_ver" -k "$kver" 2>/dev/null | grep -qE ': (built|installed)'; then
+        log "The pinned 2.0 module is already built for kernel $kver - skipping dkms build."
+    else
+        log "Building the pinned 2.0 module via DKMS (kernel $kver)..."
+        if ! dkms build -m amneziawg -v "$dkms_ver" -k "$kver" >/dev/null 2>&1; then
+            log_error "DKMS build of the pinned 2.0 module failed. See /var/lib/dkms/amneziawg/${dkms_ver}/${kver}/*/log/make.log"
+            return 1
+        fi
+    fi
+    if ! dkms install -m amneziawg -v "$dkms_ver" -k "$kver" --force >/dev/null 2>&1; then
+        log_error "DKMS install of the pinned 2.0 module failed."
+        return 1
+    fi
+
+    # Built != loadable: with Secure Boot enabled an unsigned module will not load.
+    if ! modprobe amneziawg 2>/dev/null; then
+        log_error "The module was built but modprobe amneziawg did not load it."
+        log_error "The likely cause is Secure Boot: an unsigned DKMS module is blocked."
+        log_error "Disable Secure Boot in the VPS BIOS/UEFI or enroll a MOK key."
+        return 1
+    fi
+    log "The pinned AmneziaWG 2.0 module is built and loaded (DKMS $dkms_ver, kernel $kver)."
+    return 0
+}
+
 # ==============================================================================
 # STEP 2: Installing AmneziaWG and dependencies
 # ==============================================================================
@@ -2615,8 +5484,8 @@ step2_install_amnezia() {
 
     # Guard: make sure the user actually rebooted before step 2.
     # If boot_id matches the one saved in request_reboot 2 — the reboot
-    # did not happen (e.g. user re-ran the script by mistake). Step 1's
-    # apt full-upgrade staged a new kernel on disk, but the running
+    # did not happen (e.g. user re-ran the script by mistake). The step 1
+    # upgrade may have staged a new kernel on disk, but the running
     # kernel is still the old one → DKMS would build the module against
     # the old kernel and modprobe would fail after the next reboot.
     local boot_id_file="$AWG_DIR/.boot_id_before_step2"
@@ -2634,7 +5503,14 @@ step2_install_amnezia() {
     log "### STEP 2: Installing AmneziaWG and dependencies ###"
     _APT_UPDATED=0  # Reset: new sources will be added in this step
 
-    apt_update_tolerant || die "apt update error."
+    # --ppa-amnezia-tolerant is REQUIRED already here: if a PPA file with a
+    # broken suite is left on disk (404 Release; e.g. questing from an older
+    # version or after an in-place upgrade), a strict update died BEFORE the
+    # repair blocks below ever ran, so the repair never fired (live repro on
+    # Debian 12, v5.16.0 cycle). Base repository errors remain fail-closed;
+    # PPA errors are handled by the repair + post-PPA update +
+    # apt_wait_for_ppa_package below.
+    apt_update_tolerant --ppa-amnezia-tolerant || die "apt update error."
 
     # PPA Amnezia (without software-properties-common)
     log "Adding Amnezia PPA..."
@@ -2716,6 +5592,23 @@ step2_install_amnezia() {
         log_warn "Legacy PPA $legacy_sources (suite='${legacy_suite:-<empty>}') does not match target '${ppa_codename}' — removing."
         rm -f "$legacy_sources" "$legacy_list"
     fi
+    # Same repair for the traditional .list (Debian 12): the suite is the token
+    # after the URL in a 'deb [opts] URL <suite> main' line. Without this check
+    # a file with an old/foreign suite (e.g. after an in-place upgrade
+    # bookworm->trixie) would slip through below as "PPA already added" and apt
+    # would keep pulling the wrong suite.
+    local list_suite=""
+    if [[ -f "$ppa_list" ]]; then
+        list_suite=$(awk '/^deb([[:space:]]|$)/ {
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /^https?:/) { print $(i+1); exit }
+            }
+        }' "$ppa_list" 2>/dev/null)
+        if [[ -z "$list_suite" || "$list_suite" != "$ppa_codename" ]]; then
+            log_warn "Existing $ppa_list (suite='${list_suite:-<empty>}') does not match target '${ppa_codename}' - recreating."
+            rm -f "$ppa_list"
+        fi
+    fi
     if [[ -f "$legacy_list" ]] || [[ -f "$legacy_sources" ]]; then
         log "PPA already added (legacy format)."
     elif [[ -f "$ppa_sources" ]] || [[ -f "$ppa_list" ]]; then
@@ -2732,10 +5625,24 @@ step2_install_amnezia() {
         # SSH, cloud-init, Ansible, etc.) and must not abort with "File exists"
         # when overwriting the mktemp-created tmp file. Without --yes gpg in
         # batch mode refuses to write into the pre-existing empty tmp file.
-        if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" \
+        # Request by the FULL 40-character fingerprint, not the short ID:
+        # short 32-bit IDs have preimage collisions (evil32), and
+        # keyserver.ubuntu.com accepts uploads of arbitrary keys. A swapped
+        # key would not give RCE (package signatures would not match), but it
+        # would break the install with a cryptic apt error.
+        local _ppa_key_fpr="75C9DD72C799870E310542E24166F2C257290828"
+        if ! curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${_ppa_key_fpr}" \
              | gpg --batch --no-tty --yes --dearmor -o "$_kf_tmp"; then
             rm -f "$_kf_tmp" 2>/dev/null
             die "Amnezia PPA GPG key import error."
+        fi
+        # Verify the downloaded key fingerprint against the expected one (pin).
+        local _got_fpr
+        _got_fpr=$(gpg --batch --no-tty --show-keys --with-colons "$_kf_tmp" 2>/dev/null \
+            | awk -F: '/^fpr:/{print $10; exit}')
+        if [[ "$_got_fpr" != "$_ppa_key_fpr" ]]; then
+            rm -f "$_kf_tmp" 2>/dev/null
+            die "Amnezia PPA GPG key failed the fingerprint check (got: '${_got_fpr:-<empty>}')."
         fi
         chmod 644 "$_kf_tmp" || { rm -f "$_kf_tmp" 2>/dev/null; die "chmod GPG key error."; }
         mv -f "$_kf_tmp" "$keyring_file" \
@@ -2772,6 +5679,10 @@ PPASRC
         log_error "integrity of keys in /etc/apt/keyrings, dpkg lock contention."
         die "apt update returned an error (rc!=0, not the Amnezia PPA)."
     fi
+    # PPA added, cache refreshed: sources do not change further in step 2, so
+    # install_packages must not repeat apt update (on slow mirrors every run
+    # is 10-60 seconds).
+    _APT_UPDATED=1
     # apt-get update is tolerant to an unreachable InRelease (rc=0 even when
     # the PPA is down). So we check that amneziawg-dkms actually appears in
     # apt-cache, with three attempts and 30s/60s backoff (~1.5 min total).
@@ -2789,23 +5700,127 @@ PPASRC
     # AmneziaWG + qrencode packages (NO Python!)
     log "Installing AmneziaWG packages..."
 
+    # H0 (AWG 3.0, 31 jul 2026): decide the pinned 2.0 module path BEFORE installing
+    # any package - the hold must be in place before even the ARM prebuilt path, where
+    # install_packages installs amneziawg-tools whose Recommends would otherwise pull
+    # in the 3.0 module behind the gate. On kernels < 6.7 the PPA module is AmneziaWG
+    # 3.0; we do not install it here (deliberately, see _kernel_supports_awg3) and
+    # build the pinned 2.0 from source instead; only tools come from the PPA
+    # (version-aware, they do work with 2.0 - verified).
+    local use_pinned_awg2=0
+    if ! _kernel_supports_awg3; then
+        use_pinned_awg2=1
+        log "Kernel $(uname -r) is older than 6.7 - installing the tested AmneziaWG 2.0 module here, not 3.0 from the PPA."
+        log "Activated the pinned AmneziaWG 2.0 module path from source ($AWG2_PIN_TAG)."
+        # Re-entry: if a prior run / the stock installer already installed (or left
+        # half-configured) the 3.0 package - remove it and its source, otherwise its
+        # failing postinst and /usr/src/amneziawg-* ownership conflict with the build.
+        if dpkg -l amneziawg-dkms 2>/dev/null | grep -qE '^(ii|iU|iF|iH|rc)'; then
+            log "Found a previously installed amneziawg-dkms (AmneziaWG 3.0) - removing it before the pinned build."
+            DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg-dkms amneziawg >/dev/null 2>&1 \
+                || dpkg --purge --force-all amneziawg-dkms amneziawg >/dev/null 2>&1 \
+                || log_warn "Could not fully remove the previously installed amneziawg-dkms - the install below may fail."
+            command -v dkms >/dev/null 2>&1 && dkms remove -m amneziawg -v 1.0.0 --all >/dev/null 2>&1 || true
+            rm -rf /var/lib/dkms/amneziawg* /usr/src/amneziawg-* 2>/dev/null || true
+        fi
+        # ⚠️ Hold BEFORE any install: amneziawg-tools RECOMMENDS amneziawg-dkms, apt
+        # installs recommends by default -> without a hold, installing tools (incl. on
+        # the ARM path) would drag in the 3.0 dkms, leaving TWO DKMS trees under the
+        # same module name amneziawg - the pinned 2.0 one and the packaged 3.0 one.
+        # This is a safety mechanism, so its failure is fatal (we verify the hold took
+        # effect).
+        apt-mark hold amneziawg-dkms amneziawg >/dev/null 2>&1 || true
+        # We verify amneziawg-dkms specifically - it is the load-bearing package: it
+        # is what amneziawg-tools Recommends and what carries the 3.0 module. The
+        # metapackage amneziawg need not be held (its Depends: amneziawg-dkms is held
+        # anyway), so we do not verify it separately.
+        if ! apt-mark showhold 2>/dev/null | grep -qx "amneziawg-dkms"; then
+            die "Failed to hold amneziawg-dkms. Without it, installing amneziawg-tools would pull the AmneziaWG 3.0 module from the PPA, bypassing the chosen path. Aborted (check for an apt/dpkg lock)."
+        fi
+    else
+        # Kernel >= 6.7: the normal path installs amneziawg-dkms from the PPA. Clear a
+        # possible hold left by an earlier pinned run (else apt install -y aborts on hold).
+        apt-mark unhold amneziawg-dkms amneziawg >/dev/null 2>&1 || true
+    fi
+
     # On ARM: try prebuilt .deb first (no build tools or headers required).
     # Falls back to DKMS if no matching prebuilt is available or download fails.
+    # ⚠️ On a kernel < 6.7 (use_pinned_awg2=1) using the prebuilt .deb is SAFE: our ARM
+    # prebuilts are built from scripts/arm-module-version.txt, pinned to the same 2.0
+    # tag (v1.0.20260725) and locked by a test, so it is a KNOWN 2.0 module, not 3.0.
+    # ⚠️ That is the ONLY guarantee, and it is enough. The former second argument -
+    # "3.0 cannot compile for a kernel < 6.7 anyway, so a 3.0 asset for a target like
+    # debian-bookworm-arm64 cannot exist in the release" - is WRONG as of 31 jul 2026
+    # (upstream fixed the build, v3.0.20260731-04); do not lean on it. On no match
+    # _try_install_prebuilt_arm returns 1 and we fall through to the verified source
+    # build below. The hold set above also applies here (keeps tools from pulling the
+    # 3.0 dkms via Recommends).
     local arch
     arch="$(uname -m)"
     if [[ "$arch" == "aarch64" || "$arch" == "armv7l" ]]; then
         if _try_install_prebuilt_arm; then
             log "Prebuilt kernel module installed. Installing userspace tools from PPA..."
+            # 🔴 The hold is REQUIRED here too, REGARDLESS of the kernel version.
+            # Above it is set only on the pinned path (kernel < 6.7), while the
+            # >= 6.7 branch does apt-mark unhold - and this ARM block runs AFTER
+            # that gate. The prebuilt package is named amneziawg-kmod-<KERNEL_ID>
+            # and declares no "Provides: amneziawg-modules", so it does NOT
+            # satisfy the alternative in amneziawg-tools' Recommends (live PPA
+            # metadata: "amneziawg-modules (>= 0.0.20171001) | amneziawg-dkms
+            # (>= ...)"), and amneziawg-modules itself is absent from the PPA.
+            # install_packages installs via apt install -y WITH recommends, so
+            # without the hold apt would pull amneziawg-dkms from the PPA, and a
+            # 3.0 tree in updates/dkms/ would land next to our 2.0 module in
+            # extra/. Two trees carrying a module of the SAME name is exactly what
+            # the hold exists to prevent. Reachable: the ubuntu-2510-arm64 and
+            # debian-trixie-arm64 prebuilt targets ship kernels 6.7+.
+            apt-mark hold amneziawg-dkms amneziawg >/dev/null 2>&1 || true
+            if ! apt-mark showhold 2>/dev/null | grep -qx "amneziawg-dkms"; then
+                die "Failed to put amneziawg-dkms on hold before installing amneziawg-tools. Without it the PPA module would land next to the prebuilt one - two trees named amneziawg. Check the apt/dpkg lock and run the script again: the prebuilt package is already installed, this step will simply repeat."
+            fi
             install_packages "amneziawg-tools" "wireguard-tools" "qrencode"
+            # POSTCONDITION. The PRECONDITION (the hold is in place) is verified
+            # above, but nobody checked the result - in between apt could have
+            # installed the package for a reason we did not foresee, or dkms may
+            # be left over from an earlier install on this very host. Check the
+            # fact rather than the precondition: the fact is what catches a real
+            # failure.
+            # ⚠️ Deliberately NOT a die: "dkms left over from a previous run" is
+            # already a broken state, but aborting the install over it is not
+            # something to ship without a run on an ARM bench, and an abort with
+            # no path to a fix leaves the person with nothing. Hence a loud
+            # warning with the exact command. Tightening this to a die is a
+            # separate task.
+            if dpkg-query -W -f='${Status}' amneziawg-dkms 2>/dev/null | grep -q "ok installed"; then
+                log_warn "WARNING: the amneziawg-dkms package is installed next to the prebuilt module."
+                log_warn "  How that ends was measured on a bench rather than guessed: as soon as kernel"
+                log_warn "  headers are present, DKMS builds, DISPLACES the prebuilt file from extra/, and"
+                log_warn "  after a reboot it is the one that loads - the server silently moves to the"
+                log_warn "  other protocol line. The tunnel keeps working, and dpkg still believes the"
+                log_warn "  prebuilt package is installed."
+                log_warn "  Remove the extra one: sudo apt-mark unhold amneziawg-dkms && sudo apt-get purge -y amneziawg-dkms"
+                log_warn "  then sudo apt-mark hold amneziawg-dkms, reinstall the module and reboot."
+            fi
             log "Step 2 completed (prebuilt ARM)."
+            _boot_critical_guard
+            # request_reboot always terminates the process (exit), we never return here.
             request_reboot 3
-            return
         fi
         log "No matching prebuilt — falling back to DKMS build."
     fi
 
-    local packages=("amneziawg-dkms" "amneziawg-tools" "wireguard-tools" "dkms"
-                    "build-essential" "dpkg-dev" "qrencode")
+    # Packages: on the pinned path (kernel < 6.7) we do NOT install amneziawg-dkms
+    # (it would be the 3.0 module); git is added instead to build the pinned 2.0
+    # source. The gate, hold and cleanup of a previously installed 3.0 were done
+    # above (before the ARM block).
+    local packages
+    if [[ "$use_pinned_awg2" -eq 1 ]]; then
+        packages=("amneziawg-tools" "wireguard-tools" "dkms"
+                  "build-essential" "dpkg-dev" "git" "qrencode")
+    else
+        packages=("amneziawg-dkms" "amneziawg-tools" "wireguard-tools" "dkms"
+                  "build-essential" "dpkg-dev" "qrencode")
+    fi
 
     # Linux headers: on Debian, exact linux-headers-$(uname -r) may not be available
     local current_headers
@@ -2865,6 +5880,24 @@ PPASRC
         fi
     fi
     install_packages "${packages[@]}"
+
+    # H0: pinned path - build the 2.0 module from source INSTEAD of PPA amneziawg-dkms.
+    # Headers for the current kernel are already installed above (in packages); the
+    # hold was set earlier.
+    if [[ "$use_pinned_awg2" -eq 1 ]]; then
+        if ! _install_pinned_awg2_module; then
+            log_error "Failed to install the pinned AmneziaWG 2.0 module."
+            log_error "On kernels older than 6.7 (yours is $(uname -r)) the installer does not take"
+            log_error "the module from the PPA but builds it from source, and that step did not go"
+            log_error "through. The exact reason is in the lines above; usually it is missing kernel"
+            log_error "headers, no free space, a dropped network, or a module that built but will"
+            log_error "not load (Secure Boot). Fallback option: deploy the server on Ubuntu"
+            log_error "24.04/25.10 or Debian 13, where the module comes as a package from the PPA."
+            log_error "See README/INSTALL_VPS for details."
+            die "The pinned AmneziaWG 2.0 module was not installed."
+        fi
+        log "The pinned AmneziaWG 2.0 module is installed; PPA dkms is held (3.0 protection)."
+    fi
 
     # v5.12.0: install a kernel-headers meta-package so apt automatically
     # pulls matching headers on every kernel upgrade. Without the meta only
@@ -3168,6 +6201,10 @@ AWG_SYSTEMD_UNIT_EOF
         log "DKMS status OK."
     fi
 
+    # Step 2 installs packages and reboots the machine as well, so it needs
+    # the same line of defence.
+    _boot_critical_guard
+
     log "Step 2 completed."
     request_reboot 3
 }
@@ -3250,13 +6287,14 @@ verify_sha256() {
     local file="$1" expected="$2" label="$3"
     # Skip verification when:
     # - SHA is not set (RELEASE_PLACEHOLDER — release not yet published)
-    # - AWG_BRANCH is overridden (test branch)
+    # - the source is overridden (test/local branch)
     if [[ "$expected" == "RELEASE_PLACEHOLDER" ]]; then
         log_debug "SHA256 for $label: skipped (placeholder, pre-release)."
         return 0
     fi
-    if [[ "${AWG_BRANCH}" != "v${SCRIPT_VERSION}" ]]; then
-        log_warn "SHA256 for $label: verification skipped (AWG_BRANCH=${AWG_BRANCH} != v${SCRIPT_VERSION}). File not verified."
+    if [[ "$AWG_REPOSITORY" != "$PINNED_HELPERS_REPOSITORY" \
+          || "$AWG_BRANCH" != "$PINNED_HELPERS_REF" ]]; then
+        log_warn "SHA256 for $label: verification skipped for override ${AWG_REPOSITORY}@${AWG_BRANCH}. File not verified."
         return 0
     fi
     local actual
@@ -3305,15 +6343,70 @@ _secure_download() {
     log "$label downloaded and verified."
 }
 
+# Commit two already-verified helpers as one logical transaction. Both staged
+# files live in AWG_DIR (same filesystem): validate the pair before the first
+# rename and restore the old common helper if the second rename fails.
+_commit_helper_pair() {
+    local common_stage="$1" manage_stage="$2" common_label="$3" manage_label="$4"
+    local old_common_tmp="" common_existed=0
+    [[ -f "$common_stage" && ! -L "$common_stage" \
+       && -f "$manage_stage" && ! -L "$manage_stage" ]] || {
+        log_error "Helper pair commit: staging files are missing or unsafe."
+        return 1
+    }
+    chmod 700 "$common_stage" "$manage_stage" || return 1
+    if [[ ( -e "$COMMON_SCRIPT_PATH" || -L "$COMMON_SCRIPT_PATH" ) \
+          && ( ! -f "$COMMON_SCRIPT_PATH" || -L "$COMMON_SCRIPT_PATH" ) \
+          || ( -e "$MANAGE_SCRIPT_PATH" || -L "$MANAGE_SCRIPT_PATH" ) \
+          && ( ! -f "$MANAGE_SCRIPT_PATH" || -L "$MANAGE_SCRIPT_PATH" ) ]]; then
+        log_error "Refusing to replace a helper that is not a regular file."
+        return 1
+    fi
+    if [[ -e "$COMMON_SCRIPT_PATH" ]]; then
+        old_common_tmp=$(mktemp -p "$AWG_DIR" '.old-common.XXXXXX') || return 1
+        cp -p -- "$COMMON_SCRIPT_PATH" "$old_common_tmp" \
+            || { rm -f -- "$old_common_tmp"; return 1; }
+        common_existed=1
+    fi
+
+    # Do not permit INT/TERM in the tiny window between the two renames.
+    trap '' INT TERM
+    if ! mv -f -- "$common_stage" "$COMMON_SCRIPT_PATH"; then
+        trap '_install_on_signal 130' INT
+        trap '_install_on_signal 143' TERM
+        rm -f -- "$old_common_tmp"
+        log_error "Could not atomically replace $common_label"
+        return 1
+    fi
+    if ! mv -f -- "$manage_stage" "$MANAGE_SCRIPT_PATH"; then
+        if [[ "$common_existed" -eq 1 ]]; then
+            mv -f -- "$old_common_tmp" "$COMMON_SCRIPT_PATH" \
+                || log_error "CRITICAL: common-helper rollback failed; backup: $old_common_tmp"
+        else
+            rm -f -- "$COMMON_SCRIPT_PATH" \
+                || log_error "CRITICAL: could not remove the new common helper after pair-update failure."
+        fi
+        trap '_install_on_signal 130' INT
+        trap '_install_on_signal 143' TERM
+        log_error "Could not atomically replace $manage_label; pair update rolled back."
+        return 1
+    fi
+    trap '_install_on_signal 130' INT
+    trap '_install_on_signal 143' TERM
+    rm -f -- "$old_common_tmp"
+    return 0
+}
+
 step5_download_scripts() {
     update_state 5
     log "### STEP 5: Installing management scripts ###"
     cd "$AWG_DIR" || die "Error changing to $AWG_DIR"
 
     # Local path PREFERRED: if the installer is launched from a cloned
-    # repository (i.e. awg_common.sh / manage_amneziawg.sh live next to
-    # install_amneziawg.sh — which is EXACTLY the version the user wants),
-    # use them directly without hitting the network or SHA256 verification.
+    # repository (i.e. awg_common.sh / manage_amneziawg.sh live next to the
+    # installer), stage and SHA256-check BOTH files before replacing either
+    # live helper. The standard repo/ref uses the same mandatory pin as CDN;
+    # an explicit source override is clearly logged.
     # This makes the workflow "git clone → sudo bash install_amneziawg.sh"
     # work for forks: without this branch step5 would fetch upstream
     # versions from the CDN and our local fork modifications would be
@@ -3332,29 +6425,59 @@ step5_download_scripts() {
     local _manage_basename="${MANAGE_SCRIPT_URL##*/}"
     if [[ -n "$script_dir" && "$script_dir" != "$AWG_DIR" \
           && -f "$script_dir/$_common_basename" \
-          && -f "$script_dir/$_manage_basename" ]]; then
-        log "Found local clone ($script_dir) — using files from there."
-        cp "$script_dir/$_common_basename" "$COMMON_SCRIPT_PATH" \
-            || die "Failed to copy $_common_basename"
-        cp "$script_dir/$_manage_basename" "$MANAGE_SCRIPT_PATH" \
-            || die "Failed to copy $_manage_basename"
-        chmod 700 "$COMMON_SCRIPT_PATH" "$MANAGE_SCRIPT_PATH" \
-            || log_warn "chmod on local scripts failed"
-        log "Scripts installed from local clone (SHA256 check skipped — files are trusted)."
+          && ! -L "$script_dir/$_common_basename" \
+          && -f "$script_dir/$_manage_basename" \
+          && ! -L "$script_dir/$_manage_basename" ]]; then
+        local _local_common_tmp="" _local_manage_tmp=""
+        local _local_verify_failed=0
+        log "Found local clone ($script_dir) — staging and verifying both helpers."
+        _local_common_tmp=$(mktemp -p "$AWG_DIR" '.local-common.XXXXXX') \
+            || die "Could not create staging for $_common_basename"
+        _local_manage_tmp=$(mktemp -p "$AWG_DIR" '.local-manage.XXXXXX') \
+            || { rm -f -- "$_local_common_tmp"; die "Could not create staging for $_manage_basename"; }
+        _install_temp_files+=("$_local_common_tmp" "$_local_manage_tmp")
+        cp -- "$script_dir/$_common_basename" "$_local_common_tmp" \
+            && cp -- "$script_dir/$_manage_basename" "$_local_manage_tmp" \
+            && chmod 700 "$_local_common_tmp" "$_local_manage_tmp" \
+            || { rm -f -- "$_local_common_tmp" "$_local_manage_tmp"; die "Failed to stage local helpers"; }
+        verify_sha256 "$_local_common_tmp" "$COMMON_SCRIPT_SHA256" "$_common_basename" \
+            || _local_verify_failed=1
+        verify_sha256 "$_local_manage_tmp" "$MANAGE_SCRIPT_SHA256" "$_manage_basename" \
+            || _local_verify_failed=1
+        if [[ "$_local_verify_failed" -eq 1 ]]; then
+            rm -f -- "$_local_common_tmp" "$_local_manage_tmp"
+            die "Local helper integrity could not be verified; live files were not changed."
+        fi
+        _commit_helper_pair "$_local_common_tmp" "$_local_manage_tmp" \
+            "$_common_basename" "$_manage_basename" \
+            || die "Transactional installation of the local helper pair failed."
+        log "Both helper scripts installed from the local clone after staging and SHA256 verification."
         log "Step 5 completed."
         update_state 6
         return 0
     fi
     log_debug "No local clone detected (INSTALLER_DIR='${script_dir}', AWG_DIR='$AWG_DIR') — fetching from CDN."
 
-    # Fallback: download from CDN via _secure_download (mktemp + SHA256 + atomic mv)
-    log "Downloading $COMMON_SCRIPT_PATH..."
-    _secure_download "$COMMON_SCRIPT_URL" "$COMMON_SCRIPT_PATH" \
-        "$COMMON_SCRIPT_SHA256" "awg_common.sh"
+    # The CDN fallback uses the same pair transaction: download and verify both
+    # helpers in staging first, then replace the two live files only after both
+    # SHA256 checks have succeeded.
+    local _cdn_common_tmp="" _cdn_manage_tmp=""
+    _cdn_common_tmp=$(mktemp -p "$AWG_DIR" '.cdn-common.XXXXXX') \
+        || die "Could not create CDN staging for $_common_basename"
+    _cdn_manage_tmp=$(mktemp -p "$AWG_DIR" '.cdn-manage.XXXXXX') \
+        || { rm -f -- "$_cdn_common_tmp"; die "Could not create CDN staging for $_manage_basename"; }
+    _install_temp_files+=("$_cdn_common_tmp" "$_cdn_manage_tmp")
 
-    log "Downloading $MANAGE_SCRIPT_PATH..."
-    _secure_download "$MANAGE_SCRIPT_URL" "$MANAGE_SCRIPT_PATH" \
-        "$MANAGE_SCRIPT_SHA256" "manage_amneziawg.sh"
+    log "Downloading and verifying $_common_basename in staging..."
+    _secure_download "$COMMON_SCRIPT_URL" "$_cdn_common_tmp" \
+        "$COMMON_SCRIPT_SHA256" "$_common_basename"
+    log "Downloading and verifying $_manage_basename in staging..."
+    _secure_download "$MANAGE_SCRIPT_URL" "$_cdn_manage_tmp" \
+        "$MANAGE_SCRIPT_SHA256" "$_manage_basename"
+    _commit_helper_pair "$_cdn_common_tmp" "$_cdn_manage_tmp" \
+        "$_common_basename" "$_manage_basename" \
+        || die "Transactional installation of the CDN helper pair failed."
+    log "Both helper scripts installed from CDN after pair verification."
 
     log "Step 5 completed."
     update_state 6
@@ -3375,6 +6498,24 @@ step6_generate_configs() {
     fi
     # shellcheck source=/dev/null
     source "$COMMON_SCRIPT_PATH"
+    command -v ip >/dev/null 2>&1 \
+        || die "The ip command is unavailable; live tunnels cannot be checked safely before replacing configs."
+
+    # Migrate the empty marker used by older WARP versions into the granular
+    # ownership model before stopping live awg0. Corrupt legacy state therefore
+    # fails without taking the working VPN offline.
+    local _legacy_warp_iface="${AWG_WARP_IFACE:-wgcf}"
+    if [[ -e "$AWG_DIR/.warp_cleanup_pending" ]]; then
+        [[ -f "$AWG_DIR/.warp_cleanup_pending" && ! -L "$AWG_DIR/.warp_cleanup_pending" ]] \
+            || die "Unsafe WARP cleanup marker before preflight."
+        IFS= read -r _legacy_warp_iface < "$AWG_DIR/.warp_cleanup_pending" || _legacy_warp_iface=""
+    fi
+    if [[ -e "$AWG_DIR/.wgcf_enabled_by_installer" || -L "$AWG_DIR/.wgcf_enabled_by_installer" ]]; then
+        [[ "$_legacy_warp_iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$_legacy_warp_iface" != "awg0" ]] \
+            || die "Invalid WARP iface before legacy preflight."
+        migrate_legacy_warp_ownership "$_legacy_warp_iface" \
+            || die "Legacy WARP ownership could not be migrated safely; awg0 was left unchanged."
+    fi
 
     # Create key directory
     mkdir -p "$KEYS_DIR" || die "Error creating $KEYS_DIR"
@@ -3388,58 +6529,155 @@ step6_generate_configs() {
     fi
 
     # Backup existing server config BEFORE overwriting
-    if [[ -f "$SERVER_CONF_FILE" ]]; then
+    if [[ -e "$SERVER_CONF_FILE" || -L "$SERVER_CONF_FILE" ]]; then
+        [[ -f "$SERVER_CONF_FILE" && ! -L "$SERVER_CONF_FILE" ]] \
+            || die "Refusing to back up an awg0.conf that is not a regular file."
         local s_bak
         s_bak="${SERVER_CONF_FILE}.bak-$(date +%F_%H%M%S)"
-        cp "$SERVER_CONF_FILE" "$s_bak" || log_warn "Backup error $s_bak"
+        cp "$SERVER_CONF_FILE" "$s_bak" || { rm -f "$s_bak"; die "Backup failed at $s_bak — live config left unchanged."; }
         log "Server config backup: $s_bak"
     fi
+
+    # Render and validate the complete new awg0.conf BEFORE stopping the live
+    # interface. The critical section then needs only an atomic rename.
+    local _staged_server_conf _staged_server_dir
+    _staged_server_dir=$(mktemp -d -p "$(dirname "$SERVER_CONF_FILE")" '.awg0-stage.XXXXXX') \
+        || die "Could not create the awg0.conf staging directory."
+    _install_temp_dirs+=("$_staged_server_dir")
+    _staged_server_conf="$_staged_server_dir/awg0.conf"
+    _install_temp_files+=("$_staged_server_conf")
+    render_server_config "${s_bak:-}" "$_staged_server_conf" \
+        || die "Server config pre-render failed; live awg0 was not stopped."
+    validate_awg_config "$_staged_server_conf" \
+        || die "The new awg0.conf failed validation; live awg0 was not stopped."
+    timeout 10 awg-quick strip "$_staged_server_conf" >/dev/null 2>&1 \
+        || die "The new awg0.conf failed awg-quick strip; live awg0 was not stopped."
+
+    # Fully render and validate upstream BEFORE stopping awg0 or the old
+    # upstream. render_upstream_config derives its output directory from
+    # SERVER_CONF_FILE, so point it at an isolated staging directory briefly.
+    local _staged_upstream_conf="" _staged_upstream_dir=""
+    if [[ "${AWG_ROLE:-single}" == "entry" && -n "${AWG_UPSTREAM_CONF:-}" ]]; then
+        local _saved_server_conf_file="$SERVER_CONF_FILE" _up_render_rc=0
+        _staged_upstream_dir=$(mktemp -d -p "$AWG_DIR" '.upstream-stage.XXXXXX') \
+            || die "Could not create an upstream-config staging directory."
+        _install_temp_dirs+=("$_staged_upstream_dir")
+        SERVER_CONF_FILE="$_staged_upstream_dir/awg0.conf"
+        render_upstream_config || _up_render_rc=$?
+        SERVER_CONF_FILE="$_saved_server_conf_file"
+        [[ "$_up_render_rc" -eq 0 ]] \
+            || die "Upstream pre-render failed; live units/configs were not changed."
+        _staged_upstream_conf="$_staged_upstream_dir/${AWG_UPSTREAM_IFACE:-awg1}.conf"
+        [[ -f "$_staged_upstream_conf" && ! -L "$_staged_upstream_conf" ]] \
+            || die "Upstream pre-render did not create the expected config."
+        _install_temp_files+=("$_staged_upstream_conf")
+        timeout 10 awg-quick strip "$_staged_upstream_conf" >/dev/null 2>&1 \
+            || die "The new upstream config failed awg-quick strip; live units/configs were not changed."
+        log "New upstream config rendered and validated in staging."
+    fi
+
+    # Preflight + snapshot of the installer-owned systemd dependency for EXIT rollback.
+    if [[ -e "$AWG0_DEPENDENCY_MARKER" || -L "$AWG0_DEPENDENCY_MARKER" ]]; then
+        local _old_dep_path=""
+        [[ -f "$AWG0_DEPENDENCY_MARKER" && ! -L "$AWG0_DEPENDENCY_MARKER" ]] \
+            || die "Invalid awg0 dependency marker; live awg0 was not stopped."
+        IFS= read -r _old_dep_path < "$AWG0_DEPENDENCY_MARKER" || _old_dep_path=""
+        [[ "$_old_dep_path" == "$AWG0_DEPENDENCY_DROPIN" && -f "$AWG0_DEPENDENCY_DROPIN" \
+           && ! -L "$AWG0_DEPENDENCY_DROPIN" ]] \
+            || die "Stale/invalid awg0 dependency ownership; live awg0 was not stopped."
+        _INSTALL_ROLLBACK_DEP_BACKUP=$(mktemp -p "$AWG_DIR" '.dependency.rollback.XXXXXX') \
+            || die "Could not create an awg0 dependency backup."
+        _install_temp_files+=("$_INSTALL_ROLLBACK_DEP_BACKUP")
+        cp -- "$AWG0_DEPENDENCY_DROPIN" "$_INSTALL_ROLLBACK_DEP_BACKUP" \
+            || die "Could not save awg0 dependency for rollback."
+        _INSTALL_ROLLBACK_DEP_EXISTED=1
+    elif [[ -e "$AWG0_DEPENDENCY_DROPIN" || -L "$AWG0_DEPENDENCY_DROPIN" ]]; then
+        die "A foreign awg0 dependency drop-in exists without an ownership marker; live awg0 was not stopped."
+    fi
+    _INSTALL_ROLLBACK_DEP_ACTIVE=1
+
+    # Snapshot config and exact runtime/autostart independently of active state:
+    # an inactive old config must not be lost, and a first install must remove
+    # its new target on abort. Arm the transaction BEFORE the first stop.
+    local _old_awg0_state="" _old_awg0_link=0
+    _INSTALL_ROLLBACK_SERVER_BACKUP="${s_bak:-}"
+    [[ -n "${s_bak:-}" ]] && _INSTALL_ROLLBACK_SERVER_EXISTED=1 \
+        || _INSTALL_ROLLBACK_SERVER_EXISTED=0
+    _old_awg0_state=$(systemctl is-active awg-quick@awg0 2>/dev/null || true)
+    command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1 \
+        && _old_awg0_link=1
+    [[ "$_old_awg0_state" =~ ^(active|activating|deactivating|reloading)$ ]] \
+        && _INSTALL_ROLLBACK_AWG0_WAS_ACTIVE=1 \
+        || _INSTALL_ROLLBACK_AWG0_WAS_ACTIVE=0
+    _INSTALL_ROLLBACK_AWG0_WAS_LINK="$_old_awg0_link"
+    systemctl is-enabled --quiet awg-quick@awg0 2>/dev/null \
+        && _INSTALL_ROLLBACK_AWG0_WAS_ENABLED=1 \
+        || _INSTALL_ROLLBACK_AWG0_WAS_ENABLED=0
+    if [[ "$_old_awg0_link" -eq 1 && "$_INSTALL_ROLLBACK_SERVER_EXISTED" -eq 0 ]]; then
+        die "A live awg0 exists without the expected $SERVER_CONF_FILE; safe rollback is impossible."
+    fi
+    _INSTALL_ROLLBACK_AWG0=1
+
+    # Stop awg0 WHILE the old config is still on disk so its old PostDown
+    # removes the previous direct/entry/WARP rules.
+    if [[ "$_INSTALL_ROLLBACK_AWG0_WAS_ACTIVE" -eq 1 ]]; then
+        log "Stopping awg0 before the atomic config replacement..."
+        systemctl stop awg-quick@awg0 \
+            || die "Could not stop awg-quick@awg0; old config preserved."
+    elif [[ "$_old_awg0_state" != "inactive" && "$_old_awg0_state" != "failed" \
+            && "$_old_awg0_state" != "unknown" ]]; then
+        die "Could not determine awg0 state reliably; old config preserved."
+    fi
+    if command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1; then
+        timeout 15 awg-quick down "$SERVER_CONF_FILE" >/dev/null 2>&1 \
+            || die "Could not remove live awg0 with the old config; config was not overwritten."
+    fi
+    if command -v ip >/dev/null 2>&1 && ip link show dev awg0 >/dev/null 2>&1; then
+        die "awg0 remained live after stop/down; config was not overwritten."
+    fi
+
+    # A previous upstream with its own routing table must not influence the new
+    # mode. Stop it temporarily only; disabling/deletion remains post-commit.
+    stop_pending_old_upstream_for_transition \
+        || die "Could not safely stop the previous upstream before starting the new awg0."
+
+    # Keep old units/configs intact until the new awg0 is committed. For a
+    # WARP->WARP iface rename, move ownership markers only; EXIT restores them.
+    park_pending_warp_ownership \
+        || die "Could not retain previous WARP ownership safely until commit."
 
     # WARP egress: bring wgcf up BEFORE rendering awg0.conf — the PostUp in
     # the resulting config references the wgcf interface, which must exist
     # by the time systemctl start awg-quick@awg0 fires in step 7.
     if [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
         log "Installing WARP egress (Cloudflare)..."
+        snapshot_warp_egress_state \
+            || die "Could not create a complete WARP egress snapshot before mutation."
         setup_warp_egress || die "setup_warp_egress failed. See log."
-        if [[ "${AWG_WARP_BYPASS:-none}" != "none" ]]; then
-            log "Installing WARP bypass (${AWG_WARP_BYPASS})..."
-            setup_warp_bypass || log_warn "setup_warp_bypass failed (non-fatal: WARP egress works, the bypass wasn't applied)."
-        fi
     fi
 
-    # AmneziaDNS: bring dnsmasq up on the tunnel-gateway IP BEFORE rendering
-    # client configs — those configs receive DNS=${gateway}, but the resolver
-    # needs to exist by the time a client first connects in step7.
-    if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" ]]; then
-        log "Configuring AmneziaDNS (dnsmasq on the tunnel gateway)..."
-        setup_amnezia_dns || die "setup_amnezia_dns failed. See log."
-    fi
+    configure_awg0_dependency \
+        || die "Could not configure the awg0 boot dependency on its egress tunnel."
 
-    # Create AWG 2.0 server config
-    log "Creating server config..."
-    render_server_config || die "Server config creation error."
-
-    # Restore ALL existing [Peer] blocks from backup.
-    # C5: defaults my_phone/my_laptop used to be excluded here, but the
-    # generation loop below skips peers that already exist while the guard in
-    # generate_client refuses to recreate one whose artifacts exist - so a
-    # default client became an orphan (files present, no peer block, silent
-    # connectivity loss on --force reinstall). The previous awk also dropped
-    # every peer but the last: each new [Peer] overwrote the buffer without
-    # flushing the previous one. We now flush on every [Peer] and restore ALL
-    # blocks; the idempotent loop below does not recreate what was restored.
-    if [[ -n "${s_bak:-}" && -f "$s_bak" ]]; then
-        local restored_peers
-        restored_peers=$(awk '
-            /^\[Peer\]/ { if (in_peer) printf "%s", buf; buf=$0"\n"; in_peer=1; next }
-            in_peer && /^\[/ { printf "%s", buf; buf=""; in_peer=0; next }
-            in_peer { buf=buf $0"\n"; next }
-            END { if (in_peer) printf "%s", buf }
-        ' "$s_bak")
-        if [[ -n "$restored_peers" ]]; then
-            printf '\n%s' "$restored_peers" >> "$SERVER_CONF_FILE"
-            log "Existing peers restored from backup."
-        fi
+    # Create the AWG 2.0 server config, carrying ALL existing [Peer] blocks
+    # over from the backup in ONE atomic write (render_server_config appends
+    # the peers into the temp BEFORE mv). Previously the append ran AFTER
+    # render as a separate operation: a failure in the window between them
+    # left the live config peer-less, and the next run of step 6 backed up
+    # the already peer-less file - all clients were lost on --force reinstall
+    # (recovery only by hand from a timestamped .bak).
+    # C5 history (semantics worth keeping): ALL blocks are restored, including
+    # the defaults my_phone/my_laptop - the idempotent loop below skips peers
+    # that already exist, and the guard in generate_client refuses to recreate
+    # one whose artifacts exist.
+    log "Atomically deploying the validated server config..."
+    mv -f "$_staged_server_conf" "$SERVER_CONF_FILE" \
+        && chmod 600 "$SERVER_CONF_FILE" \
+        || die "Validated server config deployment failed."
+    _staged_server_conf=""
+    rmdir "$_staged_server_dir" 2>/dev/null || true
+    if [[ -n "${s_bak:-}" && -f "$s_bak" ]] && grep -q '^\[Peer\]' "$s_bak" 2>/dev/null; then
+        log "Existing peers restored from backup."
     fi
 
     # Generate default clients
@@ -3454,25 +6692,83 @@ step6_generate_configs() {
         fi
     done
 
-    # Config validation
-    validate_awg_config || log_warn "Config validation found issues."
-
     # Multi-hop: deploy the upstream interface (awg1) for role=entry.
     # If --upstream-conf is not given on a repeat run, keep the existing
     # ${AWG_UPSTREAM_IFACE}.conf as-is.
     if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
         local _up_conf_out="/etc/amnezia/amneziawg/${AWG_UPSTREAM_IFACE:-awg1}.conf"
+        local _up_runtime_state="" _up_live_link=0 _up_bak=""
+        if [[ -e "$_up_conf_out" || -L "$_up_conf_out" ]]; then
+            [[ -f "$_up_conf_out" && ! -L "$_up_conf_out" ]] \
+                || die "Refusing to use an upstream config that is not a regular file."
+            _up_bak="${_up_conf_out}.bak-$(date +%F_%H%M%S)"
+            cp "$_up_conf_out" "$_up_bak" \
+                || { rm -f "$_up_bak"; die "Backup failed at $_up_bak; upstream config was not changed."; }
+            log "Upstream config backup: $_up_bak"
+            _INSTALL_ROLLBACK_UPSTREAM_BACKUP="$_up_bak"
+            _INSTALL_ROLLBACK_UPSTREAM_EXISTED=1
+        elif [[ -z "${AWG_UPSTREAM_CONF:-}" ]]; then
+            die "role=entry: no upstream config in CLI or on disk ($_up_conf_out)."
+        else
+            _INSTALL_ROLLBACK_UPSTREAM_BACKUP=""
+            _INSTALL_ROLLBACK_UPSTREAM_EXISTED=0
+        fi
+        _INSTALL_ROLLBACK_UPSTREAM_TARGET="$_up_conf_out"
+        _up_runtime_state=$(systemctl is-active "awg-quick@${AWG_UPSTREAM_IFACE:-awg1}" 2>/dev/null || true)
+        [[ "$_up_runtime_state" =~ ^(active|activating|deactivating|reloading)$ ]] \
+            && _INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE=1 \
+            || _INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE=0
+        command -v ip >/dev/null 2>&1 \
+            && ip link show dev "${AWG_UPSTREAM_IFACE:-awg1}" >/dev/null 2>&1 \
+            && _up_live_link=1
+        _INSTALL_ROLLBACK_UPSTREAM_WAS_LINK="$_up_live_link"
+        systemctl is-enabled --quiet "awg-quick@${AWG_UPSTREAM_IFACE:-awg1}" 2>/dev/null \
+            && _INSTALL_ROLLBACK_UPSTREAM_WAS_ENABLED=1 \
+            || _INSTALL_ROLLBACK_UPSTREAM_WAS_ENABLED=0
+        if [[ "$_up_live_link" -eq 1 && "$_INSTALL_ROLLBACK_UPSTREAM_EXISTED" -eq 0 ]]; then
+            die "A live upstream exists without regular $_up_conf_out; safe rollback is impossible."
+        fi
+        # Step 7 mutates enable/start even when reusing an unchanged config. Arm
+        # rollback now so any later error restores exact active/link/enabled state.
+        _INSTALL_ROLLBACK_UPSTREAM=1
+        if [[ "$_INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE" -eq 0 && "$_up_live_link" -eq 1 ]]; then
+            timeout 15 awg-quick down "$_up_conf_out" >/dev/null 2>&1 \
+                || die "Could not temporarily bring down manually-live upstream ${AWG_UPSTREAM_IFACE:-awg1}."
+            if ip link show dev "${AWG_UPSTREAM_IFACE:-awg1}" >/dev/null 2>&1; then
+                die "Manually-live upstream ${AWG_UPSTREAM_IFACE:-awg1} remained after awg-quick down."
+            fi
+        fi
         if [[ -n "${AWG_UPSTREAM_CONF:-}" ]]; then
             log "Deploying upstream interface ${AWG_UPSTREAM_IFACE:-awg1} from ${AWG_UPSTREAM_CONF}..."
-            if [[ -f "$_up_conf_out" ]]; then
-                local _up_bak
-                _up_bak="${_up_conf_out}.bak-$(date +%F_%H%M%S)"
-                cp "$_up_conf_out" "$_up_bak" || log_warn "Backup failed $_up_bak"
-                log "Upstream config backup: $_up_bak"
+            [[ -n "$_staged_upstream_conf" && -f "$_staged_upstream_conf" ]] \
+                || die "Validated upstream staging was lost; live config was not changed."
+            if [[ "$_INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE" -eq 1 ]]; then
+                log "Stopping ${AWG_UPSTREAM_IFACE:-awg1} before replacing the upstream config..."
+                systemctl stop "awg-quick@${AWG_UPSTREAM_IFACE:-awg1}" \
+                    || die "Could not stop upstream ${AWG_UPSTREAM_IFACE:-awg1}; old config preserved."
+            elif [[ "$_up_runtime_state" != "inactive" && "$_up_runtime_state" != "failed" \
+                    && "$_up_runtime_state" != "unknown" ]]; then
+                die "Could not reliably determine upstream ${AWG_UPSTREAM_IFACE:-awg1} state; old config preserved."
             fi
-            render_upstream_config || die "Failed to write upstream config (${AWG_UPSTREAM_IFACE:-awg1})."
-        elif [[ ! -f "$_up_conf_out" ]]; then
-            die "role=entry: no upstream config in CLI or on disk ($_up_conf_out)."
+            if command -v ip >/dev/null 2>&1 \
+               && ip link show dev "${AWG_UPSTREAM_IFACE:-awg1}" >/dev/null 2>&1; then
+                timeout 15 awg-quick down "$_up_conf_out" >/dev/null 2>&1 \
+                    || die "Could not bring down live upstream ${AWG_UPSTREAM_IFACE:-awg1} with the old config; config was not overwritten."
+            fi
+            if command -v ip >/dev/null 2>&1 \
+               && ip link show dev "${AWG_UPSTREAM_IFACE:-awg1}" >/dev/null 2>&1; then
+                die "Upstream ${AWG_UPSTREAM_IFACE:-awg1} remained live after stop/down; config was not overwritten."
+            fi
+            mv -f -- "$_staged_upstream_conf" "$_up_conf_out" \
+                && chmod 600 "$_up_conf_out" \
+                || die "Could not atomically deploy upstream config (${AWG_UPSTREAM_IFACE:-awg1})."
+            _staged_upstream_conf=""
+            rmdir "$_staged_upstream_dir" 2>/dev/null || true
+            local _expected_staged="$AWG_DIR/.upstream-${AWG_UPSTREAM_IFACE:-awg1}.pending.conf"
+            if [[ "$AWG_UPSTREAM_CONF" == "$_expected_staged" ]]; then
+                rm -f -- "$_expected_staged" || log_warn "Could not remove the consumed upstream staging file."
+                AWG_UPSTREAM_CONF=""
+            fi
         else
             log "Upstream config already exists: $_up_conf_out — skipping render."
         fi
@@ -3490,18 +6786,588 @@ step6_generate_configs() {
     update_state 7
 }
 
+# Load only a v2 ledger that passes the same bounds as common teardown: exact
+# table, at most 2048 unique public /19../32 prefixes. The result is a
+# process-local associative set made from one read snapshot rather than a
+# second grep of a ledger that may have changed.
+load_validated_warp_bypass_ledger() {
+    local expected_table="$1" marker="$AWG_DIR/.warp_bypass_enabled_by_installer"
+    local ledger="/etc/amnezia/amneziawg/warp-bypass.routes" marker_value="" line="" line_no=0 route_count=0
+    _INSTALL_VALIDATED_WARP_ROUTES=()
+    [[ -f "$marker" && ! -L "$marker" && -f "$ledger" && ! -L "$ledger" ]] || return 1
+    marker_value=$(<"$marker")
+    [[ "$marker_value" == "v2" ]] || return 1
+    declare -F _valid_warp_bypass_ledger_route >/dev/null 2>&1 || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_no=$(( line_no + 1 ))
+        if (( line_no == 1 )); then
+            [[ "$line" == "table=${expected_table}" ]] || return 1
+            continue
+        fi
+        (( route_count < 2048 )) || return 1
+        _valid_warp_bypass_ledger_route "$line" || return 1
+        [[ -z "${_INSTALL_VALIDATED_WARP_ROUTES[$line]+present}" ]] || return 1
+        _INSTALL_VALIDATED_WARP_ROUTES["$line"]=1
+        route_count=$(( route_count + 1 ))
+    done < "$ledger"
+    (( line_no >= 2 && route_count >= 1 ))
+}
+
+_validate_expected_table_default() {
+    local line="$1" kind="$2" iface="$3" expected_metric="$4"
+    local -a fields=()
+    read -r -a fields <<< "$line"
+    if [[ "$kind" == "blackhole" ]]; then
+        (( ${#fields[@]} == 4 )) \
+            && [[ "${fields[0]}" == "blackhole" && "${fields[1]}" == "default" \
+               && "${fields[2]}" == "metric" && "${fields[3]}" == "$expected_metric" ]]
+    elif [[ -n "$expected_metric" ]]; then
+        (( ${#fields[@]} == 7 )) \
+            && [[ "${fields[0]}" == "default" && "${fields[1]}" == "dev" \
+               && "${fields[2]}" == "$iface" && "${fields[3]}" == "scope" \
+               && "${fields[4]}" == "link" && "${fields[5]}" == "metric" \
+               && "${fields[6]}" == "$expected_metric" ]]
+    else
+        (( ${#fields[@]} == 5 )) \
+            && [[ "${fields[0]}" == "default" && "${fields[1]}" == "dev" \
+               && "${fields[2]}" == "$iface" && "${fields[3]}" == "scope" \
+               && "${fields[4]}" == "link" ]]
+    fi
+}
+
+# Validate bypass routes by both the destination in the ledger and the exact
+# current main nexthop used by the owned refresh service.
+validate_owned_warp_bypass_route_set() {
+    local routes="$1" table="$2" require_complete="${3:-0}"
+    local main_route="" main_nic="" main_gw="" main_defaults="" main_default=""
+    local main_default_nic="" main_default_gw="" main_default_match=0
+    local line="" dst=""
+    local -a fields=()
+    local -A seen=()
+    if [[ -z "$routes" ]]; then
+        [[ "$require_complete" != "1" || "${AWG_WARP_BYPASS:-none}" == "none" ]] \
+            && return 0
+        # After successful setup a requested bypass must have both its ledger
+        # and at least one exact route. An empty/lost set is not success.
+        load_validated_warp_bypass_ledger "$table" || return 1
+        return 1
+    fi
+    load_validated_warp_bypass_ledger "$table" || return 1
+    main_route=$(ip -4 route get 1.1.1.1 2>/dev/null) || return 1
+    main_nic=$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$main_route")
+    main_gw=$(awk '{for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}}' <<< "$main_route")
+    _valid_warp_bypass_route_iface "$main_nic" || return 1
+    ip link show up dev "$main_nic" >/dev/null 2>&1 || return 1
+    [[ -z "$main_gw" ]] || _valid_ipv4 "$main_gw" || return 1
+    main_defaults=$(ip -o -4 route show table main default 2>/dev/null) || return 1
+    while IFS= read -r main_default || [[ -n "$main_default" ]]; do
+        [[ -n "$main_default" ]] || continue
+        [[ "$main_default" != *" linkdown"* ]] || continue
+        main_default_nic=$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$main_default")
+        main_default_gw=$(awk '{for (i=1; i<=NF; i++) if ($i=="via") {print $(i+1); exit}}' <<< "$main_default")
+        if [[ "$main_default_nic" == "$main_nic" && "$main_default_gw" == "$main_gw" ]]; then
+            main_default_match=1
+            break
+        fi
+    done <<< "$main_defaults"
+    (( main_default_match == 1 )) || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        fields=(); read -r -a fields <<< "$line"
+        dst="${fields[0]:-}"
+        if [[ "$dst" != */* ]]; then
+            _valid_ipv4 "$dst" || return 1
+            dst="${dst}/32"
+        fi
+        [[ -n "$dst" && -n "${_INSTALL_VALIDATED_WARP_ROUTES[$dst]+present}" \
+           && -z "${seen[$dst]+present}" ]] || return 1
+        seen["$dst"]=1
+        if [[ -n "$main_gw" ]]; then
+            (( ${#fields[@]} == 5 )) \
+                && [[ "${fields[1]}" == "via" && "${fields[2]}" == "$main_gw" \
+                   && "${fields[3]}" == "dev" && "${fields[4]}" == "$main_nic" ]] \
+                || return 1
+        else
+            { (( ${#fields[@]} == 5 )) \
+                && [[ "${fields[1]}" == "dev" && "${fields[2]}" == "$main_nic" \
+                   && "${fields[3]}" == "scope" && "${fields[4]}" == "link" ]]; } \
+                || return 1
+        fi
+    done <<< "$routes"
+    if [[ "$require_complete" == "1" ]]; then
+        [[ "${AWG_WARP_BYPASS:-none}" != "none" ]] || return 1
+        (( ${#seen[@]} == ${#_INSTALL_VALIDATED_WARP_ROUTES[@]} )) || return 1
+    fi
+    return 0
+}
+
+# Before support/awg0 starts, both priorities must be free and no other rule
+# may reference the selected table. Entry permits only the existing default of
+# its active upstream; WARP permits only exact routes from a strict owned ledger.
+preflight_fork_policy_namespace() {
+    local iface="" table="" priority="" guard_priority="" rules="" routes="" line="" defaults=0
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        iface="${AWG_UPSTREAM_IFACE:-awg1}"
+        table="${AWG_UPSTREAM_TABLE:-123}"
+        priority="${AWG_UPSTREAM_PRIORITY:-456}"
+    elif [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        iface="${AWG_WARP_IFACE:-wgcf}"
+        table="${AWG_WARP_TABLE:-2408}"
+        priority="${AWG_WARP_PRIORITY:-789}"
+    else
+        return 0
+    fi
+    guard_priority=$(( 10#$priority + 1 ))
+    rules=$(ip -N -4 rule show 2>/dev/null) || return 1
+    printf '%s\n' "$rules" | awk -v pn="$priority" -v p="${priority}:" -v g="${guard_priority}:" -v t="$table" '
+        $1 == p || $1 == g { collision=1 }
+        {
+            prio=$1
+            sub(/:$/, "", prio)
+            if (prio == 0) {
+                zero_total++
+                if ($2 == "from" && $3 == "all" \
+                    && ($4 == "lookup" || $4 == "table") \
+                    && ($5 == "local" || $5 == "255") && NF == 5) zero_local++
+                else collision=1
+            } else if (prio ~ /^[0-9]+$/ && prio < pn) collision=1
+            for (i=2; i<NF; i++)
+                if (($i == "lookup" || $i == "table") && $(i+1) == t) collision=1
+        }
+        END { exit(!collision && zero_total == 1 && zero_local == 1 ? 0 : 1) }
+    ' \
+        || return 1
+    if ! routes=$(LC_ALL=C ip -4 route show table "$table" 2>&1); then
+        [[ "$routes" == *"FIB table does not exist"* ]] || return 1
+        routes=""
+    fi
+    [[ -n "$routes" ]] || return 0
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] || continue
+            _validate_expected_table_default "$line" real "$iface" "" || return 1
+            defaults=$(( defaults + 1 ))
+        done <<< "$routes"
+        (( defaults == 1 )) || return 1
+    else
+        validate_owned_warp_bypass_route_set "$routes" "$table" || return 1
+    fi
+    return 0
+}
+
+# PostUp is a `;`-separated shell chain, so a unit may become active even when
+# an iptables command failed. Verify critical FORWARD/NAT/MSS rules exactly,
+# including the direct-NAT path used by WARP bypass.
+verify_fork_firewall_runtime() {
+    local iface="$1" source_net="$2" path_mtu="${AWG_MTU:-1280}" mss4=""
+    local main_route="" main_nic=""
+    command -v iptables >/dev/null 2>&1 || return 1
+    iptables -w 5 -C FORWARD -i awg0 -o "$iface" -j ACCEPT >/dev/null 2>&1 || return 1
+    iptables -w 5 -C FORWARD -i "$iface" -o awg0 \
+        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || return 1
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        iptables -w 5 -t nat -C POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1 \
+            || return 1
+    else
+        iptables -w 5 -t nat -C POSTROUTING -s "$source_net" -o "$iface" \
+            -j MASQUERADE >/dev/null 2>&1 || return 1
+        if [[ "${AWG_WARP_BYPASS:-none}" != "none" ]]; then
+            main_route=$(ip -4 route get 1.1.1.1 2>/dev/null) || return 1
+            main_nic=$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$main_route")
+            _valid_warp_bypass_route_iface "$main_nic" || return 1
+            iptables -w 5 -t nat -C POSTROUTING -s "$source_net" -o "$main_nic" \
+                -j MASQUERADE >/dev/null 2>&1 || return 1
+        fi
+    fi
+    _validate_mtu "$path_mtu" || path_mtu=1280
+    path_mtu=$(( 10#$path_mtu ))
+    if [[ "${AWG_EGRESS:-direct}" == "warp" && "$path_mtu" -gt 1280 ]]; then
+        path_mtu=1280
+    elif [[ "${AWG_ROLE:-single}" == "entry" && "$path_mtu" -gt 1380 ]]; then
+        path_mtu=1380
+    fi
+    mss4=$(( path_mtu - 40 ))
+    iptables -w 5 -t mangle -C FORWARD -o awg0 -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss4" >/dev/null 2>&1 || return 1
+    iptables -w 5 -t mangle -C FORWARD -i awg0 -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss4" >/dev/null 2>&1 || return 1
+    if [[ "${CLIENT_ISOLATION:-1}" -eq 1 ]]; then
+        iptables -w 5 -C FORWARD -i awg0 -o awg0 -j DROP >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+# Before commit, verify exact live fail-closed routing and firewall state rather
+# than trusting config intent.
+verify_fork_egress_runtime() {
+    local require_complete_bypass="${1:-0}"
+    local iface="" unit="" table="" priority="" guard_priority="" source_net="" routes=""
+    local rules="" line="" specific_routes="" blackholes=0 defaults=0
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        iface="${AWG_UPSTREAM_IFACE:-awg1}"
+        unit="awg-quick@${iface}"
+        table="${AWG_UPSTREAM_TABLE:-123}"
+        priority="${AWG_UPSTREAM_PRIORITY:-456}"
+    elif [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        iface="${AWG_WARP_IFACE:-wgcf}"
+        unit="wg-quick@${iface}"
+        table="${AWG_WARP_TABLE:-2408}"
+        priority="${AWG_WARP_PRIORITY:-789}"
+    else
+        return 0
+    fi
+    guard_priority=$(( 10#$priority + 1 ))
+    source_net=$(_awg_network_cidr "${AWG_TUNNEL_SUBNET:-}") || return 1
+    systemctl is-active --quiet "$unit" 2>/dev/null || return 1
+    ip link show up dev "$iface" >/dev/null 2>&1 || return 1
+    rules=$(ip -N -4 rule show 2>/dev/null) || return 1
+    printf '%s\n' "$rules" | awk -v pn="$priority" -v p="${priority}:" -v g="${guard_priority}:" -v s="$source_net" -v t="$table" '
+        $1 == p {
+            primary_total++
+            if ($2 == "from" && $3 == s \
+                && ($4 == "lookup" || $4 == "table") && $5 == t && NF == 5) primary++
+        }
+        $1 == g {
+            guard_total++
+            if ((($2 == "from" && $3 == s && $4 == "blackhole") \
+                 || ($2 == "blackhole" && $3 == "from" && $4 == s)) && NF == 4) guard++
+        }
+        {
+            prio=$1
+            sub(/:$/, "", prio)
+            if (prio == 0) {
+                zero_total++
+                if ($2 == "from" && $3 == "all" \
+                    && ($4 == "lookup" || $4 == "table") \
+                    && ($5 == "local" || $5 == "255") && NF == 5) zero_local++
+                else earlier=1
+            } else if (prio ~ /^[0-9]+$/ && prio < pn) earlier=1
+            for (i=2; i<NF; i++)
+                if (($i == "lookup" || $i == "table") && $(i+1) == t) table_lookups++
+        }
+        END {
+            exit(primary_total == 1 && primary == 1 \
+                 && guard_total == 1 && guard == 1 && table_lookups == 1 \
+                 && zero_total == 1 && zero_local == 1 && !earlier ? 0 : 1)
+        }
+    ' || return 1
+    routes=$(ip -4 route show table "$table" 2>/dev/null) || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" == blackhole\ default* ]]; then
+            _validate_expected_table_default "$line" blackhole "" 42760 || return 1
+            blackholes=$(( blackholes + 1 ))
+        elif [[ "$line" == default* ]]; then
+            if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+                _validate_expected_table_default "$line" real "$iface" "" || return 1
+            else
+                _validate_expected_table_default "$line" real "$iface" 10 || return 1
+            fi
+            defaults=$(( defaults + 1 ))
+        elif [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+            return 1
+        else
+            specific_routes+="${specific_routes:+$'\n'}${line}"
+        fi
+    done <<< "$routes"
+    (( blackholes == 1 && defaults == 1 )) || return 1
+    if [[ "${AWG_ROLE:-single}" != "entry" ]]; then
+        validate_owned_warp_bypass_route_set \
+            "$specific_routes" "$table" "$require_complete_bypass" || return 1
+    fi
+    verify_fork_firewall_runtime "$iface" "$source_net" || return 1
+    return 0
+}
+
+ufw_main_route_required() {
+    [[ "${AWG_ROLE:-single}" != "entry" \
+       && ( "${AWG_EGRESS:-direct}" != "warp" || "${AWG_WARP_BYPASS:-none}" != "none" ) ]]
+}
+
+_inspect_exact_ufw_route() {
+    local iface="$1" comment="$2" output="" line=""
+    local base="ufw route allow in on awg0 out on ${iface}"
+    _INSTALL_UFW_ROUTE_SHAPE_COUNT=0
+    _INSTALL_UFW_ROUTE_OWNED_COUNT=0
+    command -v ufw >/dev/null 2>&1 || return 1
+    output=$(ufw show added 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            "$base"|"$base comment "*)
+                _INSTALL_UFW_ROUTE_SHAPE_COUNT=$(( _INSTALL_UFW_ROUTE_SHAPE_COUNT + 1 ))
+                ;;
+        esac
+        case "$line" in
+            "$base comment $comment"|\
+            "$base comment '$comment'"|\
+            "$base comment \"$comment\"")
+                _INSTALL_UFW_ROUTE_OWNED_COUNT=$(( _INSTALL_UFW_ROUTE_OWNED_COUNT + 1 ))
+                ;;
+        esac
+    done <<< "$output"
+}
+
+delete_exact_owned_ufw_route() {
+    local iface="$1" comment="$2"
+    _inspect_exact_ufw_route "$iface" "$comment" || return 1
+    if [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 0 ]]; then return 0; fi
+    [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 1 && "$_INSTALL_UFW_ROUTE_OWNED_COUNT" -eq 1 ]] \
+        || return 1
+    ufw route delete allow in on awg0 out on "$iface" comment "$comment" >/dev/null 2>&1 \
+        || return 1
+    _inspect_exact_ufw_route "$iface" "$comment" \
+        && [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 0 ]]
+}
+
+delete_owned_ufw_route_if_present() {
+    local iface="$1" comment="$2"
+    _inspect_exact_ufw_route "$iface" "$comment" || return 1
+    [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 0 ]] && return 0
+    delete_exact_owned_ufw_route "$iface" "$comment"
+}
+
+_inspect_exact_ufw_udp_allow() {
+    local port="$1" comment="$2" output="" line=""
+    local base="ufw allow ${port}/udp"
+    _INSTALL_UFW_UDP_SHAPE_COUNT=0
+    _INSTALL_UFW_UDP_OWNED_COUNT=0
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    command -v ufw >/dev/null 2>&1 || return 1
+    output=$(ufw show added 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            "$base"|"$base comment "*)
+                _INSTALL_UFW_UDP_SHAPE_COUNT=$(( _INSTALL_UFW_UDP_SHAPE_COUNT + 1 ))
+                ;;
+        esac
+        case "$line" in
+            "$base comment $comment"|\
+            "$base comment '$comment'"|\
+            "$base comment \"$comment\"")
+                _INSTALL_UFW_UDP_OWNED_COUNT=$(( _INSTALL_UFW_UDP_OWNED_COUNT + 1 ))
+                ;;
+        esac
+    done <<< "$output"
+}
+
+delete_owned_ufw_udp_allow_if_present() {
+    local port="$1" comment="$2"
+    _inspect_exact_ufw_udp_allow "$port" "$comment" || return 1
+    [[ "$_INSTALL_UFW_UDP_SHAPE_COUNT" -eq 0 ]] && return 0
+    [[ "$_INSTALL_UFW_UDP_SHAPE_COUNT" -eq 1 && "$_INSTALL_UFW_UDP_OWNED_COUNT" -eq 1 ]] \
+        || return 1
+    ufw delete allow "${port}/udp" comment "$comment" >/dev/null 2>&1 || return 1
+    _inspect_exact_ufw_udp_allow "$port" "$comment" \
+        && [[ "$_INSTALL_UFW_UDP_SHAPE_COUNT" -eq 0 ]]
+}
+
+ensure_owned_cascade_ufw_route() {
+    local iface="$1" comment=""
+    comment="AmneziaWG cascade awg0->${iface}"
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] || return 1
+    _inspect_exact_ufw_route "$iface" "$comment" || return 1
+    if [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 1 && "$_INSTALL_UFW_ROUTE_OWNED_COUNT" -eq 1 ]]; then
+        return 0
+    fi
+    [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 0 ]] || return 1
+    ufw route allow in on awg0 out on "$iface" comment "$comment" >/dev/null 2>&1 || return 1
+    _INSTALL_ROLLBACK_UFW_CASCADE_IFACE="$iface"
+    _INSTALL_ROLLBACK_UFW_CASCADE_RULE=1
+    _inspect_exact_ufw_route "$iface" "$comment" \
+        && [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 1 \
+              && "$_INSTALL_UFW_ROUTE_OWNED_COUNT" -eq 1 ]]
+}
+
+_install_remove_new_ufw_cascade_rule() {
+    [[ "$_INSTALL_ROLLBACK_UFW_CASCADE_RULE" -eq 1 ]] || return 0
+    local iface="$_INSTALL_ROLLBACK_UFW_CASCADE_IFACE"
+    delete_exact_owned_ufw_route "$iface" "AmneziaWG cascade awg0->${iface}" || return 1
+    _INSTALL_ROLLBACK_UFW_CASCADE_RULE=0
+    return 0
+}
+
+cleanup_pending_ufw_main_route_for_entry() {
+    local marker="$AWG_DIR/.ufw_main_cleanup_pending" iface=""
+    [[ -e "$marker" || -L "$marker" ]] || return 0
+    if ufw_main_route_required; then
+        log_warn "Deferred UFW main-route marker retained: the new mode still needs awg0→main."
+        return 0
+    fi
+    [[ -f "$marker" && ! -L "$marker" ]] || {
+        log_warn "Unsafe UFW main-route marker retained: $marker"
+        return 0
+    }
+    IFS= read -r iface < "$marker" || iface=""
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_.-]{0,14}$ ]] || {
+        log_warn "Invalid iface in UFW main-route marker; rule retained."
+        return 0
+    }
+    command -v ufw >/dev/null 2>&1 || {
+        log_warn "UFW unavailable; old awg0→main rule retained."
+        return 0
+    }
+    _inspect_exact_ufw_route "$iface" "AmneziaWG Routing" || {
+        log_warn "Could not verify UFW awg0→main ownership; rule retained."
+        return 0
+    }
+    if [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -eq 0 ]]; then
+        _INSTALL_UFW_MAIN_MARKER_RESOLVED=1
+        return 0
+    fi
+    if [[ "$_INSTALL_UFW_ROUTE_SHAPE_COUNT" -ne 1 || "$_INSTALL_UFW_ROUTE_OWNED_COUNT" -ne 1 ]]; then
+        log_warn "UFW awg0→main does not have exactly one installer-owned match; ambiguous rule retained."
+        return 0
+    fi
+    _INSTALL_ROLLBACK_UFW_MAIN_IFACE="$iface"
+    _INSTALL_ROLLBACK_UFW_MAIN_RULE=1
+    delete_exact_owned_ufw_route "$iface" "AmneziaWG Routing" || return 1
+    log "UFW: previous installer-owned awg0→${iface} route removed before the new-mode commit."
+    return 0
+}
+
 # ==============================================================================
 # STEP 7: Service startup
 # ==============================================================================
+
+# A step-7 resume has lost step 6's process-local snapshot. Before enable/start,
+# capture the exact runtime/autostart state of a reused upstream again so a late
+# abort cannot leave a previously inactive/manual unit mutated.
+arm_step7_upstream_rollback() {
+    [[ "${AWG_ROLE:-single}" == "entry" ]] || return 0
+    [[ "$_INSTALL_ROLLBACK_UPSTREAM" -eq 0 ]] || return 0
+    local iface="${AWG_UPSTREAM_IFACE:-awg1}" target="" backup="" state="" link=0
+    [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ && "$iface" != "awg0" ]] || return 1
+    target="/etc/amnezia/amneziawg/${iface}.conf"
+    [[ -f "$target" && ! -L "$target" ]] || return 1
+    command -v ip >/dev/null 2>&1 || return 1
+    backup=$(mktemp -p "$AWG_DIR" '.step7-upstream.rollback.XXXXXX') || return 1
+    _install_temp_files+=("$backup")
+    cp -p -- "$target" "$backup" || return 1
+    state=$(systemctl is-active "awg-quick@${iface}" 2>/dev/null || true)
+    [[ "$state" =~ ^(active|activating|deactivating|reloading|inactive|failed|unknown)$ ]] || return 1
+    ip link show dev "$iface" >/dev/null 2>&1 && link=1
+    _INSTALL_ROLLBACK_UPSTREAM_TARGET="$target"
+    _INSTALL_ROLLBACK_UPSTREAM_BACKUP="$backup"
+    _INSTALL_ROLLBACK_UPSTREAM_EXISTED=1
+    [[ "$state" =~ ^(active|activating|deactivating|reloading)$ ]] \
+        && _INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE=1 \
+        || _INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE=0
+    _INSTALL_ROLLBACK_UPSTREAM_WAS_LINK="$link"
+    systemctl is-enabled --quiet "awg-quick@${iface}" 2>/dev/null \
+        && _INSTALL_ROLLBACK_UPSTREAM_WAS_ENABLED=1 \
+        || _INSTALL_ROLLBACK_UPSTREAM_WAS_ENABLED=0
+    _INSTALL_ROLLBACK_UPSTREAM=1
+    if [[ "$_INSTALL_ROLLBACK_UPSTREAM_WAS_ACTIVE" -eq 0 && "$link" -eq 1 ]]; then
+        timeout 15 awg-quick down "$target" >/dev/null 2>&1 || return 1
+        ip link show dev "$iface" >/dev/null 2>&1 && return 1
+    fi
+    return 0
+}
 
 step7_start_service() {
     update_state 7
     log "### STEP 7: Service startup and security configuration ###"
 
+    # On a direct resume from setup_state=7 the shared library has not been
+    # sourced in this process yet. Without it awg_record_device_params below
+    # used to fail with command-not-found.
+    if ! declare -F awg_record_device_params >/dev/null 2>&1; then
+        [[ -f "$COMMON_SCRIPT_PATH" ]] || die "awg_common.sh is missing while resuming step 7."
+        # shellcheck source=/dev/null
+        source "$COMMON_SCRIPT_PATH"
+    fi
+    declare -F awg_record_device_params >/dev/null 2>&1 \
+        || die "awg_common.sh does not provide awg_record_device_params."
+
+    # Reconcile an existing owned bypass BEFORE namespace preflight/start. On a
+    # WARP→entry transition that reuses the table, old specific routes otherwise
+    # block entry preflight; on bypass→none they transiently outlive the new awg0.
+    # The snapshot makes this early mutation fully reversible by EXIT rollback.
+    local _bypass_marker="$AWG_DIR/.warp_bypass_enabled_by_installer"
+    local _bypass_tx_needed=0 _bypass_tx_prepared=0
+    if [[ -e "$_bypass_marker" || -L "$_bypass_marker" ]]; then
+        # The snapshot stops the owned timer/service before the transaction is
+        # fully armed. Block INT/TERM across that window and keep them blocked
+        # until the shared installer commit/state99 below.
+        trap '' INT TERM
+        declare -F snapshot_warp_bypass_state >/dev/null 2>&1 \
+            && declare -F setup_warp_bypass >/dev/null 2>&1 \
+            || die "The current awg_common.sh does not support transactional WARP bypass."
+        snapshot_warp_bypass_state \
+            || die "Could not snapshot the previous WARP bypass before policy preflight."
+        setup_warp_bypass \
+            || die "Previous WARP bypass did not reach the requested state before policy preflight; rolling back."
+        _bypass_tx_prepared=1
+    fi
+
+    local _resume_owned_live=0 _resume_awg0_active=0 _resume_awg0_link=0
+    if [[ "${_INSTALL_INITIAL_STEP:-1}" -eq 7 ]]; then
+        systemctl is-active --quiet awg-quick@awg0 2>/dev/null && _resume_awg0_active=1
+        command -v ip >/dev/null 2>&1 \
+            && ip link show dev awg0 >/dev/null 2>&1 && _resume_awg0_link=1
+        if [[ "$_resume_awg0_active" -ne "$_resume_awg0_link" ]]; then
+            die "Step 7 resume: awg0 has an ambiguous unit/link state; live networking was not changed."
+        fi
+        if [[ "$_resume_awg0_active" -eq 1 ]]; then
+            [[ -f "$SERVER_CONF_FILE" && ! -L "$SERVER_CONF_FILE" ]] \
+                || die "Step 7 resume: live awg0 has no regular managed config; networking was not changed."
+            validate_awg_config "$SERVER_CONF_FILE" \
+                || die "Step 7 resume: live awg0.conf failed strict validation; networking was not changed."
+            timeout 10 awg-quick strip "$SERVER_CONF_FILE" >/dev/null 2>&1 \
+                || die "Step 7 resume: live awg0.conf failed awg-quick strip; networking was not changed."
+            check_service_status >/dev/null 2>&1 \
+                || die "Step 7 resume: live awg0 failed its service postcondition; networking was not changed."
+            verify_fork_egress_runtime 0 \
+                || die "Step 7 resume: live fork egress does not match exact owned state; networking was not changed."
+            _resume_owned_live=1
+            log "Step 7 resume: exact live awg0 state is already verified; disruptive restart skipped."
+        fi
+    fi
+    if [[ "$_resume_owned_live" -eq 0 ]]; then
+        preflight_fork_policy_namespace \
+            || die "Selected policy table/priority contains foreign or ambiguous routes/rules."
+        arm_step7_upstream_rollback \
+            || die "Could not arm reused-upstream rollback before resuming step 7."
+    fi
+    configure_awg0_dependency || die "Could not configure the awg0 boot dependency."
+
+    # Bring the required egress up first. Requires/After preserves the same
+    # order after reboot; the explicit start fails clearly before awg0 starts.
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+        local _up="${AWG_UPSTREAM_IFACE:-awg1}"
+        log "Enabling and starting awg-quick@${_up} (upstream cascade)..."
+        systemctl enable --now "awg-quick@${_up}" \
+            || die "awg-quick@${_up} did not start. Check: systemctl status awg-quick@${_up}"
+        systemctl is-active --quiet "awg-quick@${_up}" \
+            || die "Upstream tunnel ${_up} is not active; awg0 was left stopped."
+    elif [[ "${AWG_EGRESS:-direct}" == "warp" ]]; then
+        local _warp_unit="wg-quick@${AWG_WARP_IFACE:-wgcf}"
+        log "Starting required WARP egress (${_warp_unit})..."
+        systemctl start "$_warp_unit" \
+            || die "$_warp_unit did not start; awg0 was left stopped."
+        systemctl is-active --quiet "$_warp_unit" \
+            || die "$_warp_unit is not active; awg0 was left stopped."
+    fi
+
     log "Enabling and starting awg-quick@awg0..."
-    if systemctl is-active --quiet awg-quick@awg0; then
+
+    # Isolation switched on->off: the new config's PostDown no longer has the
+    # DROP rule to remove, and the restart's down phase already runs against
+    # the new on-disk config. Remove stale rules explicitly, in a loop - a
+    # repeated interrupted run may have left more than one (issue #178,
+    # same deferred-cleanup pattern as PREV_AWG_PORT in #175).
+    if [[ "${CLIENT_ISOLATION:-1}" -eq 0 ]]; then
+        while iptables -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null; do :; done
+        while ip6tables -D FORWARD -i awg0 -o awg0 -j DROP 2>/dev/null; do :; done
+    fi
+
+    if [[ "$_resume_owned_live" -eq 1 ]]; then
+        systemctl enable awg-quick@awg0 \
+            || die "Could not enable the already verified awg-quick@awg0 unit."
+    elif systemctl is-active --quiet awg-quick@awg0; then
         log "Service already active — restarting to apply configuration..."
-        systemctl enable awg-quick@awg0 || log_warn "Failed to enable awg-quick@awg0 — check autostart manually"
+        systemctl enable awg-quick@awg0 \
+            || die "Failed to enable awg-quick@awg0; installation will not be marked complete."
         systemctl restart awg-quick@awg0 || die "restart awg-quick@awg0 error."
     else
         systemctl enable --now awg-quick@awg0 || die "enable --now error."
@@ -3517,22 +7383,7 @@ step7_start_service() {
     done
     check_service_status || die "Service status check failed."
 
-    # Multi-hop: bring up the upstream interface. Its absence is not fatal for
-    # awg0 itself (client handshake still works), but clients won't get
-    # internet until the cascade is up — warn the operator.
-    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
-        local _up="${AWG_UPSTREAM_IFACE:-awg1}"
-        log "Enabling and starting awg-quick@${_up} (upstream cascade)..."
-        if systemctl enable --now "awg-quick@${_up}"; then
-            log "Upstream tunnel ${_up} started."
-            if command -v ufw &>/dev/null && ! ufw status 2>/dev/null | grep -q inactive; then
-                ufw route allow in on awg0 out on "${_up}" comment "AmneziaWG cascade awg0->${_up}" \
-                    || log_warn "UFW: failed to add route awg0→${_up}."
-            fi
-        else
-            log_warn "awg-quick@${_up} did not start. Check: systemctl status awg-quick@${_up}"
-        fi
-    fi
+    if [[ "${AWG_ROLE:-single}" == "entry" ]]; then log "Upstream tunnel ${_up} started."; fi
 
     # Fail2Ban
     if [[ "$NO_TWEAKS" -eq 0 ]]; then
@@ -3541,8 +7392,135 @@ step7_start_service() {
         log "Skipping Fail2Ban (--no-tweaks)."
     fi
 
+    verify_fork_egress_runtime \
+        || die "Fork egress live verification failed: support/rule/blackhole/default route is incomplete."
+    # Record the snapshot only after service + exact egress postconditions pass.
+    awg_record_device_params
+    # A signal must not split the critical UFW-delete → bypass/DNS
+    # transactions → commit window. EXIT can restore every snapshot until
+    # the installer explicitly closes them below.
+    trap '' INT TERM
+    if [[ "${AWG_ROLE:-single}" == "entry" ]] \
+       && command -v ufw &>/dev/null && ! ufw status 2>/dev/null | grep -q inactive; then
+        ensure_owned_cascade_ufw_route "${_up}" \
+            || die "UFW: required owned route awg0→${_up} is ambiguous or could not be added; rolling back."
+    fi
+    if ! cleanup_pending_ufw_main_route_for_entry; then
+        die "Could not remove the confirmed previous UFW awg0→main route; rolling back."
+    fi
+
+    # Bypass participates in the same install-level commit as awg0/WARP. Both
+    # creating the requested bypass and removing a previous owned bundle start
+    # with a full snapshot of files, unit state and exact kernel routes.
+    if [[ "${AWG_EGRESS:-direct}" == "warp" && "${AWG_WARP_BYPASS:-none}" != "none" ]] \
+       || [[ -e "$_bypass_marker" || -L "$_bypass_marker" ]] \
+       || [[ "$_bypass_tx_prepared" -eq 1 ]]; then
+        _bypass_tx_needed=1
+    fi
+    if [[ "$_bypass_tx_needed" -eq 1 ]]; then
+        if [[ "$_bypass_tx_prepared" -eq 0 ]]; then
+            declare -F snapshot_warp_bypass_state >/dev/null 2>&1 \
+                && declare -F setup_warp_bypass >/dev/null 2>&1 \
+                || die "The current awg_common.sh does not support transactional WARP bypass."
+            snapshot_warp_bypass_state \
+                || die "Could not create a complete WARP bypass snapshot before mutation."
+            if [[ "${AWG_EGRESS:-direct}" == "warp" && "${AWG_WARP_BYPASS:-none}" != "none" ]]; then
+                log "Transactionally configuring WARP bypass (${AWG_WARP_BYPASS})..."
+            else
+                log "Transactionally removing the previous installer-owned WARP bypass..."
+            fi
+            setup_warp_bypass \
+                || die "WARP bypass did not reach the requested state; rolling back."
+        fi
+        verify_fork_egress_runtime 1 \
+            || die "Fork egress failed the exact route/rule check after WARP bypass setup."
+    fi
+
+    # DNS is the final mandatory fallible setup. Its snapshot remains active
+    # until the shared commit, so a later error restores the old awg0/gateway
+    # first and then the previous resolver files, UFW rules and unit state.
+    if [[ "${AWG_AMNEZIA_DNS:-off}" == "on" ]]; then
+        log "Configuring AmneziaDNS (dnsmasq on the tunnel gateway)..."
+        declare -F snapshot_amnezia_dns_state >/dev/null 2>&1 \
+            && declare -F setup_amnezia_dns >/dev/null 2>&1 \
+            || die "The current awg_common.sh does not support transactional AmneziaDNS."
+        snapshot_amnezia_dns_state \
+            || die "Could not arm the installer-level AmneziaDNS snapshot."
+        if ! setup_amnezia_dns; then
+            die "setup_amnezia_dns failed. See log."
+        fi
+    fi
+
+    # Commit point: the new awg0 is active and fully verified. Cleanup failures
+    # must not put the old config back over this working interface. Old
+    # resources are removed best-effort and retain their markers on any error.
+    _INSTALL_ROLLBACK_AWG0=0
+    _INSTALL_ROLLBACK_UPSTREAM=0
+    _INSTALL_ROLLBACK_DEP_ACTIVE=0
+    _INSTALL_ROLLBACK_OLD_SUPPORT=0
+    _INSTALL_ROLLBACK_UFW_CASCADE_RULE=0
+    if [[ "$_INSTALL_ROLLBACK_UFW_MAIN_RULE" -eq 1 || "$_INSTALL_UFW_MAIN_MARKER_RESOLVED" -eq 1 ]]; then
+        _INSTALL_ROLLBACK_UFW_MAIN_RULE=0
+        _INSTALL_UFW_MAIN_MARKER_RESOLVED=0
+        rm -f -- "$AWG_DIR/.ufw_main_cleanup_pending" \
+            || log_warn "Post-commit: could not remove the UFW main-route marker."
+    elif ufw_main_route_required \
+         && [[ -e "$AWG_DIR/.ufw_main_cleanup_pending" || -L "$AWG_DIR/.ufw_main_cleanup_pending" ]]; then
+        if [[ -f "$AWG_DIR/.ufw_main_cleanup_pending" && ! -L "$AWG_DIR/.ufw_main_cleanup_pending" ]]; then
+            rm -f -- "$AWG_DIR/.ufw_main_cleanup_pending" \
+                || log_warn "Post-commit: could not clear the no-longer-needed UFW main-route marker."
+        else
+            log_warn "Post-commit: unsafe UFW main-route marker retained."
+        fi
+    fi
+    # Close every common transaction while INT/TERM are still blocked. These
+    # commit hooks only remove snapshots: the working new awg0 is already
+    # disarmed and must not fail because backup removal was incomplete.
+    if declare -F commit_warp_bypass_state >/dev/null 2>&1; then
+        commit_warp_bypass_state \
+            || log_warn "Post-commit: could not remove the temporary WARP bypass snapshot."
+    fi
+    if declare -F commit_warp_egress_state >/dev/null 2>&1; then
+        commit_warp_egress_state \
+            || log_warn "Post-commit: could not remove the temporary WARP egress snapshot."
+    fi
+    if declare -F commit_amnezia_dns_state >/dev/null 2>&1; then
+        commit_amnezia_dns_state \
+            || log_warn "Post-commit: could not remove the temporary AmneziaDNS snapshot."
+    fi
+    # Parked proof stays on disk for best-effort/next-run cleanup, but after
+    # commit INT/TERM must never restore it into the live ownership markers.
+    _INSTALL_ROLLBACK_WARP_PARKED=0
+    local _post_commit_cleanup_failed=0
+    if [[ -n "${PREV_AWG_PORT:-}" && "$PREV_AWG_PORT" =~ ^[0-9]+$ \
+          && "$PREV_AWG_PORT" != "$AWG_PORT" ]]; then
+        if delete_owned_ufw_udp_allow_if_present "$PREV_AWG_PORT" "AmneziaWG VPN"; then
+            log "Post-commit UFW: old port rule ${PREV_AWG_PORT}/udp removed."
+            sed -i '/^export PREV_AWG_PORT=/d' "$CONFIG_FILE" 2>/dev/null \
+                || log_warn "Could not remove PREV_AWG_PORT from $CONFIG_FILE."
+            PREV_AWG_PORT=""
+        else
+            log_warn "Post-commit UFW: old port ${PREV_AWG_PORT}/udp was not removed; cleanup will be retried."
+            _post_commit_cleanup_failed=1
+        fi
+    fi
+    if [[ "${AWG_AMNEZIA_DNS:-off}" != "on" || "${AWG_ROLE:-single}" == "exit" ]]; then
+        teardown_amnezia_dns || {
+            log_warn "Post-commit cleanup: previous AmneziaDNS was not removed completely; new awg0 remains active."
+            _post_commit_cleanup_failed=1
+        }
+    fi
+    finalize_deferred_mode_cleanup || _post_commit_cleanup_failed=1
+    if [[ "$_post_commit_cleanup_failed" -eq 1 ]]; then
+        log_warn "The new awg0 is working, but some old owned resources were retained for a safe cleanup retry."
+    fi
+
     log "Step 7 completed successfully."
+    # Keep INT/TERM blocked until state=99 is durable. SIGKILL/power loss leaves
+    # state=7, which the exact owned-live resume path recognizes safely.
     update_state 99
+    trap '_install_on_signal 130' INT
+    trap '_install_on_signal 143' TERM
 }
 
 # ==============================================================================
@@ -3581,7 +7559,12 @@ step99_finish() {
 
     # Remove state file
     log "Removing installation state file..."
-    rm -f "$STATE_FILE" "${STATE_FILE}.lock" "$AWG_DIR/.boot_id_before_step2" || log_warn "Failed to remove $STATE_FILE"
+    # The protected package snapshot goes too: it is needed between the steps,
+    # but surviving the install it would only grow stale. A stale name (a
+    # package renamed by a release upgrade) would stop the next install for no
+    # reason the user can see.
+    rm -f "$STATE_FILE" "${STATE_FILE}.lock" "$AWG_DIR/.boot_id_before_step2" \
+          "$BOOT_CRITICAL_SNAPSHOT_FILE" || log_warn "Failed to remove $STATE_FILE"
     log "Installation fully completed. Log: $LOG_FILE"
     log "=============================================================================="
 }
@@ -3591,7 +7574,15 @@ step99_finish() {
 # ==============================================================================
 
 if [[ "$HELP" -eq 1 ]]; then show_help; fi
-if [[ "$UNINSTALL" -eq 1 ]]; then step_uninstall; fi
+if [[ "$UNINSTALL" -eq 1 ]]; then
+    [[ "$(id -u)" -eq 0 ]] || die "Uninstall requires root (sudo bash $0 --uninstall)."
+    mkdir -p "$AWG_DIR" || die "Could not open working directory $AWG_DIR."
+    INSTALL_LOCK_FILE="$AWG_DIR/.install.lock"
+    exec 9>"$INSTALL_LOCK_FILE" || die "Cannot open $INSTALL_LOCK_FILE"
+    flock -n 9 || die "Another install/uninstall is already running. Wait for it to finish."
+    touch "$LOG_FILE" && chmod 640 "$LOG_FILE" || die "Could not prepare $LOG_FILE."
+    step_uninstall
+fi
 if [[ "$DIAGNOSTIC" -eq 1 ]]; then create_diagnostic_report; exit 0; fi
 if [[ "$VERBOSE" -eq 1 ]]; then set -x; fi
 
@@ -3606,12 +7597,21 @@ if [[ "$VERBOSE" -eq 1 ]]; then set -x; fi
 if [[ "${AWG_FORCE_REINSTALL:-0}" == "1" ]]; then
     FORCE_REINSTALL=1
 fi
-if [[ "$FORCE_REINSTALL" -ne 1 ]] && [[ -f "$SERVER_CONF_FILE" ]] \
+# A valid unfinished setup_state takes precedence over the idempotency guard:
+# after a forced reinstall reboot the user does not have to repeat --force.
+_resume_install_in_progress=0
+if [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]]; then
+    IFS= read -r _resume_state < "$STATE_FILE" || _resume_state=""
+    [[ "$_resume_state" =~ ^[1-7]$ ]] && _resume_install_in_progress=1
+fi
+if [[ "$FORCE_REINSTALL" -ne 1 && "$_resume_install_in_progress" -ne 1 ]] && [[ -f "$SERVER_CONF_FILE" ]] \
    && systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
     log_error "AmneziaWG is already installed and running."
     log_error "To reinstall — pass --force (or AWG_FORCE_REINSTALL=1)."
-    log_error "WARNING: a reinstall will rerun Step 1 (sysctl/swap/BBR) and Step 7 (service restart);"
-    log_error "         obfuscation parameters (Jc/Jmin/Jmax/H1-H4/I1) survive."
+    log_error "WARNING: a reinstall will rerun Step 1 (sysctl/swap/BBR) and Step 7 (service restart)."
+    log_error "         Obfuscation parameters (Jc/Jmin/Jmax/H1-H4/I1) survive UNLESS you pass"
+    log_error "         --preset/--jc/--jmin/--jmax (those flags regenerate the whole set - every"
+    log_error "         issued client config would have to be reissued via regen)."
     log_error "To manage clients:  sudo bash $MANAGE_SCRIPT_PATH help"
     log_error "To fully uninstall: sudo bash $0 --uninstall"
     exit 0

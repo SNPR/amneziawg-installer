@@ -12,6 +12,12 @@
 # Использование:
 #   bash scripts/check-docs-consistency.sh
 #
+# ⚠️ ДОБАВЛЯЕШЬ СЮДА НОВУЮ ПРОВЕРКУ - ПОДВИНЬ СЧЁТ В ДВУХ ТЕСТАХ.
+# tests/test_v5153_docs_check.bats и tests/test_v5153_docs_check_slug.bats
+# ассертят точную строку сводки вида "N passed, 0 failed". Любая добавленная
+# проверка роняет оба файла, и связь эта ниоткуда не видна: сам скрипт про них
+# не знает, а падение выглядит немотивированным.
+#
 # Проверки:
 #   1. Внутренние markdown-ссылки (#anchor) резолвятся в этом же файле.
 #   2. CHANGELOG: у каждого version-heading есть reference-link; набор версий
@@ -24,12 +30,17 @@
 #      нет захардкоженного test-count baseline).
 #   6. Pinned raw-URL теги в README/ADVANCED/INSTALL_VPS == SCRIPT_VERSION
 #      (CHANGELOG исключён - там теги исторические).
+#  6b. Форма пина: все raw-URL теги имеют вид vX.Y.Z числами. Отдельная проверка
+#      потому, что регулярка #6 нечисловой пин не видит ВООБЩЕ (см. её комментарий).
 #   7. ADVANCED: устаревшие IPv6 split-tunnel формулировки не вернулись
 #      (present-tense "не поддерживается / implies full-tunnel"; past-tense
 #      историческая заметка разрешена).
 #   8. Issue-template: placeholder версии нейтральный (не протухающий X.Y.Z).
 #   9. Матрица OS×arch×prebuilt-target: supported Ubuntu-версии без ARM
 #      prebuilt-таргета в arm-build.yml помечены DKMS-only для ARM в INSTALL_VPS.
+#  10. Установочные/update wget-сниппеты качают install_amneziawg*.sh через -O
+#      (голый wget <url> пишет .1 при повторном запуске, и chmod/bash берут
+#      старый файл; злейший кейс - update-флоу с --force).
 
 set -o pipefail
 
@@ -238,8 +249,11 @@ if [[ "$stale_fail" -eq 0 ]]; then _ok "SECURITY/CONTRIBUTING не протух�
 # указывать на текущий релиз, иначе copy-paste из README ставит прошлую версию
 # (регрессия, ради которой добавлена эта проверка). CHANGELOG исключён намеренно -
 # там теги исторические (точки появления функций/прошлые релизы).
+# CASCADE.md/.en.md включены: awg-routing.sh закрепляет тег в fallback-URL снимка
+# ru.zone (raw .../vX.Y.Z/cascade/ru.zone). Пин на тег = иммутабельный снимок, а не
+# подвижный main; проверка не даёт ему протухнуть на новом релизе (бампать каждый релиз).
 url_fail=0
-URL_DOCS=(README.md README.en.md ADVANCED.md ADVANCED.en.md INSTALL_VPS.md)
+URL_DOCS=(README.md README.en.md ADVANCED.md ADVANCED.en.md INSTALL_VPS.md INSTALL_VPS.ru.md CASCADE.md CASCADE.en.md WARP-RU.md WARP-RU.en.md)
 for f in "${URL_DOCS[@]}"; do
     [[ -f "$f" ]] || continue
     while IFS= read -r tag; do
@@ -251,6 +265,32 @@ for f in "${URL_DOCS[@]}"; do
     done < <(grep -oP 'raw\.githubusercontent\.com/bivlked/amneziawg-installer/v\K[0-9]+\.[0-9]+\.[0-9]+' "$f")
 done
 if [[ "$url_fail" -eq 0 ]]; then _ok "pinned raw-URL теги == SCRIPT_VERSION ($script_ver)"; else _bad "pinned raw-URL теги рассинхронизированы"; fi
+
+# --- 6b. Форма пина: все raw-URL теги обязаны быть vX.Y.Z числами ---
+# Проверка 6 выше сравнивает НАЙДЕННЫЕ ЧИСЛОВЫЕ теги со SCRIPT_VERSION, и это
+# её единственная задача. Но её регулярка требует три группы цифр, поэтому
+# нечисловой пин в выборку не попадает ВООБЩЕ и проверка остаётся зелёной.
+# Замер 25 aug 2026: из пяти форм (v5.27.1, vX.Y.Z, v5.27, vLATEST, main) она
+# видела ОДНУ. Опаснее всего v5.27 - правдоподобная опечатка из двух групп,
+# выглядит настоящим тегом и молча ведёт в никуда.
+# Живой случай: INSTALL_VPS.md отдавал команду обновления с буквальным vX.Y.Z
+# внутри блока кода; docs/RELEASE_PROCESS.md шаг 3 прямо пишет, что пользователи
+# копируют такие однострочники дословно.
+# Здесь берём ВСЕ вхождения (`[^/]+`, вместе с ведущим v) и требуем форму.
+# ⚠️ URL_DOCS намеренно переиспользуется как есть: выборка та же, менять её
+# незачем, и её вид - якорь публикационного пакета русского INSTALL_VPS.
+form_fail=0
+for f in "${URL_DOCS[@]}"; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r pin; do
+        [[ -z "$pin" ]] && continue
+        if [[ ! "$pin" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "  $f: пин '$pin' не имеет формы vX.Y.Z (плейсхолдер, ветка или усечённый тег)" >&2
+            form_fail=1
+        fi
+    done < <(grep -oP 'raw\.githubusercontent\.com/bivlked/amneziawg-installer/\K[^/]+' "$f")
+done
+if [[ "$form_fail" -eq 0 ]]; then _ok "форма пинов raw-URL (все vX.Y.Z числами)"; else _bad "нечисловые пины в raw-URL"; fi
 
 # --- 7. ADVANCED: устаревшие IPv6 split-tunnel формулировки не вернулись ---
 # После переписывания IPv6-раздела (v5.15.1 split-tunnel + dual-stack корректно
@@ -305,6 +345,31 @@ else
     echo "  нет $arm_yml (проверка ARM prebuilt-матрицы)" >&2; arm_matrix_fail=1
 fi
 if [[ "$arm_matrix_fail" -eq 0 ]]; then _ok "ARM prebuilt-покрытие согласовано (OS×arch×target)"; else _bad "ARM prebuilt-покрытие рассинхронизировано"; fi
+
+# --- 10. Установочные wget-сниппеты используют -O (re-run .1-ловушка) ---
+# Голый `wget <url>/install_amneziawg*.sh` без -O при повторном запуске пишет
+# install_amneziawg.sh.1, а следующий `chmod +x` / `bash install_amneziawg.sh`
+# берут СТАРЫЙ первый файл. Злейший кейс - update-флоу с `--force`: старый скрипт
+# присутствует всегда, и юзер переустанавливает прошлую версию, думая что
+# обновился. Все сниппеты обязаны пинить имя через `-O` (паттерн как в FAQ
+# recovery). Регрессия, ради которой добавлена проверка (PR #114). Детект (два
+# шага): строка вызывает `wget` и качает install_amneziawg*.sh по raw-URL, но в
+# ней нет `-O`/`--output-document` (пин имени). Ловит и `wget -q <url>` с флагами
+# перед URL, не только голую форму. `wget -O name url`, `wget -O- url | bash` и
+# `curl`-альтернативы (без `wget`) под паттерн не попадают.
+wget_o_fail=0
+WGET_DOCS=(README.md README.en.md ADVANCED.md ADVANCED.en.md INSTALL_VPS.md)
+for f in "${WGET_DOCS[@]}"; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r hit; do
+        [[ -z "$hit" ]] && continue
+        echo "  $f:$hit" >&2
+        echo "    ^ wget без -O: повторный запуск возьмёт .1; используйте 'wget -O <файл> <url>'" >&2
+        wget_o_fail=1
+    done < <(grep -nE 'wget[[:space:]].*https?://[^[:space:]]*install_amneziawg[a-z_]*\.sh' "$f" \
+             | grep -vE -- '(^|[[:space:]])(-O|--output-document)')
+done
+if [[ "$wget_o_fail" -eq 0 ]]; then _ok "установочные wget-сниппеты используют -O (нет .1-ловушки)"; else _bad "wget-сниппет без -O (.1-ловушка вернулась)"; fi
 
 # --- Summary ---
 echo ""

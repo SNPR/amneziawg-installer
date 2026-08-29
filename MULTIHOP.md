@@ -33,11 +33,11 @@
 **Важно:** клонируй форк в путь **НЕ равный** `/root/awg` (это рабочая директория установщика). Стандартный вариант:
 
 ```bash
-git clone https://github.com/SNPR/amneziawg-installer.git /root/amneziawg-installer
+git clone --branch feat/v3 --single-branch https://github.com/SNPR/amneziawg-installer.git /root/amneziawg-installer
 cd /root/amneziawg-installer
 ```
 
-Установщик в шаге 5 сам определит, что рядом с ним лежат `awg_common.sh` и `manage_amneziawg.sh`, и возьмёт именно их — **без скачивания из апстрим-CDN**. Наши `--role=entry` и `--egress=warp` доработки гарантированно окажутся на целевой ноде.
+Установщик в шаге 5 обнаружит лежащие рядом `awg_common.sh` и `manage_amneziawg.sh`, скопирует их через staging и сверит оба с вшитыми SHA-256 — **без скачивания из апстрим-CDN**. На ноду попадёт согласованная пара с доработками `--role=entry` / `--egress=warp`.
 
 ## Нода 1 (exit) — «выходной» сервер
 
@@ -142,9 +142,18 @@ sudo bash /root/awg/manage_amneziawg.sh add <имя>        # добавить �
 sudo bash /root/awg/manage_amneziawg.sh remove <имя>     # удалить
 sudo bash /root/awg/manage_amneziawg.sh list             # список
 sudo bash /root/awg/manage_amneziawg.sh restart          # перезапуск обоих туннелей
+sudo bash /root/awg/manage_amneziawg.sh upstream up       # поднять только upstream
+sudo bash /root/awg/manage_amneziawg.sh upstream down --yes  # fail-closed: сначала снять awg0
 sudo bash /root/awg/manage_amneziawg.sh upstream restart # только каскад
+sudo bash /root/awg/manage_amneziawg.sh upstream apply --yes # применить awg1.conf
 sudo bash /root/awg/manage_amneziawg.sh upstream show    # статус каскада
+sudo bash /root/awg/manage_amneziawg.sh upstream show --json # один JSON для бота
 ```
+
+`down` не оставляет клиентский `awg0` без обязательного выхода: сначала
+проверяется, что `awg0` действительно снят (включая интерфейс, поднятый вручную),
+и лишь затем снимается upstream. `up`/`restart`/`apply` восстанавливают прежнее
+активное состояние `awg0`; ошибка upstream приводит к fail-closed остановке.
 
 ---
 
@@ -159,12 +168,12 @@ sudo bash /root/awg/manage_amneziawg.sh upstream show    # статус каск
 
 ## Как это работает под капотом (кратко)
 
-- На entry-ноде `awg0.conf` не делает `MASQUERADE` на `eth0`, а только пускает `FORWARD` между `%i` и `awg1` + TCPMSS-clamp на SYN.
-- `awg1.conf` получает параметры `Table=123` и `FwMark=0xca6d`, плюс `PostUp`: `ip rule add from 10.8.0.0/24 table 123 priority 456` и `MASQUERADE -o %i`.
-- Клиентский пакет: **src=10.8.0.5** → попадает на `awg0` → `FORWARD → awg1` → `ip rule` ловит по src → таблица 123 → дефолт через `awg1` → `MASQUERADE` (src становится `10.9.0.2` — адрес entry на стороне exit) → шифрование → exit по UDP → на exit-ноде расшифровывается → `MASQUERADE` на его `eth0` → интернет.
+- На entry-ноде именно `awg0.conf` в своих `PostUp`/`PostDown` владеет policy-routing и fail-closed защитой: blackhole-default с metric `42760` в таблице `123`, source-rule `from 10.8.0.0/24 lookup 123 priority 456` и RPDB blackhole guard с приоритетом `457` (`P+1`). Там же живут `FORWARD` между `%i` и `awg1` и TCPMSS-clamp; `MASQUERADE` на `eth0` нет.
+- `awg1.conf` содержит только поддержку выхода: `Table=123`, `FwMark=0xca6d`, дефолт `AllowedIPs = 0.0.0.0/0` (его `awg-quick` кладёт в таблицу `123`) и `MASQUERADE -o %i`. Source-rule и blackhole guard в `awg1.conf` не живут, поэтому исчезновение `awg1` не снимает fail-closed защиту, пока поднят `awg0`.
+- Клиентский пакет: **src=10.8.0.5** → приходит на `awg0` → RPDB source-rule выбирает таблицу `123` → рабочий default через `awg1` выигрывает у blackhole по меньшей metric → затем `FORWARD → awg1` → `MASQUERADE` (src становится `10.9.0.2` — адрес entry на стороне exit) → шифрование → exit по UDP → на exit-ноде расшифровывается → `MASQUERADE` на его `eth0` → интернет. Если рабочего default через `awg1` нет, table-blackhole/guard не дают пакету провалиться в `main` и раскрыть прямой egress entry-ноды.
 - Обратный пакет приходит на exit (dst=exit публичный IP), проходит DNAT через conntrack обратно к `10.9.0.2` (entry), шифруется в `awg0` exit-ноды, приходит на `awg1` entry-ноды, conntrack восстанавливает dst=`10.8.0.5` клиента, `FORWARD → awg0` → клиенту.
 
-Нужные для жизни каскада параметры **должны совпадать между `awg1` (entry) и `awg0` (exit)**: `Jc / Jmin / Jmax / S1-S4 / H1-H4`. Скрипт берёт их из `hop_to_entry.conf`, созданного на exit-ноде — совпадение гарантировано.
+Проверяемые принимающей стороной параметры **должны совпадать между `awg1` (entry) и `awg0` (exit)**: `S1-S4 / H1-H4` и, если задан, `HeaderProtectionKey`. Рендерер также переносит `Jc/Jmin/Jmax` и `I1-I5` из `hop_to_entry.conf`, созданного на exit-ноде, хотя принимающая сторона их не сверяет.
 
 ---
 
@@ -198,7 +207,7 @@ sudo bash install_amneziawg.sh --egress=warp --yes
 2. Зарегистрирует бесплатный WARP-аккаунт через `wgcf register --accept-tos`.
 3. Сгенерирует `/etc/wireguard/wgcf.conf` и пропатчит его: `Table = off` (иначе дефолт-роут сервера уходит в WARP и SSH отваливается), удалит `DNS =`.
 4. Включит `wg-quick@wgcf`.
-5. В `awg0.conf` добавит `PostUp`: `ip rule from <подсеть> table 2408`, `ip route default dev wgcf table 2408`, `MASQUERADE -o wgcf`, `TCPMSS clamp` — чтобы клиентский трафик уходил в `wgcf`, а собственный трафик ноды (SSH, apt, handshake от entry) оставался через `eth0`.
+5. В `awg0.conf` добавит транзакционные `PostUp`/`PostDown`: blackhole-default в таблице `2408`, рабочий default через `wgcf` с metric `10`, source-rule с приоритетом `P` (по умолчанию `789`) и RPDB blackhole guard с приоритетом `P+1`, а также `MASQUERADE -o wgcf` и TCPMSS clamp. Поэтому клиентский трафик уходит в `wgcf`, собственный трафик ноды (SSH, apt, handshake от entry) остаётся через `eth0`, а при исчезновении WARP клиентский поток не проваливается в `main`.
 
 ### Проверка
 
@@ -232,11 +241,20 @@ curl ifconfig.me
 
 ```bash
 --warp-table=N       # routing table (умолч. 2408)
---warp-priority=N    # приоритет ip rule (умолч. 789)
+--warp-priority=N    # приоритет P: 1..32764 (умолч. 789); P+1 занят blackhole guard
+--warp-bypass=SPEC   # none | youtube | custom:<URL|/path>[,...]
 ```
 
-Коллизия с `--upstream-table` (123) проверяется на валидации.
+`--warp-bypass` добавляет в WARP-таблицу более специфичные маршруты выбранных
+назначений через основной NIC. Здесь «напрямую» означает **мимо Cloudflare WARP,
+но всё ещё через exit-VPS**: благодаря отдельному MASQUERADE сайт видит публичный
+IP этой VPS. Эти назначения намеренно исключены из WARP fail-closed; остальной
+клиентский трафик по-прежнему защищён table-blackhole и guard `P+1`. Приоритет
+`P` ограничен диапазоном `1..32764`, чтобы `P+1` оставался раньше системного
+правила `main` с приоритетом `32766`.
+
+Режимы WARP egress и entry/upstream взаимоисключающие, поэтому эти таблицы одновременно не используются.
 
 ### Отключение
 
-Если передумал — просто `sudo bash install_amneziawg.sh --uninstall`. Скрипт аккуратно снесёт `wg-quick@wgcf`, `wgcf.conf`, account-файл и сам бинарь `wgcf` — но только если WARP поднимался именно нашим инсталлятором (маркер `.wgcf_enabled_by_installer`). Если wgcf у тебя был до установки — uninstall его не трогает.
+Если передумал — просто `sudo bash install_amneziawg.sh --uninstall`. Скрипт удаляет сервис, конфиг, account-файл и бинарь `wgcf` только при наличии отдельного точного ownership-marker для соответствующего ресурса. Неоднозначный пустой marker старой версии не считается доказательством владения сервисом, поэтому существующий до установки wgcf сохраняется.

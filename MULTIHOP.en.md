@@ -33,11 +33,11 @@ Both nodes default to the same subnet `10.9.9.0/24`. It will work, but debugging
 **Important:** clone the fork into a path that is **NOT** `/root/awg` (that's the installer's working directory). Standard layout:
 
 ```bash
-git clone https://github.com/SNPR/amneziawg-installer.git /root/amneziawg-installer
+git clone --branch feat/v3 --single-branch https://github.com/SNPR/amneziawg-installer.git /root/amneziawg-installer
 cd /root/amneziawg-installer
 ```
 
-In step 5 the installer detects that `awg_common.sh` and `manage_amneziawg.sh` live next to it and uses those directly — **no upstream CDN download**. Our `--role=entry` and `--egress=warp` changes are guaranteed to land on the target node.
+In step 5 the installer detects the adjacent `awg_common.sh` and `manage_amneziawg.sh`, stages both, and verifies their embedded SHA-256 pins — **no upstream CDN download**. The node receives one consistent pair containing the `--role=entry` / `--egress=warp` changes.
 
 ## Node 1 (exit) — the "egress" server
 
@@ -142,9 +142,18 @@ sudo bash /root/awg/manage_amneziawg.sh add <name>        # add a client
 sudo bash /root/awg/manage_amneziawg.sh remove <name>     # remove one
 sudo bash /root/awg/manage_amneziawg.sh list              # list clients
 sudo bash /root/awg/manage_amneziawg.sh restart           # restart both tunnels
+sudo bash /root/awg/manage_amneziawg.sh upstream up       # raise only the upstream
+sudo bash /root/awg/manage_amneziawg.sh upstream down --yes  # fail-closed: take awg0 down first
 sudo bash /root/awg/manage_amneziawg.sh upstream restart  # just the cascade
+sudo bash /root/awg/manage_amneziawg.sh upstream apply --yes # apply awg1.conf
 sudo bash /root/awg/manage_amneziawg.sh upstream show     # cascade status
+sudo bash /root/awg/manage_amneziawg.sh upstream show --json # one JSON document for a bot
 ```
+
+`down` never leaves the client-facing `awg0` alive without its required egress:
+it first verifies that `awg0` is actually down (including a link raised
+manually), then takes down the upstream. `up`/`restart`/`apply` restore the
+previous active state of `awg0`; an upstream failure forces a fail-closed stop.
 
 ---
 
@@ -159,12 +168,12 @@ sudo bash /root/awg/manage_amneziawg.sh upstream show     # cascade status
 
 ## How it works under the hood (short version)
 
-- The entry node's `awg0.conf` does not `MASQUERADE` on `eth0`; it only `FORWARD`s between `%i` and `awg1` and clamps SYN TCPMSS.
-- `awg1.conf` gets `Table=123` and `FwMark=0xca6d`, plus a `PostUp`: `ip rule add from 10.8.0.0/24 table 123 priority 456` and `MASQUERADE -o %i`.
-- A client packet: **src=10.8.0.5** → lands on `awg0` → `FORWARD → awg1` → `ip rule` matches by src → table 123 → default via `awg1` → `MASQUERADE` (src becomes `10.9.0.2` — entry's address on the exit side) → encryption → exit over UDP → decrypted on the exit node → `MASQUERADE` on its `eth0` → internet.
+- On the entry node, `awg0.conf` owns policy routing and the fail-closed guard in its `PostUp`/`PostDown`: a metric-`42760` blackhole default in table `123`, the source rule `from 10.8.0.0/24 lookup 123 priority 456`, and an RPDB blackhole guard at priority `457` (`P+1`). The `FORWARD` rules between `%i` and `awg1` and the TCPMSS clamp live there too; there is no `MASQUERADE` on `eth0`.
+- `awg1.conf` contains only the supporting egress pieces: `Table=123`, `FwMark=0xca6d`, the default `AllowedIPs = 0.0.0.0/0` route that `awg-quick` installs into table `123`, and `MASQUERADE -o %i`. The source rule and blackhole guard do not live in `awg1.conf`, so losing `awg1` does not remove fail-closed protection while `awg0` remains up.
+- A client packet: **src=10.8.0.5** → arrives on `awg0` → the RPDB source rule selects table `123` → the working default through `awg1` beats the blackhole by its lower metric → then `FORWARD → awg1` → `MASQUERADE` (src becomes `10.9.0.2`, the entry address on the exit side) → encryption → exit over UDP → decrypted on the exit node → `MASQUERADE` on its `eth0` → internet. If the working `awg1` default is gone, the table blackhole/guard prevents fallback to `main` and exposure through the entry node's direct egress.
 - The return packet arrives on the exit (dst=exit public IP), gets DNAT'ed back through conntrack to `10.9.0.2` (entry), is encrypted in the exit's `awg0`, reaches the entry's `awg1`, conntrack restores dst=`10.8.0.5`, `FORWARD → awg0` → back to the client.
 
-The parameters that **must match between `awg1` (entry) and `awg0` (exit)** for the cascade to live: `Jc / Jmin / Jmax / S1-S4 / H1-H4`. The script reads them from `hop_to_entry.conf`, which was produced on the exit node — so the match is guaranteed.
+The receiver-checked parameters that **must match between `awg1` (entry) and `awg0` (exit)** are `S1-S4 / H1-H4` and, when present, `HeaderProtectionKey`. The renderer also carries `Jc/Jmin/Jmax` and `I1-I5` from the exit-generated `hop_to_entry.conf`, although the receiving side does not compare them.
 
 ---
 
@@ -198,7 +207,7 @@ The script will automatically:
 2. Register a free WARP account via `wgcf register --accept-tos`.
 3. Generate `/etc/wireguard/wgcf.conf` and patch it: `Table = off` (otherwise the host default route moves into WARP and SSH drops), strip the `DNS =` line.
 4. Enable `wg-quick@wgcf`.
-5. Append to `awg0.conf` PostUp: `ip rule from <subnet> table 2408`, `ip route default dev wgcf table 2408`, `MASQUERADE -o wgcf`, TCPMSS clamp — so the client traffic egresses via `wgcf` while the node's own traffic (SSH, apt, handshakes from entry) keeps using `eth0`.
+5. Add transactional `PostUp`/`PostDown` rules to `awg0.conf`: a blackhole default in table `2408`, a working default through `wgcf` with metric `10`, a source rule at priority `P` (default `789`), an RPDB blackhole guard at `P+1`, plus `MASQUERADE -o wgcf` and the TCPMSS clamp. Client traffic therefore exits through `wgcf`, the node's own traffic (SSH, apt, handshakes from entry) keeps using `eth0`, and losing WARP cannot make client traffic fall through to `main`.
 
 ### Verification
 
@@ -232,11 +241,20 @@ Should return an **IP from the Cloudflare range** (`104.x` / `162.x`), not the e
 
 ```bash
 --warp-table=N       # routing table (default 2408)
---warp-priority=N    # ip rule priority (default 789)
+--warp-priority=N    # priority P: 1..32764 (default 789); P+1 is the blackhole guard
+--warp-bypass=SPEC   # none | youtube | custom:<URL|/path>[,...]
 ```
 
-A collision with `--upstream-table` (123) is checked during validation.
+`--warp-bypass` installs more-specific routes for selected destinations in the
+WARP table through the host's main NIC. Here “direct” means **outside Cloudflare
+WARP but still through the exit VPS**: a separate MASQUERADE makes the site see
+that VPS's public IP. Those destinations are deliberately exempt from WARP
+fail-closed behavior; all remaining client traffic is still protected by the
+table blackhole and the `P+1` guard. `P` is restricted to `1..32764`, keeping
+`P+1` ahead of the system `main` rule at priority `32766`.
+
+WARP egress and entry/upstream modes are mutually exclusive, so their routing tables are never active together.
 
 ### Removal
 
-Changed your mind? Just run `sudo bash install_amneziawg_en.sh --uninstall`. The script carefully tears down `wg-quick@wgcf`, `wgcf.conf`, the account file and the `wgcf` binary itself — but only if WARP was raised by our installer (marker `.wgcf_enabled_by_installer`). If wgcf existed before our install, uninstall leaves it alone.
+Changed your mind? Just run `sudo bash install_amneziawg_en.sh --uninstall`. The script removes the service, configuration, account file, and `wgcf` binary only when a separate exact ownership marker proves ownership of that resource. An ambiguous empty marker from an older build is not accepted as proof of service ownership, so pre-existing wgcf installations are preserved.

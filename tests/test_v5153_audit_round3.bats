@@ -6,8 +6,8 @@
 # canonical _valid_* in awg_common.sh. This file pins the hardening.
 #
 # .1 validators:
-#    - validate_port: reject leading-zero/octal ('0080'); enforce 1-65535
-#      (fork allows privileged ports 1-1023 for mobile-DPI bypass, e.g. 443/500/53)
+#    - validate_port: reject leading-zero/octal ('0080'), enforce 1-65535
+#      (low ports like 443/80/53 allowed since v5.18.1 for DPI evasion)
 #    - validate_subnet / validate_cidr_list: decimal octets, reject leading zeros
 #    - validate_endpoint: structural [IPv6] check instead of charset-only
 #    - validate_cidr_list: reject leading/trailing/double comma before split
@@ -31,33 +31,25 @@ setup() {
 # ---------- .1 validate_port ----------
 
 @test ".1 validate_port: rejects leading-zero/octal and out-of-range" {
-    # NB: 80/23 are NOT in this list — the fork intentionally accepts privileged
-    # ports (see the dedicated test below). Leading-zero forms (0080/080) and 0
-    # stay rejected because the ^[1-9][0-9]{0,4}$ regex forbids a leading zero.
+    # v5.18.1: low ports (1-1023) are now allowed; only zero, leading-zero/octal,
+    # over-max and non-numeric stay rejected.
     for bad in 0080 080 0 65536 99999 abc ""; do
         run validate_port "$bad"
         [ "$status" -ne 0 ] || { echo "accepted invalid port: $bad"; false; }
     done
 }
 
-@test ".1 validate_port: accepts valid high ports" {
-    for ok in 1024 51820 65535; do
+@test ".1 validate_port: accepts valid ports incl. low DPI-evasion ports (v5.18.1)" {
+    for ok in 1 53 80 443 500 1023 1024 51820 65535; do
         run validate_port "$ok"
         [ "$status" -eq 0 ] || { echo "rejected valid port: $ok"; false; }
     done
 }
 
-@test ".1 validate_port: accepts privileged ports (fork DPI-bypass feature)" {
-    for ok in 1 53 80 443 500 1023; do
-        run validate_port "$ok"
-        [ "$status" -eq 0 ] || { echo "rejected privileged port: $ok"; false; }
-    done
-}
-
 # ---------- .1 validate_subnet ----------
 
-@test ".1 validate_subnet: rejects octal/leading-zero, out-of-range, wrong last octet" {
-    for bad in 010.008.009.001/24 300.0.0.1/24 256.0.0.1/24 10.0.0.0/24 10.0.0.255/24 10.0.0.2/24 10.0.0.1/16; do
+@test ".1 validate_subnet: rejects octal/leading-zero, out-of-range, non-network host" {
+    for bad in 010.008.009.001/24 300.0.0.1/24 256.0.0.1/24 10.0.0.255/24 10.0.0.2/24 10.0.0.5/16; do
         run validate_subnet "$bad"
         [ "$status" -ne 0 ] || { echo "accepted invalid subnet: $bad"; false; }
     done

@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # AmneziaWG 2.0 peer management script
 # Author: @bivlked
-# Version: 5.15.6
-# Date: 2026-06-08
+# Version: 5.28.1
+# Date: 2026-08-27
 # Repository: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Safe mode and Constants ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="5.15.6"
+SCRIPT_VERSION="5.28.1"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
@@ -37,11 +37,15 @@ EXPIRES_DURATION=""
 # does not leave orphan /tmp/tmp.XXXX (audit).
 _manage_temp_dirs=()
 
-manage_mktempdir() {
-    local d
-    d=$(mktemp -d) || return 1
-    _manage_temp_dirs+=("$d")
-    echo "$d"
+# The path is written to a named variable (printf -v), NOT via command
+# substitution: with td=$(manage_mktempdir) the append to _manage_temp_dirs
+# happened in the subshell and was lost, so cleanup on INT/TERM/EXIT never
+# removed those dirs. Call: manage_mktempdir_var td || die ...
+manage_mktempdir_var() {
+    local __rv="$1" __d
+    __d=$(mktemp -d) || return 1
+    _manage_temp_dirs+=("$__d")
+    printf -v "$__rv" '%s' "$__d"
 }
 
 _manage_cleaned=0
@@ -64,7 +68,116 @@ _manage_on_signal() {
     _manage_cleanup
     exit "$1"
 }
-trap _manage_cleanup EXIT
+
+# ==============================================================================
+# JSON helpers (v5.21.0)
+# ==============================================================================
+# Defined BEFORE the EXIT trap is installed: _manage_on_exit calls
+# _json_exit_guard, which calls json_escape. An early exit (option error)
+# without these definitions would print "command not found" instead of the
+# emergency JSON.
+
+# Byte-wise replacement of invalid UTF-8 with U+FFFD. A replacement, not
+# iconv -c: silently dropping bytes makes an error text meaningless exactly
+# when it matters most. iconv prints the valid prefix up to the first bad
+# byte: take the prefix, replace the byte, re-run the tail.
+# Called only after validation already failed - zero cost on valid input.
+_json_utf8_sanitize() {
+    local s="$1" out="" prefix
+    local LC_ALL=C   # ${#} and ${:offset} must count BYTES, not characters
+    while [[ -n "$s" ]]; do
+        if printf '%s' "$s" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            out+="$s"
+            break
+        fi
+        # Sentinel X preserves the prefix's trailing newlines ($() strips them).
+        prefix=$(printf '%s' "$s" | iconv -f UTF-8 -t UTF-8 2>/dev/null; printf X)
+        prefix="${prefix%X}"
+        out+="${prefix}"$'\xEF\xBF\xBD'
+        s="${s:$(( ${#prefix} + 1 ))}"
+    done
+    printf '%s' "$out"
+}
+
+# Escape a string for safe JSON inclusion. Beyond the basic \ " \n \r \t
+# this escapes ALL C0 controls (0x01-0x1F) as \u00XX - jq rejects raw ESC/BEL
+# (same class as the ESC-in-vpn:// bug in v5.20.0), and the emergency path
+# feeds arbitrary error text and --conf-dir paths in here. Invalid UTF-8 ->
+# U+FFFD. NUL is not handled: a bash variable cannot carry it.
+json_escape() {
+    local s="$1"
+    # Fork-free fast-path via printf %q: clean strings (names, IPs, our
+    # status literals) come back from %q unchanged - no iconv spawn needed
+    # (matters for list/stats: hundreds of calls per run). Broken bytes and
+    # C0 are ALWAYS quoted by %q ($'...') -> they take the iconv path.
+    # A false positive (spaces/parens) costs one cheap validation.
+    # NOT usable as a detector on its own: comparing char length == byte
+    # length misses broken UTF-8 (each bad byte counts as a "character").
+    local _q
+    printf -v _q '%q' "$s"
+    if [[ "$_q" != "$s" ]] && command -v iconv >/dev/null 2>&1; then
+        if ! printf '%s' "$s" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            s=$(_json_utf8_sanitize "$s"; printf X)
+            s="${s%X}"
+        fi
+    fi
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    # Rare path: remaining C0 (after the replacements above, \n\r\t are gone).
+    if [[ "$s" =~ [[:cntrl:]] ]]; then
+        local _i _ch _u
+        for _i in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+            printf -v _ch "\\$(printf '%03o' "$_i")"
+            [[ "$s" == *"$_ch"* ]] || continue
+            printf -v _u '\\u%04x' "$_i"
+            s="${s//$_ch/$_u}"
+        done
+    fi
+    printf '%s' "$s"
+}
+
+# The single point that prints JSON to stdout. Contract rule: with --json,
+# stdout carries EXACTLY ONE JSON document, including any failure.
+_JSON_EMITTED=0
+_JSON_ERR=""
+json_out() {
+    [[ "${JSON_OUTPUT:-0}" -eq 1 ]] || return 0
+    [[ "$_JSON_EMITTED" -eq 1 ]] && return 0    # double-emission protection
+    _JSON_EMITTED=1
+    printf '%s\n' "$1"
+}
+
+# Emergency emission on EXIT: any exit path with rc!=0 that has not printed
+# its envelope (die, bare exit, strict-confirm refusal, signal, usage error)
+# leaves the bot {"command","ok":false,"error","rc"} instead of empty stdout.
+# rc arrives as an ARGUMENT: the guard is called from _manage_on_exit, and
+# reading $? here would be too late. The error field is human-readable text
+# (may be localized); bots must decide by ok/rc/status.
+_json_exit_guard() {
+    local rc="$1"
+    [[ "${JSON_OUTPUT:-0}" -eq 1 && "$_JSON_EMITTED" -eq 0 && "$rc" -ne 0 ]] || return 0
+    # show/diagnose are outside the JSON contract (--json documented as
+    # unsupported): their human output already went to stdout, an emergency
+    # object on top would produce a mixed stream instead of "exactly one".
+    case "${COMMAND:-}" in show|diagnose) return 0 ;; esac
+    json_out "{\"command\":\"$(json_escape "${COMMAND:-}")\",\"ok\":false,\"error\":\"$(json_escape "${_JSON_ERR:-command failed}")\",\"rc\":$rc}"
+}
+
+# The ONLY EXIT handler. The guard lives here, NOT inside the idempotent
+# _manage_cleanup: the signal path calls cleanup directly (at that moment $?
+# is not yet 130/143 - the guard would report a wrong rc), and the repeated
+# cleanup call on EXIT hits _manage_cleaned=1 (a guard placed after that
+# check would never run). Here rc is honest on all paths, including the
+# exit 130/143 from the signal hooks.
+_manage_on_exit() {
+    local rc=$?
+    _json_exit_guard "$rc"
+    _manage_cleanup
+}
+trap _manage_on_exit EXIT
 trap '_manage_on_signal 130' INT
 trap '_manage_on_signal 143' TERM
 
@@ -81,11 +194,18 @@ while [[ $# -gt 0 ]]; do
         --expires=*)       EXPIRES_DURATION="${1#*=}"; shift ;;
         --conf-dir=*)      AWG_DIR="${1#*=}"; shift ;;
         --server-conf=*)   SERVER_CONF_FILE="${1#*=}"; shift ;;
-        --apply-mode=*)    _CLI_APPLY_MODE="${1#*=}"; export AWG_APPLY_MODE="$_CLI_APPLY_MODE"; shift ;;
+        --apply-mode=*)
+            # Stash only; validation happens AFTER the loop (see below):
+            # inside the loop --json may not be parsed yet ('add x
+            # --apply-mode=bad --json') and the emergency JSON guard
+            # would stay silent on an error here.
+            _CLI_APPLY_MODE="${1#*=}"
+            shift ;;
         --psk)             CLI_ADD_PSK=1; shift ;;
+        --reset-routes)    CLI_RESET_ROUTES=1; shift ;;
         --yes)             CLI_YES=1; shift ;;
         --carrier=*)       CLI_CARRIER="${1#*=}"; shift ;;
-        --*)               echo "Unknown option: $1" >&2; COMMAND="help"; HELP_EXIT_RC=1; break ;;
+        --*)               echo "Unknown option: $1" >&2; for _rest in "$@"; do [[ "$_rest" == "--json" ]] && JSON_OUTPUT=1; done; COMMAND="help"; HELP_EXIT_RC=1; break ;;
         *)
             if [[ -z "$COMMAND" ]]; then
                 COMMAND=$1
@@ -98,6 +218,28 @@ done
 CLIENT_NAME="${ARGS[0]}"
 PARAM="${ARGS[1]}"
 VALUE="${ARGS[2]}"
+
+# Alias canonicalization (contract 3.2): a bot must not have to parse how the
+# command was typed. The dispatcher below matches both spellings, so this is
+# safe for the human path too.
+case "$COMMAND" in
+    status) COMMAND="check" ;;
+    repair) COMMAND="repair-module" ;;
+esac
+
+# Validate --apply-mode after ALL options are parsed (--json is known now).
+# A typo (--apply-mode=restrat) would silently act as syncconf - a user
+# working around an issue with restart mode would never learn the mode
+# did not apply.
+if [[ -n "${_CLI_APPLY_MODE:-}" ]]; then
+    case "$_CLI_APPLY_MODE" in
+        syncconf|restart) export AWG_APPLY_MODE="$_CLI_APPLY_MODE" ;;
+        *)
+            _JSON_ERR="Invalid --apply-mode value: '$_CLI_APPLY_MODE' (expected: syncconf or restart)"
+            echo "$_JSON_ERR" >&2
+            exit 1 ;;
+    esac
+fi
 
 # Update paths after possible --conf-dir override
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -136,7 +278,7 @@ log_msg() {
     if [[ "$type" == "ERROR" || "$type" == "WARN" ]]; then
         printf "${color_start}%s${color_end}\n" "$entry" >&2
     elif [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
-        # weaq P2: in --json mode stdout must contain ONLY JSON (jq/automation).
+        # In --json mode stdout must contain ONLY JSON (jq/automation).
         # Route INFO/DEBUG to stderr, otherwise list/show/stats --json print INFO
         # lines before the JSON and break parsing (confirmed on biHetzner).
         printf "${color_start}%s${color_end}\n" "$entry" >&2
@@ -149,7 +291,9 @@ log()       { log_msg "INFO" "$1"; }
 log_warn()  { log_msg "WARN" "$1"; }
 log_error() { log_msg "ERROR" "$1"; }
 log_debug() { if [[ "$VERBOSE_LIST" -eq 1 ]]; then log_msg "DEBUG" "$1"; fi; }
-die()       { log_error "$1"; exit 1; }
+# die mirrors the message into _JSON_ERR so the guard's emergency JSON
+# carries meaningful text instead of the default "command failed".
+die()       { _JSON_ERR="$1"; log_error "$1"; exit 1; }
 
 # ==============================================================================
 # Utilities
@@ -167,18 +311,285 @@ escape_sed() {
     printf '%s' "$s"
 }
 
+# A root run gives manage full privileges, so CLI paths cannot be checked with
+# `-f` alone: it follows symlinks and can feed a substituted awg_common.sh to
+# `source`. This check runs BEFORE the first LOG_FILE write and before source.
+# It is intentionally a no-op for unprivileged test runs whose fixtures live in
+# mktemp; the security boundary is the privilege transition.
+_manage_root_node_trusted() {
+    local path="$1" kind="$2" meta owner mode group_digit other_digit
+    [[ -n "$path" && ! -L "$path" ]] || return 1
+    case "$kind" in
+        dir)  [[ -d "$path" ]] || return 1 ;;
+        file) [[ -f "$path" ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    meta=$(stat -c '%u %a' -- "$path" 2>/dev/null) || return 1
+    read -r owner mode <<< "$meta"
+    [[ "$owner" == "0" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    group_digit="${mode: -2:1}"
+    other_digit="${mode: -1}"
+    (( (10#$group_digit & 2) == 0 && (10#$other_digit & 2) == 0 ))
+}
+
+_manage_root_parent_chain_trusted() {
+    local path="$1" parent rest current="/" part
+    local -a parts=()
+    [[ "$path" == /* && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
+    case "/${path#/}/" in
+        *"/../"*|*"/./"*) return 1 ;;
+    esac
+    parent="${path%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    _manage_root_node_trusted / dir || return 1
+    rest="${parent#/}"
+    IFS='/' read -r -a parts <<< "$rest"
+    for part in "${parts[@]}"; do
+        [[ -z "$part" ]] && continue
+        current="${current%/}/$part"
+        _manage_root_node_trusted "$current" dir || return 1
+    done
+}
+
+_manage_root_file_trusted() {
+    local path="$1"
+    _manage_root_parent_chain_trusted "$path" \
+        && _manage_root_node_trusted "$path" file
+}
+
+_manage_root_dir_trusted() {
+    local path="$1"
+    [[ "$path" != "/" ]] \
+        && _manage_root_parent_chain_trusted "$path" \
+        && _manage_root_node_trusted "$path" dir
+}
+
+_manage_root_file_or_missing_trusted() {
+    local path="$1"
+    _manage_root_parent_chain_trusted "$path" || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+        _manage_root_node_trusted "$path" file || return 1
+    fi
+    return 0
+}
+
+_manage_validate_privileged_paths() {
+    _MANAGE_PATH_ERROR=""
+    (( EUID == 0 )) || return 0
+    if ! _manage_root_dir_trusted "$AWG_DIR"; then
+        _MANAGE_PATH_ERROR="Untrusted --conf-dir directory: $AWG_DIR"
+    elif ! _manage_root_file_trusted "$CONFIG_FILE"; then
+        _MANAGE_PATH_ERROR="Untrusted configuration file: $CONFIG_FILE"
+    elif ! _manage_root_file_trusted "$COMMON_SCRIPT_PATH"; then
+        _MANAGE_PATH_ERROR="Untrusted common library: $COMMON_SCRIPT_PATH"
+    elif ! _manage_root_file_trusted "$SERVER_CONF_FILE"; then
+        _MANAGE_PATH_ERROR="Untrusted --server-conf: $SERVER_CONF_FILE"
+    elif ! _manage_root_file_or_missing_trusted "$LOG_FILE"; then
+        _MANAGE_PATH_ERROR="Untrusted log path: $LOG_FILE"
+    else
+        return 0
+    fi
+    return 1
+}
+
+# Read topology fields without executing the init file. A genuinely absent
+# AWG_ROLE remains legacy-compatible `single`; an explicit malformed or
+# duplicate assignment can no longer silently turn an entry node into single.
+# A legacy entry config without AWG_UPSTREAM_IFACE keeps the historical awg1.
+_manage_unquote_scalar() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "$value" == \'* ]]; then
+        [[ ${#value} -ge 2 && "$value" == *\' ]] || return 1
+        value="${value#\'}"; value="${value%\'}"
+        [[ "$value" != *\'* ]] || return 1
+    elif [[ "$value" == \"* ]]; then
+        [[ ${#value} -ge 2 && "$value" == *\" ]] || return 1
+        value="${value#\"}"; value="${value%\"}"
+        [[ "$value" != *\"* ]] || return 1
+    fi
+    printf '%s' "$value"
+}
+
+_manage_load_topology_strict() {
+    local file="$1" line key raw value first_line=1
+    local role="single" iface="awg1" role_seen=0 iface_seen=0
+    _MANAGE_TOPOLOGY_ERROR=""
+    [[ -f "$file" && ! -L "$file" ]] || {
+        _MANAGE_TOPOLOGY_ERROR="init file is missing or is a symlink: $file"
+        return 1
+    }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$first_line" -eq 1 ]]; then
+            line="${line#$'\xEF\xBB\xBF'}"
+            first_line=0
+        fi
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*# || "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(AWG_ROLE|AWG_UPSTREAM_IFACE)[[:space:]]*=(.*)$ ]]; then
+            key="${BASH_REMATCH[2]}"
+            raw="${BASH_REMATCH[3]}"
+            value=$(_manage_unquote_scalar "$raw") || {
+                _MANAGE_TOPOLOGY_ERROR="Invalid quoted $key value in $file"
+                return 1
+            }
+            case "$key" in
+                AWG_ROLE)
+                    ((role_seen += 1))
+                    (( role_seen == 1 )) || {
+                        _MANAGE_TOPOLOGY_ERROR="Duplicate AWG_ROLE in $file"
+                        return 1
+                    }
+                    role="$value"
+                    ;;
+                AWG_UPSTREAM_IFACE)
+                    ((iface_seen += 1))
+                    (( iface_seen == 1 )) || {
+                        _MANAGE_TOPOLOGY_ERROR="Duplicate AWG_UPSTREAM_IFACE in $file"
+                        return 1
+                    }
+                    iface="$value"
+                    ;;
+            esac
+        elif [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?AWG_(ROLE|UPSTREAM_IFACE)([^A-Za-z0-9_]|$) ]]; then
+            _MANAGE_TOPOLOGY_ERROR="Malformed role/upstream line in $file: $line"
+            return 1
+        fi
+    done < "$file"
+    case "$role" in
+        single|exit|entry) ;;
+        *) _MANAGE_TOPOLOGY_ERROR="Invalid AWG_ROLE='$role' in $file"; return 1 ;;
+    esac
+    if ! [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] || [[ "$iface" == "awg0" ]]; then
+        _MANAGE_TOPOLOGY_ERROR="Invalid AWG_UPSTREAM_IFACE='$iface' in $file"
+        return 1
+    fi
+    _MANAGE_CONFIG_ROLE="$role"
+    _MANAGE_CONFIG_UPSTREAM_IFACE="$iface"
+    return 0
+}
+
+_manage_iface_link_present() {
+    local iface="$1"
+    ip link show dev "$iface" >/dev/null 2>&1
+}
+
+_manage_iface_is_live() {
+    local iface="$1"
+    systemctl is-active --quiet "awg-quick@${iface}" 2>/dev/null \
+        || _manage_iface_link_present "$iface"
+}
+
+# Mutation success is stricter than status visibility: RemainAfterExit can
+# leave a unit active after its kernel link was removed manually.
+_manage_iface_is_healthy() {
+    local iface="$1"
+    systemctl is-active --quiet "awg-quick@${iface}" 2>/dev/null \
+        && _manage_iface_link_present "$iface"
+}
+
+_manage_quick_conf_trusted() {
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    (( EUID != 0 )) || _manage_root_file_trusted "$path"
+}
+
+_manage_quick_conf_matches_iface() {
+    local iface="$1" path="$2"
+    [[ "${path##*/}" == "${iface}.conf" ]]
+}
+
+_ensure_interface_down() {
+    local iface="$1" conf="$2" unit
+    unit="awg-quick@${iface}"
+    if ! systemctl stop "$unit" >/dev/null 2>&1; then
+        log_warn "systemctl could not stop $unit; checking the live interface."
+    fi
+    if _manage_iface_link_present "$iface"; then
+        if ! _manage_quick_conf_matches_iface "$iface" "$conf"; then
+            log_error "Cannot safely remove $iface through a config with another basename: $conf"
+        elif ! _manage_quick_conf_trusted "$conf"; then
+            log_error "Cannot safely remove live interface $iface: untrusted config $conf"
+        elif ! timeout 15 awg-quick down "$conf" >/dev/null 2>&1; then
+            log_error "awg-quick could not remove live interface $iface."
+        fi
+    fi
+    if systemctl is-active --quiet "$unit" 2>/dev/null \
+       || _manage_iface_link_present "$iface"; then
+        log_error "$iface is still active after the stop attempt."
+        return 1
+    fi
+    return 0
+}
+
+_ensure_awg0_down() {
+    _ensure_interface_down awg0 "$SERVER_CONF_FILE"
+}
+
+_ensure_upstream_down() {
+    local conf
+    conf="$(dirname "$SERVER_CONF_FILE")/${AWG_UPSTREAM_IFACE}.conf"
+    _ensure_interface_down "$AWG_UPSTREAM_IFACE" "$conf"
+}
+
+_restore_awg0_state() {
+    local unit_was_active="$1" link_was_present="$2"
+    if [[ "$unit_was_active" -eq 1 ]]; then
+        if systemctl is-active --quiet awg-quick@awg0 2>/dev/null \
+           && _manage_iface_link_present awg0; then
+            return 0
+        fi
+        if systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
+            systemctl restart awg-quick@awg0 || return 1
+        else
+            systemctl start awg-quick@awg0 || return 1
+        fi
+        systemctl is-active --quiet awg-quick@awg0 2>/dev/null \
+            && _manage_iface_link_present awg0
+        return $?
+    fi
+    if [[ "$link_was_present" -eq 1 ]]; then
+        _manage_iface_link_present awg0 && return 0
+        _manage_quick_conf_matches_iface awg0 "$SERVER_CONF_FILE" || return 1
+        _manage_quick_conf_trusted "$SERVER_CONF_FILE" || return 1
+        if timeout 15 awg-quick up "$SERVER_CONF_FILE" >/dev/null 2>&1 \
+            && _manage_iface_link_present awg0; then
+            return 0
+        fi
+        # A failed postcondition must not strand a partially created link.
+        timeout 15 awg-quick down "$SERVER_CONF_FILE" >/dev/null 2>&1 || true
+        return 1
+    fi
+    return 0
+}
+
 confirm_action() {
     # CLI flag --yes or ENV AWG_YES=1 skip the confirm prompt — useful for
     # scripts, cron, Ansible and interactive calls that pre-confirmed.
     if [[ "${CLI_YES:-0}" == "1" || "${AWG_YES:-0}" == "1" ]]; then
         return 0
     fi
-    if ! is_interactive; then return 0; fi
+    if ! is_interactive; then
+        # AWG_STRICT_CONFIRM=1 (opt-in, v5.21.0): a non-interactive run without
+        # an explicit --yes/AWG_YES=1 is refused instead of silently approved -
+        # protects destructive commands in pipelines where nobody watches the
+        # screen. Default 0 keeps prior behavior; strictly the string "1".
+        # The ENV applies per run and is NOT persisted to awgsetup_cfg.init.
+        if [[ "${AWG_STRICT_CONFIRM:-0}" == "1" ]]; then
+            _JSON_ERR="AWG_STRICT_CONFIRM=1: non-interactive run requires --yes"
+            log_error "AWG_STRICT_CONFIRM=1: non-interactive run requires --yes (or AWG_YES=1). Action cancelled."
+            return 1
+        fi
+        return 0
+    fi
     local action="$1" subject="$2"
     read -rp "Are you sure you want to $action $subject? [y/N]: " confirm < /dev/tty
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    # Accept y/yes (case-insensitive) plus stray whitespace/CR around it.
+    if [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
         return 0
     else
+        _JSON_ERR="confirmation denied"
         log "Action cancelled."
         return 1
     fi
@@ -192,11 +603,53 @@ validate_client_name() {
     return 0
 }
 
+# JSON entry for a successful regen (v5.21.0). qr/vpnuri are paths if the
+# file exists at response time (regenerate_client refreshes them best-effort;
+# the contract makes no freshness promise - see the races note in the docs).
+_regen_json_entry() {
+    local name="$1" _jqr="null" _juri="null"
+    [[ -f "$AWG_DIR/${name}.png" ]] && _jqr="\"$(json_escape "$AWG_DIR/${name}.png")\""
+    [[ -f "$AWG_DIR/${name}.vpnuri" ]] && _juri="\"$(json_escape "$AWG_DIR/${name}.vpnuri")\""
+    printf '%s' "{\"name\":\"$(json_escape "$name")\",\"status\":\"regenerated\",\"conf\":\"$(json_escape "$AWG_DIR/${name}.conf")\",\"qr\":$_jqr,\"vpnuri\":$_juri}"
+}
+
 # ==============================================================================
 # Dependency check
 # ==============================================================================
 
+# Compatibility check between awg_common.sh and this script. The files are
+# updated as a pair; if only one is refreshed, the mismatch otherwise surfaces
+# as a "command not found" somewhere random (issue #183). We compare MAJOR.MINOR:
+# a patch difference is fine (no breaking library changes within a minor), but a
+# different minor or a library with no version (older than this check) = stop.
+_check_common_compat() {
+    local have="${AWG_COMMON_VERSION:-}"
+    local want="$SCRIPT_VERSION"
+    # Compare MAJOR and MINOR separately as NUMBERS, not via ${v%.*} (which would
+    # collapse "5.20" and "5.9" into "5"). An X.Y.* shape with numeric X.Y is
+    # required: an empty/two-component/non-numeric library version fails the
+    # match and leads to die. Anything after MINOR (patch, -rc1) is ignored.
+    local re='^([0-9]+)\.([0-9]+)\.'
+    if [[ "$have" =~ $re ]]; then
+        local have_mj="${BASH_REMATCH[1]}" have_mn="${BASH_REMATCH[2]}"
+        if [[ "$want" =~ $re ]]; then
+            [[ "$have_mj" == "${BASH_REMATCH[1]}" && "$have_mn" == "${BASH_REMATCH[2]}" ]] && return 0
+        fi
+    fi
+    die "awg_common.sh (${have:-no version}) is incompatible with manage_amneziawg.sh ($want). Update both halves from one Git snapshot (if the clone is absent, run the clone command from README first):
+  git -C /root/amneziawg-installer fetch origin feat/v3
+  git -C /root/amneziawg-installer checkout feat/v3
+  git -C /root/amneziawg-installer pull --ff-only origin feat/v3
+  install -m 700 /root/amneziawg-installer/manage_amneziawg_en.sh $AWG_DIR/manage_amneziawg.sh
+  install -m 700 /root/amneziawg-installer/awg_common_en.sh $COMMON_SCRIPT_PATH"
+}
+
 check_dependencies() {
+    if ! _manage_validate_privileged_paths; then
+        _JSON_ERR="${_MANAGE_PATH_ERROR:-Runtime path trust check failed}"
+        printf 'ERROR: %s\n' "$_JSON_ERR" >&2
+        exit 1
+    fi
     log "Checking dependencies..."
     local ok=1
 
@@ -219,9 +672,14 @@ check_dependencies() {
     if ! command -v awg &>/dev/null; then die "'awg' not found."; fi
     if ! command -v qrencode &>/dev/null; then log_warn "qrencode not found (QR codes will not be created)."; fi
 
-    # Load common library
+    # Load common library.
+    # Reset before sourcing so the version comes ONLY from the library, not from
+    # an inherited environment (otherwise an old library with no variable could
+    # falsely pass the compatibility check).
+    unset AWG_COMMON_VERSION
     # shellcheck source=/dev/null
     source "$COMMON_SCRIPT_PATH" || die "Failed to load $COMMON_SCRIPT_PATH"
+    _check_common_compat
 
     log "Dependencies OK."
 }
@@ -262,7 +720,7 @@ _backup_configs_nolock() {
     # backups (e.g. regen → backup → modify → backup within the same second).
     ts=$(date +%F_%H-%M-%S.%3N)
     bf="$bd/awg_backup_${ts}.tar.gz"
-    td=$(manage_mktempdir) || die "Failed to create temp directory"
+    manage_mktempdir_var td || die "Failed to create temp directory"
 
     mkdir -p "$td/server" "$td/clients" "$td/keys"
 
@@ -378,8 +836,26 @@ backup_configs() {
         exec {backup_lock_fd}>&-
         return 1
     fi
+    # Additionally take the config lock: a concurrent `manage add/remove`
+    # could modify awg0.conf/keys BETWEEN copying server/ and clients/ into
+    # tmpdir - each file in the backup is intact (atomic mv) but the set is
+    # desynchronized (peer mismatch on restore). restore_backup holds both
+    # locks - backup must do the same. IMPORTANT: in restore
+    # _backup_configs_nolock is called under an already-held config lock -
+    # here the lock is taken only for the direct backup command (flock is
+    # non-reentrant, see the contract in awg_common.sh).
+    local config_lockfile="${AWG_DIR}/.awg_config.lock"
+    local config_lock_fd
+    exec {config_lock_fd}>"$config_lockfile"
+    if ! flock -x -w 30 "$config_lock_fd"; then
+        log_error "Config lock timeout (30 sec)."
+        exec {config_lock_fd}>&-
+        exec {backup_lock_fd}>&-
+        return 1
+    fi
     _backup_configs_nolock
     local _rc=$?
+    exec {config_lock_fd}>&-
     exec {backup_lock_fd}>&-
     return "$_rc"
 }
@@ -398,7 +874,7 @@ _restore_do_rollback() {
     fi
     log_warn "Rolling back to pre-restore state ($(basename "$_snap"))..."
     local _rtd
-    _rtd=$(manage_mktempdir) || {
+    manage_mktempdir_var _rtd || {
         log_error "Failed to create rollback tmpdir. Manual: tar -xzf $_snap -C /"
         return 1
     }
@@ -417,6 +893,9 @@ _restore_do_rollback() {
     [[ -d "$_rtd/expiry" ]] && { mkdir -p "${EXPIRY_DIR:-$AWG_DIR/expiry}"; cp -a "$_rtd/expiry"/* "${EXPIRY_DIR:-$AWG_DIR/expiry}/" 2>/dev/null; }
     [[ -f "$_rtd/awg-expiry" ]] && cp -a "$_rtd/awg-expiry" /etc/cron.d/awg-expiry 2>/dev/null
     rm -rf "$_rtd"
+    # Rollback files are in place - the JSON envelope reports rolled_back=true
+    # even if the service below fails to start (FS state is already pre-restore).
+    _RESTORE_ROLLED_BACK=1
 
     log "Rollback done — attempting to start service..."
     if systemctl start awg-quick@awg0; then
@@ -426,6 +905,16 @@ _restore_do_rollback() {
         log_error "Service did not start after rollback — check: systemctl status awg-quick@awg0"
         return 1
     fi
+}
+
+# Returns 0 when the path contains '..' as a COMPLETE component (parent
+# traversal): exactly "..", a "../" prefix, "/../" in the middle or a trailing
+# "/..". A ".." substring inside a name (my..backup.conf, v1..2) is legitimate -
+# the old substring check falsely rejected such files when restoring
+# foreign/modified archives.
+_path_has_parent_component() {
+    local p="$1"
+    [[ "$p" == ".." || "$p" == "../"* || "$p" == *"/../"* || "$p" == *"/.." ]]
 }
 
 restore_backup() {
@@ -461,6 +950,7 @@ restore_backup() {
     fi
 
     if [[ ! -f "$bf" ]]; then die "Backup file '$bf' not found."; fi
+    _RESTORE_SOURCE="$bf"   # for the restore JSON envelope (v5.21.0)
     log "Restoring from $bf"
     if ! confirm_action "restore" "configuration from '$bf'"; then return 1; fi
 
@@ -545,7 +1035,7 @@ restore_backup() {
     # Capture rollback snapshot (set by _backup_configs_nolock)
     _rollback_snap="${LAST_BACKUP_PATH:-}"
 
-    td=$(manage_mktempdir) || {
+    manage_mktempdir_var td || {
         log_error "Failed to create temp directory"
         return 1
     }
@@ -556,7 +1046,8 @@ restore_backup() {
     # path traversal (../), absolute paths, symlinks or device files to
     # overwrite arbitrary system files when extracted as root.
 
-    # Type check via verbose listing: reject block/char/FIFO/hardlink entries
+    # Type check via verbose listing: reject block/char/FIFO/symlink ('l')
+    # and hardlink ('h') entries - both link classes are unsafe to extract.
     local _tar_verbose _vline _tc
     _tar_verbose=$(tar -tvzf "$bf" 2>/dev/null) || {
         log_error "Cannot read archive contents: $bf"
@@ -586,8 +1077,8 @@ restore_backup() {
             log_error "Archive contains absolute path: '$_bad_entry' — restore aborted."
             return 1
         fi
-        # Parent directory traversal
-        if [[ "$_bad_entry" == *..* ]]; then
+        # Parent directory traversal ('..' as a complete path component only)
+        if _path_has_parent_component "$_bad_entry"; then
             log_error "Archive contains path traversal (..): '$_bad_entry' — restore aborted."
             return 1
         fi
@@ -707,10 +1198,12 @@ restore_backup() {
         log "Restoring expiry data..."
         mkdir -p "${EXPIRY_DIR:-$AWG_DIR/expiry}"
         # C11: expiry is intentionally NOT pruned. Orphan stamps for nonexistent
-        # clients are harmless (cron cleanup ignores them), and a prune here would
-        # be unsafe: both the rm and the following cp are best-effort (|| true), so
-        # a copy failure after the prune would silently leave expiry empty. The
-        # client artifacts themselves are pruned above.
+        # clients are harmless: check_expired_clients detects on expiry that the
+        # peer is absent from the config and cleans the stamp with the artifacts
+        # itself. A prune here would be unsafe: both the rm and the following cp
+        # are best-effort (|| true), so a copy failure after the prune would
+        # silently leave expiry empty. The client artifacts themselves are
+        # pruned above.
         cp -a "$td/expiry/"* "${EXPIRY_DIR:-$AWG_DIR/expiry}/" 2>/dev/null || true
         chmod 600 "${EXPIRY_DIR:-$AWG_DIR/expiry}"/* 2>/dev/null
     fi
@@ -738,6 +1231,10 @@ restore_backup() {
 
     # Success — rollback not needed, trap only performs cleanup
     _restore_ok=1
+    # The restore replaced awg0.conf and recreated the interface, so the
+    # device-parameter snapshot has to be taken again: it must describe what is
+    # on the live interface NOW, not what was there before the restore.
+    awg_record_device_params
     log "Restore completed."
     return 0
 }
@@ -888,17 +1385,51 @@ modify_client() {
     fi
     log "Backup: $bak"
 
+    # List-valued parameters are normalised to the canonical "a, b, c" form
+    # (D#38): the installer writes them with a space after each comma, and
+    # modify must not leave a second, collapsed variant of the same value in
+    # the config.
+    #
+    # 🔴 Checking that the function exists is mandatory. _check_common_compat
+    # compares MAJOR.MINOR only and deliberately tolerates a patch-level drift,
+    # while awg_normalize_csv arrived in the 5.27.1 patch. On a half-updated
+    # server (a fresh manage next to an old library) the call would return an
+    # empty string, and that would silently replace the list of routes.
+    case "$param" in
+        AllowedIPs|DNS)
+            command -v awg_normalize_csv >/dev/null 2>&1 || {
+                log_error "awg_common.sh is out of date: awg_normalize_csv is missing. Update both halves to the same version."
+                exec {modify_lock_fd}>&-
+                return 1
+            }
+            local _norm
+            _norm=$(awg_normalize_csv "$value")
+            [[ -n "$_norm" ]] || {
+                log_error "Normalising '$param' produced an empty value - the change was cancelled."
+                exec {modify_lock_fd}>&-
+                return 1
+            }
+            value="$_norm"
+            log "Value normalised to: $value"
+            ;;
+    esac
+
     local escaped_value
     escaped_value=$(escape_sed "$value")
     if ! sed -i "s#^${param}[[:space:]]*=[[:space:]]*.*#${param} = ${escaped_value}#" "$cf"; then
         log_error "sed error. Restoring..."
-        cp "$bak" "$cf" || log_warn "Restore error."
+        # After a successful rollback the .bak is identical to the config -
+        # remove it so repeated failed modifies do not pile .bak files in $AWG_DIR.
+        if cp "$bak" "$cf"; then rm -f "$bak"; else log_warn "Restore error."; fi
         exec {modify_lock_fd}>&-
         return 1
     fi
-    if ! grep -q -E "^${param} = " "$cf"; then
+    # An empty value is not accepted: the prefix-only check matched a line like
+    # "AllowedIPs = ", so wiping a setting was reported as success while the
+    # backup was deleted.
+    if ! grep -q -E "^${param} = .+" "$cf"; then
         log_error "Replacement failed for '$param'. Restoring..."
-        cp "$bak" "$cf" || log_warn "Restore error."
+        if cp "$bak" "$cf"; then rm -f "$bak"; else log_warn "Restore error."; fi
         exec {modify_lock_fd}>&-
         return 1
     fi
@@ -926,29 +1457,62 @@ modify_client() {
 check_server() {
     log "Checking AmneziaWG 2.0 server status..."
     local ok=1
+    # Snapshot for the JSON envelope (v5.21.0): collected along the human
+    # checks so the data and the verdict come from the same pass.
+    local _c_svc_active=false _c_present=false _c_mtu=null _c_addrs=""
+    local _c_listen=false _c_mod=false _c_ufw_active=false _c_allowed=false
+    local _c_mod_ver=""
 
     log "Service status:"
-    if ! systemctl status awg-quick@awg0 --no-pager; then ok=0; fi
+    # With --json the raw systemctl output goes to stderr: stdout is contract-only.
+    if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        if ! systemctl status awg-quick@awg0 --no-pager >&2; then ok=0; fi
+    else
+        if ! systemctl status awg-quick@awg0 --no-pager; then ok=0; fi
+    fi
+    systemctl is-active --quiet awg-quick@awg0 2>/dev/null && _c_svc_active=true
 
     log "Interface awg0:"
-    if ! ip addr show awg0 &>/dev/null; then
+    local _ip_out
+    if ! _ip_out=$(ip addr show awg0 2>/dev/null); then
         log_error " - Interface not found!"
         ok=0
     else
-        while IFS= read -r line; do log "  $line"; done < <(ip addr show awg0)
+        _c_present=true
+        while IFS= read -r line; do log "  $line"; done <<< "$_ip_out"
+        _c_mtu=$(sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p' <<< "$_ip_out" | head -n1)
+        [[ "$_c_mtu" =~ ^[0-9]+$ ]] || _c_mtu=null
+        local _a
+        while IFS= read -r _a; do
+            [[ -z "$_a" ]] && continue
+            _c_addrs+="${_c_addrs:+,}\"$(json_escape "$_a")\""
+        done < <(awk '/^[[:space:]]*inet6? /{print $2}' <<< "$_ip_out")
     fi
 
     log "Port listening:"
-    # shellcheck source=/dev/null
     safe_load_config "$CONFIG_FILE" 2>/dev/null
-    local port=${AWG_PORT:-0}
+    local port
+    port=$(_sanitize_port "${AWG_PORT:-}")
     if [[ "$port" -eq 0 ]]; then
-        log_warn " - Failed to determine port."
+        if [[ -n "${AWG_PORT:-}" ]]; then
+            # The config holds something that is not a port: the file is
+            # corrupt, not "the setting is unset". Staying quiet is wrong - for
+            # monitoring this is as broken as a dead service. The value is
+            # shown truncated and stripped of control characters: it is an
+            # arbitrary string and may drag in a newline or an ESC sequence.
+            local _bad_port="${AWG_PORT:0:32}"
+            _bad_port="${_bad_port//[^[:print:]]/?}"
+            log_error " - The port in the config is invalid: '${_bad_port}'."
+            ok=0
+        else
+            log_warn " - Failed to determine port."
+        fi
     else
         if ! ss -lunp | grep -q ":${port} "; then
             log_error " - Port ${port}/udp is NOT listening!"
             ok=0
         else
+            _c_listen=true
             log " - Port ${port}/udp is listening."
         fi
     fi
@@ -963,12 +1527,46 @@ check_server() {
         log " - IP Forwarding is enabled."
     fi
 
+    log "Kernel module:"
+    # Pattern from diagnose: exact module name in the first lsmod column.
+    if lsmod 2>/dev/null | awk '$1 == "amneziawg" {f=1} END {exit !f}'; then
+        _c_mod=true
+        # Module version: the 3.0 line starts with 3., the 2.0 one with 1.
+        # (upstream tag names have never tracked the protocol version, so we
+        #  print the raw value instead of guessing the protocol from it).
+        # awg_module_version asks the LOADED module and keeps modinfo (the file
+        # on disk) as the second path - see the note at the function in awg_common.sh.
+        _c_mod_ver=$(awg_module_version)
+        if [[ -n "$_c_mod_ver" ]]; then
+            log " - amneziawg module is loaded (version $_c_mod_ver)."
+        else
+            log " - amneziawg module is loaded."
+        fi
+    else
+        # WARN, not ok=0: userspace installs (amneziawg-go, LXC) never have
+        # the module, and a broken kernel path already fails service/interface.
+        log_warn " - amneziawg module is not loaded (normal for userspace mode)."
+    fi
+
     log "UFW rules:"
     if command -v ufw &>/dev/null; then
-        if ! ufw status | grep -qw "${port}/udp"; then
-            log_warn " - UFW rule for ${port}/udp not found!"
-        else
+        local _ufw_st
+        _ufw_st=$(ufw status 2>/dev/null | head -1)
+        [[ "$_ufw_st" == "Status: active" ]] && _c_ufw_active=true
+        if [[ "$port" -eq 0 ]]; then
+            # The port could not be determined above - grepping for "0/udp" would give a false warning.
+            log_warn " - Port not determined, UFW rule check skipped."
+        elif [[ "$_c_ufw_active" != true ]]; then
+            # Inactive UFW used to masquerade as "rule not found": grepping the
+            # inactive status output missed the port and blamed the wrong thing.
+            log_warn " - UFW is not active (${_ufw_st:-no status})."
+        elif ufw status 2>/dev/null | grep -qE "^${port}/udp[[:space:]]+ALLOW"; then
+            # Strict pattern from diagnose: specifically ALLOW, not any mention
+            # of the port (the old grep -qw did not tell ALLOW from DENY).
+            _c_allowed=true
             log " - UFW rule for ${port}/udp is present."
+        else
+            log_warn " - UFW rule for ${port}/udp not found!"
         fi
     else
         log_warn " - UFW is not installed."
@@ -990,6 +1588,13 @@ check_server() {
         else
             log_warn " - AWG 2.0 obfuscation parameters not detected"
         fi
+    fi
+
+    if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        local _c_clients _jok=false
+        _c_clients=$(grep -c '^\[Peer\]' "$SERVER_CONF_FILE" 2>/dev/null) || _c_clients=0
+        [[ "$ok" -eq 1 ]] && _jok=true
+        json_out "{\"command\":\"check\",\"ok\":$_jok,\"service\":{\"unit\":\"awg-quick@awg0\",\"active\":$_c_svc_active},\"interface\":{\"name\":\"awg0\",\"present\":$_c_present,\"mtu\":$_c_mtu,\"addresses\":[$_c_addrs]},\"port\":{\"number\":$port,\"proto\":\"udp\",\"listening\":$_c_listen},\"module\":{\"loaded\":$_c_mod,\"version\":$([[ -n "$_c_mod_ver" ]] && printf '"%s"' "$(json_escape "$_c_mod_ver")" || printf 'null')},\"clients\":{\"total\":$_c_clients},\"firewall\":{\"ufw_active\":$_c_ufw_active,\"port_allowed\":$_c_allowed}}"
     fi
 
     if [[ "$ok" -eq 1 ]]; then
@@ -1056,7 +1661,16 @@ diagnose_server() {
 
     # 1. Kernel module
     if lsmod 2>/dev/null | awk '$1 == "amneziawg" {f=1} END {exit !f}'; then
-        _diag_line OK "Kernel module amneziawg loaded"; ok=$((ok+1))
+        local _d_mod_ver
+        _d_mod_ver=$(awg_module_version)
+        if [[ "$_d_mod_ver" == 3.* ]]; then
+            _diag_line OK "Kernel module amneziawg loaded (AmneziaWG 3.0, $_d_mod_ver)"
+        elif [[ -n "$_d_mod_ver" ]]; then
+            _diag_line OK "Kernel module amneziawg loaded ($_d_mod_ver)"
+        else
+            _diag_line OK "Kernel module amneziawg loaded"
+        fi
+        ok=$((ok+1))
     else
         _diag_line FAIL "Kernel module amneziawg NOT loaded"
         echo "        Fix: sudo bash $0 repair-module"
@@ -1104,13 +1718,30 @@ diagnose_server() {
     fi
 
     # 6. UFW state + AWG port
-    # shellcheck source=/dev/null
     safe_load_config "$CONFIG_FILE" 2>/dev/null
-    local awg_port="${AWG_PORT:-39743}"
+    # The port is taken without a default: substituting 39743 and reporting on
+    # it would mean asserting a port the config does not hold. It also stops the
+    # raw value reaching the regex below, where '.*' matched any rule.
+    local awg_port
+    awg_port=$(_sanitize_port "${AWG_PORT:-}")
     if command -v ufw &>/dev/null; then
         local ufw_st
         ufw_st=$(ufw status 2>/dev/null | head -1)
-        if [[ "$ufw_st" == "Status: active" ]]; then
+        if [[ "$awg_port" -eq 0 ]]; then
+            # The firewall state is named here too: it is a separate finding and
+            # must not be lost because the port is broken.
+            local _ufw_state_txt="UFW active"
+            [[ "$ufw_st" == "Status: active" ]] || _ufw_state_txt="UFW not active ($ufw_st)"
+            if [[ -n "${AWG_PORT:-}" ]]; then
+                local _bad_port="${AWG_PORT:0:32}"
+                _bad_port="${_bad_port//[^[:print:]]/?}"
+                _diag_line FAIL "${_ufw_state_txt}; the port in the config is invalid ('${_bad_port}'), rule not checked"
+                fail=$((fail+1))
+            else
+                _diag_line WARN "${_ufw_state_txt}; no port found in the config, rule not checked"
+                warn=$((warn+1))
+            fi
+        elif [[ "$ufw_st" == "Status: active" ]]; then
             if ufw status 2>/dev/null | grep -qE "^${awg_port}/udp[[:space:]]+ALLOW"; then
                 _diag_line OK "UFW active, ${awg_port}/udp ALLOW"; ok=$((ok+1))
             else
@@ -1129,12 +1760,13 @@ diagnose_server() {
     peer_count=$(awg show awg0 peers 2>/dev/null | wc -l)
     _diag_line INFO "Peers configured: $peer_count"
 
-    # 8. AWG params snapshot
-    local jc jmin jmax i1
-    jc=$(awg show awg0 2>/dev/null   | awk '/^[[:space:]]*jc:/   {print $2; exit}')
-    jmin=$(awg show awg0 2>/dev/null | awk '/^[[:space:]]*jmin:/ {print $2; exit}')
-    jmax=$(awg show awg0 2>/dev/null | awk '/^[[:space:]]*jmax:/ {print $2; exit}')
-    i1=$(awg show awg0 2>/dev/null   | awk -F': ' '/^[[:space:]]*i1:/ {print $2; exit}')
+    # 8. AWG params snapshot (one awg show call instead of four)
+    local _awg_show jc jmin jmax i1
+    _awg_show=$(awg show awg0 2>/dev/null)
+    jc=$(awk '/^[[:space:]]*jc:/   {print $2; exit}' <<< "$_awg_show")
+    jmin=$(awk '/^[[:space:]]*jmin:/ {print $2; exit}' <<< "$_awg_show")
+    jmax=$(awk '/^[[:space:]]*jmax:/ {print $2; exit}' <<< "$_awg_show")
+    i1=$(awk -F': ' '/^[[:space:]]*i1:/ {print $2; exit}' <<< "$_awg_show")
     _diag_line INFO "AWG params: Jc=${jc:-?} Jmin=${jmin:-?} Jmax=${jmax:-?} I1=${i1:-absent}"
 
     # 9. Carrier comparison
@@ -1228,7 +1860,7 @@ list_clients() {
     clients=$(grep '^#_Name = ' "$SERVER_CONF_FILE" | sed 's/^#_Name = //' | sort) || clients=""
     if [[ -z "$clients" ]]; then
         if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-            echo "[]"
+            json_out "[]"
         else
             log "No clients found."
         fi
@@ -1349,12 +1981,19 @@ list_clients() {
             fi
         fi
 
-        # Expiry info
+        # Expiry info: table output only (JSON does not print it - a wasted
+        # file read per client). Accept only a numeric timestamp: a corrupted
+        # expiry file would throw a bash arithmetic error from
+        # format_remaining straight into the table.
         local exp_str=""
-        local exp_ts
-        exp_ts=$(get_client_expiry "$name" 2>/dev/null)
-        if [[ -n "$exp_ts" ]]; then
-            exp_str=" [$(format_remaining "$exp_ts")]"
+        if [[ "$JSON_OUTPUT" -ne 1 ]]; then
+            local exp_ts
+            exp_ts=$(get_client_expiry "$name" 2>/dev/null)
+            if [[ "$exp_ts" =~ ^[0-9]+$ ]]; then
+                exp_str=" [$(format_remaining "$exp_ts")]"
+            elif [[ -n "$exp_ts" ]]; then
+                exp_str=" [expiry corrupted]"
+            fi
         fi
 
         if [[ "$JSON_OUTPUT" -eq 1 ]]; then
@@ -1375,7 +2014,8 @@ list_clients() {
     done <<< "$clients"
 
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-        ( IFS=","; echo "[${json_entries[*]}]" )
+        _jarr=$(IFS=","; echo "[${json_entries[*]}]")
+        json_out "$_jarr"
     else
         echo ""
         log "Total clients: $tot, Active/Recent: $act"
@@ -1386,16 +2026,9 @@ list_clients() {
 # Traffic statistics
 # ==============================================================================
 
-# Escape string for safe JSON inclusion
-json_escape() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
-}
+# json_escape is defined in the JSON helpers block at the top of the file
+# (moved in v5.21.0: the EXIT guard calls it on any early exit, so the
+# definition must precede the trap installation).
 
 # Format bytes to human-readable
 format_bytes() {
@@ -1417,7 +2050,7 @@ stats_clients() {
     clients=$(grep '^#_Name = ' "$SERVER_CONF_FILE" | sed 's/^#_Name = //' | sort) || clients=""
     if [[ -z "$clients" ]]; then
         if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-            echo "[]"
+            json_out "[]"
         else
             log "No clients found."
         fi
@@ -1449,12 +2082,25 @@ stats_clients() {
     local json_entries=()
     local table_rows=()
     local total_rx=0 total_tx=0
+    # date +%s once before the loop (instead of a subprocess per peer);
+    # one-second snapshot precision is enough for active/recent statuses.
+    local _stats_now
+    _stats_now=$(date +%s)
 
     # awg show dump: each peer line = pubkey psk endpoint allowed-ips latest-handshake rx tx keepalive
     # shellcheck disable=SC2034
     while IFS=$'\t' read -r pk psk ep aips handshake rx tx keepalive; do
         local cname="${pk_to_name[$pk]:-unknown}"
         if [[ "$cname" == "unknown" ]]; then continue; fi
+
+        # awg show dump is kernel-utility output, but the values must reach JSON
+        # and arithmetic as canonical decimal numbers. The regex demands exactly
+        # that (0, or no leading zero): "08" would pass ^[0-9]+$ yet produce
+        # invalid JSON ("rx":08) and an octal error in $((...)). Anything else
+        # (non-numeric, a broken dump line like a[$(...)]) is zeroed too.
+        [[ "$rx" =~ ^(0|[1-9][0-9]*)$ ]] || rx=0
+        [[ "$tx" =~ ^(0|[1-9][0-9]*)$ ]] || tx=0
+        [[ "$handshake" =~ ^(0|[1-9][0-9]*)$ ]] || handshake=0
 
         local ip="-"
         if [[ -f "$AWG_DIR/${cname}.conf" ]]; then
@@ -1464,9 +2110,7 @@ stats_clients() {
         local hs_str="never"
         local status="Inactive" status_code="inactive"
         if [[ "$handshake" =~ ^[0-9]+$ && "$handshake" -gt 0 ]]; then
-            local now
-            now=$(date +%s)
-            local diff=$((now - handshake))
+            local diff=$((_stats_now - handshake))
             if [[ $diff -lt 180 ]]; then
                 status="Active"; status_code="active"
             elif [[ $diff -lt 86400 ]]; then
@@ -1489,7 +2133,8 @@ stats_clients() {
     done < <(echo "$awg_dump" | tail -n +2)
 
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-        ( IFS=","; echo "[${json_entries[*]}]" )
+        _jarr=$(IFS=","; echo "[${json_entries[*]}]")
+        json_out "$_jarr"
     else
         log "Client traffic statistics:"
         echo ""
@@ -1513,6 +2158,14 @@ usage() {
     # -> stderr + exit 1. Explicit-help callers pass 0, error callers omit the
     # argument (get 1).
     local _rc="${1:-1}"
+    if [[ "$_rc" -ne 0 && "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        # --json + usage error: the bot has no use for help text, and the
+        # exec >&2 below would hijack stdout away from the emergency JSON
+        # guard (exec moves the fd for the whole process, and the guard
+        # fires LATER, on EXIT). The cause is already on stderr.
+        _JSON_ERR="${_JSON_ERR:-invalid usage (unknown option or command)}"
+        exit "$_rc"
+    fi
     [[ "$_rc" -ne 0 ]] && exec >&2
     echo ""
     echo "AmneziaWG 2.0 management script (v${SCRIPT_VERSION})"
@@ -1523,12 +2176,15 @@ usage() {
     echo "  -h, --help            Show this help"
     echo "  -v, --verbose         Verbose output (for list command)"
     echo "  --no-color            Disable colored output"
-    echo "  --json                Machine-readable JSON output (for list / stats)"
+    echo "  --json                Machine-readable JSON output (most commands; details in ADVANCED.en.md)"
+    echo "                        ENV AWG_STRICT_CONFIRM=1: non-TTY run without --yes is refused (rc 1)"
     echo "  --expires=DURATION    Expiry time for add (1h, 12h, 1d, 7d, 30d, 4w)"
     echo "  --conf-dir=PATH       Specify AWG directory (default: $AWG_DIR)"
     echo "  --server-conf=PATH    Specify server config file"
     echo "  --apply-mode=MODE     syncconf (default) or restart (bypass kernel panic)"
     echo "  --psk                 (add only) generate a PresharedKey for the new client"
+    echo "  --reset-routes        (regen only) reset client AllowedIPs to the current"
+    echo "                        global routing mode (Issue #170)"
     echo "  --yes                 Skip confirm prompts (equivalent to ENV AWG_YES=1)"
     echo "  --carrier=NAME        (diagnose only) compare AWG params against carrier profile"
     echo "                        Available: beeline_msk yota_msk tele2_msk tele2_krasnoyarsk"
@@ -1540,7 +2196,7 @@ usage() {
     echo "  remove <name> [name2 ...]    Remove client(s)"
     echo "  list [-v] [--json]    List clients (--json: machine-readable, includes client_ipv6)"
     echo "  stats [--json]        Client traffic statistics"
-    echo "  regen [name]          Regenerate client file(s)"
+    echo "  regen [name ...] [--reset-routes]  Regenerate client file(s), multiple names allowed"
     echo "  modify <name> <p> <v> Modify a client parameter"
     echo "  backup                Create a backup"
     echo "  restore [file]        Restore from backup"
@@ -1550,7 +2206,7 @@ usage() {
     echo "  restart               Restart AmneziaWG service"
     echo "  upstream <action>     Manage the cascade (role=entry):"
     echo "                        show | up | down | restart | apply"
-    echo "  repair-module         Repair the kernel module after a kernel upgrade"
+    echo "  repair-module         Repair the kernel module after a kernel upgrade (alias: repair)"
     echo "                        (dkms autoinstall + modprobe + start awg-quick)"
     echo "  help                  Show this help"
     echo ""
@@ -1568,17 +2224,33 @@ if [[ "$COMMAND" == "help" ]]; then
     usage "$HELP_EXIT_RC"
 fi
 
-check_dependencies || exit 1
+check_dependencies || { _JSON_ERR="missing dependencies (diagnostics in stderr)"; exit 1; }
 cd "$AWG_DIR" || die "Failed to change to $AWG_DIR"
 
 # Preload role and upstream fields from config (for restart/upstream/check).
-# load_awg_params inside generate_client/regenerate_client re-reads the same
-# values — preloading here is harmless for the early dispatcher branches.
-if [[ -f "$CONFIG_FILE" ]]; then
-    safe_load_config "$CONFIG_FILE" 2>/dev/null || true
+# Hard resets prevent sudo -E from selecting a unit through the environment. A
+# separate strict pass distinguishes legacy absence from explicit corruption or
+# duplicates; the shared whitelist parser then loads the remaining settings.
+AWG_ROLE=""
+AWG_UPSTREAM_IFACE=""
+if ! _manage_load_topology_strict "$CONFIG_FILE"; then
+    die "${_MANAGE_TOPOLOGY_ERROR:-Could not safely read topology from $CONFIG_FILE}"
 fi
-AWG_ROLE="${AWG_ROLE:-single}"
-AWG_UPSTREAM_IFACE="${AWG_UPSTREAM_IFACE:-awg1}"
+safe_load_config "$CONFIG_FILE" 2>/dev/null \
+    || die "Could not load settings from $CONFIG_FILE."
+AWG_ROLE="$_MANAGE_CONFIG_ROLE"
+AWG_UPSTREAM_IFACE="$_MANAGE_CONFIG_UPSTREAM_IFACE"
+# safe_load_config also reads AWG_APPLY_MODE; explicit CLI must retain
+# precedence over the saved init value regardless of argument order.
+[[ -n "${_CLI_APPLY_MODE:-}" ]] && AWG_APPLY_MODE="$_CLI_APPLY_MODE"
+case "$AWG_ROLE" in
+    single|exit|entry) ;;
+    *) die "Invalid AWG_ROLE='$AWG_ROLE' in $CONFIG_FILE." ;;
+esac
+if ! [[ "$AWG_UPSTREAM_IFACE" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] \
+   || [[ "$AWG_UPSTREAM_IFACE" == "awg0" ]]; then
+    die "Invalid AWG_UPSTREAM_IFACE='$AWG_UPSTREAM_IFACE' in $CONFIG_FILE."
+fi
 
 log "Running command '$COMMAND'..."
 _cmd_rc=0
@@ -1592,8 +2264,14 @@ case $COMMAND in
         # AWG_SKIP_APPLY=1 (offline/batch edit without apply): skip the module check —
         # apply_config will no-op anyway, and the command must work on a dev machine.
         if [[ "${AWG_SKIP_APPLY:-0}" != "1" ]]; then
-            ensure_amneziawg_kernel_module \
-                || die "amneziawg kernel module unavailable. Run 'manage repair-module' and try again."
+            # rc=2 (module OK, service did not start) does not block add: the
+            # config gets written and apply_config reports the failure itself.
+            ensure_amneziawg_kernel_module; _mod_rc=$?
+            if [[ "$_mod_rc" -eq 1 ]]; then
+                die "amneziawg kernel module unavailable. Run 'manage repair-module' and try again."
+            elif [[ "$_mod_rc" -eq 2 ]]; then
+                log_warn "awg-quick@awg0 service is not active - the config will be written but may not be applied."
+            fi
         fi
 
         # --psk: enable optional PresharedKey for every new client.
@@ -1611,15 +2289,21 @@ case $COMMAND in
         # quietly became permanent. A bad format now aborts before any change.
         if [[ -n "$EXPIRES_DURATION" ]]; then
             parse_duration "$EXPIRES_DURATION" >/dev/null \
-                || die "Invalid --expires='$EXPIRES_DURATION'. Use: 1h, 12h, 1d, 7d, 4w."
+                || die "Invalid --expires='$EXPIRES_DURATION'. Use: 1h, 12h, 1d, 7d, 30d, 4w."
         fi
 
         _added=0
+        _jr=()
         for _cname in "${ARGS[@]}"; do
-            validate_client_name "$_cname" || { _cmd_rc=1; continue; }
+            validate_client_name "$_cname" || { _cmd_rc=1; _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"invalid_name\"}"); continue; }
 
             if grep -qxF "#_Name = ${_cname}" "$SERVER_CONF_FILE"; then
+                # _cmd_rc=1 - parity with remove ("No clients to remove") and
+                # regen ("not found, skipping"): a no-op for this name must be
+                # distinguishable via the exit code for automation (Issue #175).
                 log_warn "Client '$_cname' already exists, skipping."
+                _cmd_rc=1
+                _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"exists\"}")
                 continue
             fi
 
@@ -1629,10 +2313,22 @@ case $COMMAND in
                 export CLIENT_PSK="auto"
             fi
 
+            # Stale artifacts of a same-named client from the past (the QR
+            # may not regenerate if qrencode disappeared): without cleanup the
+            # [[ -f ]] checks below would report someone else's old file as
+            # fresh - both in the log and in JSON.
+            rm -f "$AWG_DIR/${_cname}.png" "$AWG_DIR/${_cname}.vpnuri" "$AWG_DIR/${_cname}.vpnuri.png"
+
             log "Adding '$_cname'..."
             if generate_client "$_cname"; then
                 log "Client '$_cname' added."
-                log "Files: $AWG_DIR/${_cname}.conf, $AWG_DIR/${_cname}.png"
+                # Mention .png only if the QR was actually created (qrencode
+                # may be absent) - symmetric to the .vpnuri check below.
+                if [[ -f "$AWG_DIR/${_cname}.png" ]]; then
+                    log "Files: $AWG_DIR/${_cname}.conf, $AWG_DIR/${_cname}.png"
+                else
+                    log "Files: $AWG_DIR/${_cname}.conf"
+                fi
                 if [[ -f "$AWG_DIR/${_cname}.vpnuri" ]]; then
                     log "vpn:// URI: $AWG_DIR/${_cname}.vpnuri"
                 fi
@@ -1649,23 +2345,42 @@ case $COMMAND in
                     fi
                 fi
                 ((_added++))
+                # JSON success entry: qr/vpnuri are paths if the file really
+                # exists at response time (generate_client reports success
+                # even when QR/URI failed); expires_at is epoch or null.
+                _jqr="null"; _juri="null"; _jexp="null"
+                [[ -f "$AWG_DIR/${_cname}.png" ]] && _jqr="\"$(json_escape "$AWG_DIR/${_cname}.png")\""
+                [[ -f "$AWG_DIR/${_cname}.vpnuri" ]] && _juri="\"$(json_escape "$AWG_DIR/${_cname}.vpnuri")\""
+                if [[ -n "$EXPIRES_DURATION" ]]; then
+                    _jexp_val=$(get_client_expiry "$_cname" 2>/dev/null) || _jexp_val=""
+                    [[ "$_jexp_val" =~ ^[0-9]+$ ]] && _jexp="$_jexp_val"
+                fi
+                _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"created\",\"conf\":\"$(json_escape "$AWG_DIR/${_cname}.conf")\",\"qr\":$_jqr,\"vpnuri\":$_juri,\"expires_at\":$_jexp}")
             else
                 log_error "Error adding client '$_cname'."
                 _cmd_rc=1
+                _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"error\"}")
             fi
         done
 
+        _japplied=false
         if [[ $_added -gt 0 ]]; then
-            [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
             if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
                 apply_config
                 log "Clients added: $_added. Apply deferred (AWG_SKIP_APPLY=1)."
             elif apply_config; then
+                _japplied=true
                 log "Clients added: $_added. Configuration applied."
             else
                 log_error "Clients added: $_added, but apply_config failed. Config written but NOT applied to live interface. Check: systemctl status awg-quick@awg0"
                 _cmd_rc=1
             fi
+        fi
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jrj=""
+            [[ ${#_jr[@]} -gt 0 ]] && _jrj=$(IFS=,; printf '%s' "${_jr[*]}")
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            json_out "{\"command\":\"add\",\"ok\":$_jok,\"added\":$_added,\"failed\":$(( ${#ARGS[@]} - _added )),\"applied\":$_japplied,\"results\":[$_jrj]}"
         fi
         # Hygiene: do not let CLIENT_PSK leak into later operations
         unset CLIENT_PSK
@@ -1676,10 +2391,16 @@ case $COMMAND in
 
         # Validate all names before removing
         _valid_names=()
+        _jr=()
         for _rname in "${ARGS[@]}"; do
-            validate_client_name "$_rname" || { _cmd_rc=1; continue; }
+            validate_client_name "$_rname" || { _cmd_rc=1; _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"invalid_name\"}"); continue; }
             if ! grep -qxF "#_Name = ${_rname}" "$SERVER_CONF_FILE"; then
+                # _cmd_rc=1 (v5.21.0): a partial not-found used to give rc 0 -
+                # asymmetric with add (exists -> rc 1) and regen (not-found ->
+                # rc 1). Spec 3.4: 'remove a ghost' = partial success = rc 1.
                 log_warn "Client '$_rname' not found, skipping."
+                _cmd_rc=1
+                _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"not_found\"}")
                 continue
             fi
             _valid_names+=("$_rname")
@@ -1700,8 +2421,14 @@ case $COMMAND in
             # AWG_SKIP_APPLY=1 (offline/batch edit without apply): skip the module check —
             # apply_config will no-op anyway, and the command must work on a dev machine.
             if [[ "${AWG_SKIP_APPLY:-0}" != "1" ]]; then
-                ensure_amneziawg_kernel_module \
-                    || die "amneziawg kernel module unavailable. Run 'manage repair-module' and try again."
+                # rc=2 (module OK, service did not start) does not block remove -
+                # symmetric with add: apply_config reports the failure itself.
+                ensure_amneziawg_kernel_module; _mod_rc=$?
+                if [[ "$_mod_rc" -eq 1 ]]; then
+                    die "amneziawg kernel module unavailable. Run 'manage repair-module' and try again."
+                elif [[ "$_mod_rc" -eq 2 ]]; then
+                    log_warn "awg-quick@awg0 service is not active - the config will be written but may not be applied."
+                fi
             fi
 
             _removed=0
@@ -1712,24 +2439,33 @@ case $COMMAND in
                     remove_client_expiry "$_rname"
                     log "Client '$_rname' removed."
                     ((_removed++))
+                    _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"removed\"}")
                 else
                     log_error "Error removing '$_rname'."
                     _cmd_rc=1
+                    _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"error\"}")
                 fi
             done
 
+            _japplied=false
             if [[ $_removed -gt 0 ]]; then
-                [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
                 if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
                     apply_config
                     log "Clients removed: $_removed. Apply deferred (AWG_SKIP_APPLY=1)."
                 elif apply_config; then
+                    _japplied=true
                     log "Clients removed: $_removed. Configuration applied."
                 else
                     log_error "Clients removed: $_removed, but apply_config failed. Peers removed from config but may still be present on live interface. Check: systemctl status awg-quick@awg0"
                     _cmd_rc=1
                 fi
             fi
+        fi
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jrj=""
+            [[ ${#_jr[@]} -gt 0 ]] && _jrj=$(IFS=,; printf '%s' "${_jr[*]}")
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            json_out "{\"command\":\"remove\",\"ok\":$_jok,\"removed\":${_removed:-0},\"failed\":$(( ${#ARGS[@]} - ${_removed:-0} )),\"applied\":${_japplied:-false},\"results\":[$_jrj]}"
         fi
         ;;
 
@@ -1743,17 +2479,39 @@ case $COMMAND in
 
     regen)
         log "Regenerating config and QR files..."
+        # Editing AWG_* in awgsetup_cfg.init after the install does not reach
+        # clients (awg0.conf is the source of truth). That used to be silent (#196).
+        warn_awg_init_drift
+        # --reset-routes (Issue #170): pass the flag to regenerate_client via
+        # ENV - a regular regen preserves per-client AllowedIPs, with the flag
+        # every client gets the global routing mode from awgsetup_cfg.init.
+        if [[ "${CLI_RESET_ROUTES:-0}" == "1" ]]; then
+            export AWG_REGEN_RESET_ROUTES=1
+            log "AllowedIPs of all regenerated clients will be reset to the global routing mode (--reset-routes)."
+        fi
+        _jr=()
+        _regen_count=0
+        _regen_total=0
         if [[ ${#ARGS[@]} -eq 0 ]]; then
             # No arguments — regenerate all clients (preserves prior behaviour).
             all_clients=$(grep '^#_Name = ' "$SERVER_CONF_FILE" | sed 's/^#_Name = //')
             if [[ -z "$all_clients" ]]; then
+                # Empty list is a regular no-op: rc 0, regenerated=0 in JSON.
                 log "No clients found."
             else
                 while IFS= read -r cname; do
                     cname="${cname## }"; cname="${cname%% }"
                     [[ -z "$cname" ]] && continue
+                    _regen_total=$((_regen_total + 1))
                     log "Regenerating '$cname'..."
-                    regenerate_client "$cname" || { log_warn "Regeneration error '$cname'"; _cmd_rc=1; }
+                    if regenerate_client "$cname"; then
+                        _regen_count=$((_regen_count + 1))
+                        _jr+=("$(_regen_json_entry "$cname")")
+                    else
+                        log_warn "Regeneration error '$cname'"
+                        _cmd_rc=1
+                        _jr+=("{\"name\":\"$(json_escape "$cname")\",\"status\":\"error\"}")
+                    fi
                 done <<< "$all_clients"
                 log "Regeneration completed."
             fi
@@ -1761,43 +2519,86 @@ case $COMMAND in
             # With arguments — process each name individually (parity with add/remove).
             # Until v5.11.5 only $CLIENT_NAME (=ARGS[0]) was read here, the rest were
             # silently dropped (Issue #70).
-            _regen_count=0
+            _regen_total=${#ARGS[@]}
             for _cname in "${ARGS[@]}"; do
-                validate_client_name "$_cname" || { _cmd_rc=1; continue; }
+                validate_client_name "$_cname" || { _cmd_rc=1; _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"invalid_name\"}"); continue; }
                 if ! grep -qxF "#_Name = ${_cname}" "$SERVER_CONF_FILE"; then
                     log_warn "Client '$_cname' not found, skipping."
                     _cmd_rc=1
+                    _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"not_found\"}")
                     continue
                 fi
                 log "Regenerating '$_cname'..."
                 if regenerate_client "$_cname"; then
                     _regen_count=$((_regen_count + 1))
+                    _jr+=("$(_regen_json_entry "$_cname")")
                 else
                     log_error "Regeneration error '$_cname'."
                     _cmd_rc=1
+                    _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"error\"}")
                 fi
             done
             if [[ $_regen_count -gt 0 ]]; then
                 log "Regeneration completed. Processed: $_regen_count of ${#ARGS[@]}."
             fi
         fi
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jrj=""
+            [[ ${#_jr[@]} -gt 0 ]] && _jrj=$(IFS=,; printf '%s' "${_jr[*]}")
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            _jreset=false; [[ "${CLI_RESET_ROUTES:-0}" == "1" ]] && _jreset=true
+            # regen does not change server state (keys and IPs are reused,
+            # no apply needed) - the envelope has no applied field on purpose.
+            json_out "{\"command\":\"regen\",\"ok\":$_jok,\"regenerated\":$_regen_count,\"failed\":$(( _regen_total - _regen_count )),\"reset_routes\":$_jreset,\"results\":[$_jrj]}"
+        fi
         ;;
 
     modify)
         [[ -z "$CLIENT_NAME" ]] && die "Client name not specified."
-        validate_client_name "$CLIENT_NAME" || exit 1
-        modify_client "$CLIENT_NAME" "$PARAM" "$VALUE" || _cmd_rc=1
+        validate_client_name "$CLIENT_NAME" || { _JSON_ERR="invalid client name"; exit 1; }
+        if modify_client "$CLIENT_NAME" "$PARAM" "$VALUE"; then
+            # modify edits ONLY the client config (DNS/MTU/AllowedIPs/...):
+            # server state does not change, no apply needed - the envelope has
+            # no applied field on purpose (symmetry with regen).
+            json_out "{\"command\":\"modify\",\"ok\":true,\"name\":\"$(json_escape "$CLIENT_NAME")\",\"param\":\"$(json_escape "$PARAM")\",\"value\":\"$(json_escape "$VALUE")\"}"
+        else
+            _cmd_rc=1
+        fi
         ;;
 
     backup)
-        backup_configs || _cmd_rc=1
+        if backup_configs; then
+            _jsize=null
+            if [[ -n "${LAST_BACKUP_PATH:-}" && -f "$LAST_BACKUP_PATH" ]]; then
+                _jsize=$(stat -c%s "$LAST_BACKUP_PATH" 2>/dev/null) || _jsize=null
+            fi
+            json_out "{\"command\":\"backup\",\"ok\":true,\"path\":\"$(json_escape "${LAST_BACKUP_PATH:-}")\",\"size_bytes\":$_jsize}"
+        else
+            _cmd_rc=1
+        fi
         ;;
 
     restore)
-        restore_backup "$CLIENT_NAME" || _cmd_rc=1 # CLIENT_NAME is used as [file]
+        if restore_backup "$CLIENT_NAME"; then # CLIENT_NAME is used as [file]
+            _jclients=$(grep -c '^\[Peer\]' "$SERVER_CONF_FILE" 2>/dev/null) || _jclients=0
+            _jkeys=false
+            [[ -n "$(find "$KEYS_DIR" -maxdepth 1 -name '*.private' -print -quit 2>/dev/null)" ]] && _jkeys=true
+            # clients = number of [Peer] blocks in the RESTORED server config
+            # (spec 3.3: not files in clients/ - those can diverge).
+            json_out "{\"command\":\"restore\",\"ok\":true,\"source\":\"$(json_escape "${_RESTORE_SOURCE:-}")\",\"applied\":true,\"rolled_back\":false,\"restored\":{\"server_conf\":true,\"clients\":$_jclients,\"keys\":$_jkeys}}"
+        else
+            _cmd_rc=1
+            # Envelope on failure too: the bot needs to know whether a rollback
+            # happened. error is human-readable text; decide by ok/rc.
+            if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+                _jrb=false; [[ "${_RESTORE_ROLLED_BACK:-0}" == "1" ]] && _jrb=true
+                json_out "{\"command\":\"restore\",\"ok\":false,\"error\":\"$(json_escape "${_JSON_ERR:-restore failed (see stderr)}")\",\"source\":\"$(json_escape "${_RESTORE_SOURCE:-}")\",\"applied\":false,\"rolled_back\":$_jrb,\"rc\":1}"
+            fi
+        fi
         ;;
 
     check|status)
+        warn_awg_init_drift
         check_server || _cmd_rc=1
         ;;
 
@@ -1808,29 +2609,75 @@ case $COMMAND in
 
     restart)
         log "Restarting service..."
+        # Warn BEFORE confirm_action: with --yes/AWG_YES=1 there is no prompt, and
+        # a non-interactive run can cut you off from the server just as well.
+        awg_warn_interface_disruption
         if ! confirm_action "restart" "service"; then exit 1; fi
         # Verify kernel module is loaded before systemctl restart (mode=module-only —
         # the restart below starts the unit explicitly, so an extra start from ensure
         # would be redundant).
         ensure_amneziawg_kernel_module module-only \
             || die "amneziawg kernel module unavailable. Run 'manage repair-module' and try again."
-        if ! systemctl restart awg-quick@awg0; then
-            log_error "Restart error."
-            status_out=$(systemctl status awg-quick@awg0 --no-pager 2>&1) || true
-            while IFS= read -r line; do log_error "  $line"; done <<< "$status_out"
-            exit 1
-        else
-            log "Service restarted."
-        fi
+        _jactive=false
+        _jupactive=null
+        _restart_main=1
         if [[ "$AWG_ROLE" == "entry" ]]; then
+            # On an entry node awg0 Requires the upstream unit. Restarting that
+            # required unit can stop the dependent awg0, so support always goes
+            # first and the main interface is started only after support succeeds.
             log "Restarting upstream interface ${AWG_UPSTREAM_IFACE}..."
             if ! systemctl restart "awg-quick@${AWG_UPSTREAM_IFACE}"; then
-                log_warn "Failed to restart ${AWG_UPSTREAM_IFACE}. Clients may lose internet."
+                _JSON_ERR="upstream restart failed"
+                log_error "Failed to restart ${AWG_UPSTREAM_IFACE}; awg0 is being left down (fail-closed)."
                 _cmd_rc=1
+                _restart_main=0
+                if ! _ensure_awg0_down; then
+                    _JSON_ERR="upstream restart failed; awg0 could not be stopped"
+                    log_error "Fail-closed shutdown is incomplete: the live awg0 interface is still present."
+                fi
             else
                 log "Upstream ${AWG_UPSTREAM_IFACE} restarted."
             fi
+            _jupactive=false
+            _manage_iface_is_healthy "$AWG_UPSTREAM_IFACE" && _jupactive=true
+            if [[ "$_jupactive" != "true" ]]; then
+                _JSON_ERR="upstream inactive after restart"
+                log_error "Upstream ${AWG_UPSTREAM_IFACE} is inactive after restart; awg0 will not be started."
+                _cmd_rc=1
+                _restart_main=0
+                if ! _ensure_awg0_down; then
+                    _JSON_ERR="upstream inactive after restart; awg0 could not be stopped"
+                    log_error "Fail-closed shutdown is incomplete: the live awg0 interface is still present."
+                fi
+            fi
         fi
+        if [[ "$_restart_main" -eq 1 ]]; then
+            if ! systemctl restart awg-quick@awg0; then
+                _JSON_ERR="service restart failed"
+                log_error "Failed to restart awg0."
+                status_out=$(systemctl status awg-quick@awg0 --no-pager 2>&1) || true
+                while IFS= read -r line; do log_error "  $line"; done <<< "$status_out"
+                _cmd_rc=1
+            fi
+        fi
+        if _manage_iface_is_healthy awg0; then
+            _jactive=true
+            if [[ "$_restart_main" -eq 1 && "$_cmd_rc" -eq 0 ]]; then
+                # Only a confirmed unit+link postcondition proves that the live
+                # interface caught up with the config. Otherwise the snapshot
+                # could hide a later warning about a removed device parameter.
+                awg_record_device_params
+                log "awg0 service restarted."
+            fi
+        else
+            if [[ "$_restart_main" -eq 1 && "$_cmd_rc" -eq 0 ]]; then
+                _JSON_ERR="service inactive after restart"
+                log_error "awg0 is inactive after a successful systemctl restart."
+            fi
+            _cmd_rc=1
+        fi
+        _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+        json_out "{\"command\":\"restart\",\"ok\":$_jok,\"unit\":\"awg-quick@awg0\",\"active\":$_jactive,\"upstream_active\":$_jupactive}"
         ;;
 
     upstream)
@@ -1846,28 +2693,136 @@ case $COMMAND in
             case "$_up_action" in
                 show|status)
                     log "Upstream ${AWG_UPSTREAM_IFACE} status:"
-                    awg show "${AWG_UPSTREAM_IFACE}" 2>/dev/null || log_warn "awg show ${AWG_UPSTREAM_IFACE}: interface not up?"
+                    _up_show=$(awg show "${AWG_UPSTREAM_IFACE}" 2>/dev/null) || _up_show=""
+                    if [[ -n "$_up_show" ]]; then
+                        while IFS= read -r _ln; do log "  $_ln"; done <<< "$_up_show"
+                    else
+                        log_warn "awg show ${AWG_UPSTREAM_IFACE}: interface not up?"
+                    fi
                     systemctl status "$_up" --no-pager 2>&1 | while IFS= read -r _ln; do log "  $_ln"; done
                     ;;
-                up|start)
-                    if systemctl start "$_up"; then log "${AWG_UPSTREAM_IFACE} started."; else log_error "Failed to start ${AWG_UPSTREAM_IFACE}."; _cmd_rc=1; fi
+                up|start|restart)
+                    # Requires= ties awg0 to the support unit: restarting upstream
+                    # normally stops the dependent awg0. Snapshot systemd and the
+                    # live link separately: a legacy interface may be up manually.
+                    _main_was_active=0
+                    _main_was_link=0
+                    systemctl is-active --quiet awg-quick@awg0 2>/dev/null && _main_was_active=1
+                    _manage_iface_link_present awg0 && _main_was_link=1
+                    _support_ok=0
+                    if [[ "$_up_action" == "restart" ]]; then
+                        awg_warn_interface_disruption
+                        if ! confirm_action "restart" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
+                        if systemctl restart "$_up"; then
+                            log "${AWG_UPSTREAM_IFACE} restarted."
+                            _support_ok=1
+                        else
+                            log_error "Failed to restart ${AWG_UPSTREAM_IFACE}."
+                        fi
+                    elif systemctl start "$_up"; then
+                        log "${AWG_UPSTREAM_IFACE} started."
+                        _support_ok=1
+                    else
+                        log_error "Failed to start ${AWG_UPSTREAM_IFACE}."
+                    fi
+                    if [[ "$_support_ok" -eq 1 ]] \
+                       && ! _manage_iface_is_healthy "$AWG_UPSTREAM_IFACE"; then
+                        log_error "${AWG_UPSTREAM_IFACE} is inactive after ${_up_action}."
+                        _support_ok=0
+                    fi
+                    if [[ "$_support_ok" -eq 0 ]]; then
+                        _JSON_ERR="upstream ${_up_action} failed"
+                        if ! _ensure_awg0_down; then
+                            _JSON_ERR="upstream ${_up_action} failed; awg0 could not be stopped"
+                            log_error "Fail-closed shutdown is incomplete: the live awg0 interface is still present."
+                        fi
+                        _cmd_rc=1
+                    elif [[ "$_main_was_active" -eq 1 || "$_main_was_link" -eq 1 ]]; then
+                        log "Restoring awg0 after successful upstream ${_up_action}..."
+                        if _restore_awg0_state "$_main_was_active" "$_main_was_link"; then
+                            awg_record_device_params
+                            log "awg0 is active."
+                        else
+                            _JSON_ERR="awg0 restore after upstream failed"
+                            log_error "Failed to restore the previous awg0 state after upstream ${_up_action}; enforcing a fail-closed stop."
+                            _ensure_awg0_down || log_error "Fail-closed shutdown is incomplete: awg0 is still active."
+                            _cmd_rc=1
+                        fi
+                    fi
                     ;;
                 down|stop)
                     if ! confirm_action "stop" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
-                    if systemctl stop "$_up"; then log "${AWG_UPSTREAM_IFACE} stopped."; else log_error "Failed to stop."; _cmd_rc=1; fi
-                    ;;
-                restart)
-                    if systemctl restart "$_up"; then log "${AWG_UPSTREAM_IFACE} restarted."; else log_error "Failed to restart."; _cmd_rc=1; fi
+                    # Client egress is invalid without upstream. Stop awg0 first
+                    # (including a manually raised legacy link), then verify both
+                    # systemd and the live link. If awg0 cannot be removed, do NOT
+                    # touch upstream: that would leave a live client interface
+                    # without its mandatory egress.
+                    _main_down_ok=1
+                    if _ensure_awg0_down; then
+                        log "awg0 stopped with upstream (fail-closed)."
+                    else
+                        _main_down_ok=0
+                        _JSON_ERR="awg0 could not be stopped before upstream"
+                        log_error "Upstream ${AWG_UPSTREAM_IFACE} was kept active because awg0 is still running."
+                        _cmd_rc=1
+                    fi
+                    if [[ "$_main_down_ok" -eq 1 ]]; then
+                        if _ensure_upstream_down; then
+                            log "${AWG_UPSTREAM_IFACE} stopped."
+                        else
+                            _JSON_ERR="upstream could not be stopped"
+                            log_error "${AWG_UPSTREAM_IFACE} is still active after the stop attempt."
+                            _cmd_rc=1
+                        fi
+                    fi
                     ;;
                 apply)
-                    apply_config "${AWG_UPSTREAM_IFACE}" || { log_error "apply_config ${AWG_UPSTREAM_IFACE} failed."; _cmd_rc=1; }
+                    # syncconf is normally seamless, but its fallback and
+                    # --apply-mode=restart restart the required unit and may
+                    # stop awg0. Restore only a previously active main unit,
+                    # and only after upstream is verified active.
+                    awg_warn_interface_disruption
+                    if ! confirm_action "apply config to" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
+                    _main_was_active=0
+                    _main_was_link=0
+                    systemctl is-active --quiet awg-quick@awg0 2>/dev/null && _main_was_active=1
+                    _manage_iface_link_present awg0 && _main_was_link=1
+                    if apply_config "${AWG_UPSTREAM_IFACE}" \
+                       && _manage_iface_is_healthy "$AWG_UPSTREAM_IFACE"; then
+                        if [[ "$_main_was_active" -eq 1 || "$_main_was_link" -eq 1 ]]; then
+                            if _restore_awg0_state "$_main_was_active" "$_main_was_link"; then
+                                awg_record_device_params
+                                log "Restored awg0 after applying the upstream configuration."
+                            else
+                                _JSON_ERR="awg0 restore after upstream apply failed"
+                                log_error "Upstream was applied, but awg0 could not be restored."
+                                _ensure_awg0_down || log_error "Fail-closed shutdown is incomplete: awg0 is still active."
+                                _cmd_rc=1
+                            fi
+                        fi
+                    else
+                        _JSON_ERR="upstream apply failed"
+                        log_error "apply_config ${AWG_UPSTREAM_IFACE} failed or upstream is inactive."
+                        if ! _ensure_awg0_down; then
+                            _JSON_ERR="upstream apply failed; awg0 could not be stopped"
+                            log_error "Fail-closed shutdown is incomplete: the live awg0 interface is still present."
+                        fi
+                        _cmd_rc=1
+                    fi
                     ;;
                 *)
                     log_error "Unknown upstream action: '$_up_action'. Allowed: show, up, down, restart, apply."
+                    _JSON_ERR="unknown upstream action"
                     _cmd_rc=1
                     ;;
             esac
         fi
+        _jupactive=false
+        _jmainactive=false
+        _manage_iface_is_live "$AWG_UPSTREAM_IFACE" && _jupactive=true
+        _manage_iface_is_live awg0 && _jmainactive=true
+        _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+        json_out "{\"command\":\"upstream\",\"action\":\"$(json_escape "${_up_action:-${CLIENT_NAME:-show}}")\",\"ok\":$_jok,\"interface\":\"$(json_escape "$AWG_UPSTREAM_IFACE")\",\"upstream_active\":$_jupactive,\"awg0_active\":$_jmainactive}"
         ;;
 
     repair-module|repair)
@@ -1875,11 +2830,30 @@ case $COMMAND in
         # need a DKMS rebuild. Allow apt-installing kernel headers here
         # (AWG_ALLOW_APT_IN_ENSURE=1) — the user explicitly requested repair.
         log "Repairing amneziawg kernel module (may take up to 5 minutes — DKMS rebuild)..."
-        if AWG_ALLOW_APT_IN_ENSURE=1 ensure_amneziawg_kernel_module full; then
-            log "amneziawg kernel module repaired, awg-quick@awg0 service is active."
-        else
-            log_error "Could not repair the kernel module. See log above; manual recovery may be required."
-            _cmd_rc=1
+        AWG_ALLOW_APT_IN_ENSURE=1 ensure_amneziawg_kernel_module full; _mod_rc=$?
+        _jmod=true; _jsvc=false
+        case "$_mod_rc" in
+            0)
+                _jsvc=true
+                log "amneziawg kernel module repaired, awg-quick@awg0 service is active."
+                ;;
+            2)
+                # Previously this case masqueraded as success: "service is
+                # active" + exit 0 while the service was down (Issue #175).
+                log_error "The kernel module is fine, but the awg-quick@awg0 service did NOT start."
+                log_error "Diagnostics: systemctl status awg-quick@awg0; journalctl -u awg-quick@awg0 -n 50"
+                _cmd_rc=1
+                ;;
+            *)
+                _jmod=false
+                log_error "Could not repair the kernel module. See log above; manual recovery may be required."
+                _cmd_rc=1
+                ;;
+        esac
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            # rc here = ensure_amneziawg_kernel_module code (0/1/2), not the exit code.
+            json_out "{\"command\":\"repair-module\",\"ok\":$_jok,\"module_loaded\":$_jmod,\"service_active\":$_jsvc,\"rc\":$_mod_rc}"
         fi
         ;;
 
@@ -1887,9 +2861,9 @@ case $COMMAND in
         diagnose_server || _cmd_rc=1
         ;;
 
-    help)
-        usage
-        ;;
+    # No help) branch here on purpose: every path that sets COMMAND="help"
+    # (-h/--help, unknown option, positional help) is intercepted BEFORE the
+    # dispatcher by the early `usage` (which terminates the process via exit).
 
     *)
         log_error "Unknown command: '$COMMAND'"

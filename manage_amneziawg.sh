@@ -8,14 +8,14 @@ fi
 # ==============================================================================
 # Скрипт для управления пользователями (пирами) AmneziaWG 2.0
 # Автор: @bivlked
-# Версия: 5.15.6
-# Дата: 2026-06-08
+# Версия: 5.28.1
+# Дата: 2026-08-27
 # Репозиторий: https://github.com/bivlked/amneziawg-installer
 # ==============================================================================
 
 # --- Безопасный режим и Константы ---
 # shellcheck disable=SC2034
-SCRIPT_VERSION="5.15.6"
+SCRIPT_VERSION="5.28.1"
 set -o pipefail
 AWG_DIR="/root/awg"
 SERVER_CONF_FILE="/etc/amnezia/amneziawg/awg0.conf"
@@ -37,11 +37,15 @@ CLI_CARRIER=""
 # orphan /tmp/tmp.XXXX (audit).
 _manage_temp_dirs=()
 
-manage_mktempdir() {
-    local d
-    d=$(mktemp -d) || return 1
-    _manage_temp_dirs+=("$d")
-    echo "$d"
+# Путь пишем в переменную по имени (printf -v), БЕЗ command substitution: при
+# td=$(manage_mktempdir) append в _manage_temp_dirs уходил в сабшелл и терялся,
+# а cleanup на INT/TERM/EXIT эти папки не удалял. Вызов:
+# manage_mktempdir_var td || die ...
+manage_mktempdir_var() {
+    local __rv="$1" __d
+    __d=$(mktemp -d) || return 1
+    _manage_temp_dirs+=("$__d")
+    printf -v "$__rv" '%s' "$__d"
 }
 
 _manage_cleaned=0
@@ -64,7 +68,114 @@ _manage_on_signal() {
     _manage_cleanup
     exit "$1"
 }
-trap _manage_cleanup EXIT
+
+# ==============================================================================
+# JSON-хелперы (v5.21.0)
+# ==============================================================================
+# Определены ДО установки EXIT-trap: _manage_on_exit зовёт _json_exit_guard,
+# а тот - json_escape. Ранний выход (ошибка опций) без этих определений дал бы
+# "command not found" вместо аварийного JSON.
+
+# Побайтовая замена невалидного UTF-8 на U+FFFD. Именно замена, не iconv -c:
+# молчаливая потеря байтов делает текст ошибки бессмысленным ровно тогда,
+# когда он нужнее всего. iconv печатает валидный префикс до первого битого
+# байта: префикс забираем, битый байт заменяем, хвост прогоняем снова.
+# Вызывается только когда валидация уже провалилась - на валидном входе цена 0.
+_json_utf8_sanitize() {
+    local s="$1" out="" prefix
+    local LC_ALL=C   # ${#} и ${:offset} должны считать БАЙТЫ, не символы
+    while [[ -n "$s" ]]; do
+        if printf '%s' "$s" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            out+="$s"
+            break
+        fi
+        # Сентинель X сохраняет хвостовые \n префикса ($() их режет).
+        prefix=$(printf '%s' "$s" | iconv -f UTF-8 -t UTF-8 2>/dev/null; printf X)
+        prefix="${prefix%X}"
+        out+="${prefix}"$'\xEF\xBF\xBD'
+        s="${s:$(( ${#prefix} + 1 ))}"
+    done
+    printf '%s' "$out"
+}
+
+# Экранирование строки для безопасного включения в JSON. Помимо базовых
+# \\ \" \n \r \t экранирует ВСЕ управляющие C0 (0x01-0x1F) как \u00XX - jq
+# отвергает сырой ESC/BEL (тот же класс, что ESC-баг vpn:// в v5.20.0), а
+# аварийный путь кормит сюда произвольный текст ошибок и пути из --conf-dir.
+# Битый UTF-8 -> U+FFFD. NUL не обрабатываем: bash-переменная его не донесёт.
+json_escape() {
+    local s="$1"
+    # Fork-free fast-path через printf %q: чистые строки (имена, IP, наши
+    # статус-литералы, включая валидную кириллицу) %q возвращает как есть -
+    # iconv-спавн не нужен (важно для list/stats: сотни вызовов за прогон).
+    # Битые байты и C0 %q ВСЕГДА квотит ($'...') -> уходят на iconv-проверку.
+    # Ложное срабатывание (пробелы/скобки) стоит одной дешёвой валидации.
+    # НЕ подходит как детектор сам по себе: сравнение длин символы==байты
+    # битый UTF-8 пропускает (каждый битый байт считается «символом»).
+    local _q
+    printf -v _q '%q' "$s"
+    if [[ "$_q" != "$s" ]] && command -v iconv >/dev/null 2>&1; then
+        if ! printf '%s' "$s" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            s=$(_json_utf8_sanitize "$s"; printf X)
+            s="${s%X}"
+        fi
+    fi
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    # Редкий путь: остальные C0 (после замен выше \n\r\t уже двухсимвольные).
+    if [[ "$s" =~ [[:cntrl:]] ]]; then
+        local _i _ch _u
+        for _i in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+            printf -v _ch "\\$(printf '%03o' "$_i")"
+            [[ "$s" == *"$_ch"* ]] || continue
+            printf -v _u '\\u%04x' "$_i"
+            s="${s//$_ch/$_u}"
+        done
+    fi
+    printf '%s' "$s"
+}
+
+# Единственная точка печати JSON в stdout. Правило контракта: при --json
+# stdout содержит РОВНО ОДИН JSON-документ, включая любой провал.
+_JSON_EMITTED=0
+_JSON_ERR=""
+json_out() {
+    [[ "${JSON_OUTPUT:-0}" -eq 1 ]] || return 0
+    [[ "$_JSON_EMITTED" -eq 1 ]] && return 0    # защита от двойной эмиссии
+    _JSON_EMITTED=1
+    printf '%s\n' "$1"
+}
+
+# Аварийная эмиссия на EXIT: любой путь выхода с rc!=0, не напечатавший свой
+# конверт (die, голый exit, отказ strict-confirm, сигнал, ошибка usage),
+# оставляет боту {"command","ok":false,"error","rc"} вместо пустого stdout.
+# rc приходит АРГУМЕНТОМ: guard зовётся из _manage_on_exit, и читать $? здесь
+# уже поздно. Поле error - человекочитаемый текст (может быть локализован),
+# машинные решения бот принимает по ok/rc/status.
+_json_exit_guard() {
+    local rc="$1"
+    [[ "${JSON_OUTPUT:-0}" -eq 1 && "$_JSON_EMITTED" -eq 0 && "$rc" -ne 0 ]] || return 0
+    # show/diagnose вне JSON-контракта (--json задокументированно не поддержан):
+    # их человеческий вывод уже ушёл в stdout, аварийный объект сверху дал бы
+    # смешанный поток вместо "ровно одного документа".
+    case "${COMMAND:-}" in show|diagnose) return 0 ;; esac
+    json_out "{\"command\":\"$(json_escape "${COMMAND:-}")\",\"ok\":false,\"error\":\"$(json_escape "${_JSON_ERR:-command failed}")\",\"rc\":$rc}"
+}
+
+# ЕДИНСТВЕННЫЙ обработчик EXIT. Guard живёт здесь, а НЕ внутри идемпотентного
+# _manage_cleanup: сигнальный путь зовёт cleanup напрямую (в тот момент $? ещё
+# не 130/143 - guard соврал бы rc), а повторный вызов cleanup на EXIT упирается
+# в _manage_cleaned=1 (guard после этой проверки не выполнился бы вовсе).
+# Здесь же rc честный на всех путях, включая exit 130/143 из сигнальных хуков.
+_manage_on_exit() {
+    local rc=$?
+    _json_exit_guard "$rc"
+    _manage_cleanup
+}
+trap _manage_on_exit EXIT
 trap '_manage_on_signal 130' INT
 trap '_manage_on_signal 143' TERM
 
@@ -81,11 +192,17 @@ while [[ $# -gt 0 ]]; do
         --expires=*)       EXPIRES_DURATION="${1#*=}"; shift ;;
         --conf-dir=*)      AWG_DIR="${1#*=}"; shift ;;
         --server-conf=*)   SERVER_CONF_FILE="${1#*=}"; shift ;;
-        --apply-mode=*)    _CLI_APPLY_MODE="${1#*=}"; export AWG_APPLY_MODE="$_CLI_APPLY_MODE"; shift ;;
+        --apply-mode=*)
+            # Только запоминаем; валидация - ПОСЛЕ цикла (см. ниже): внутри
+            # цикла --json мог быть ещё не разобран ('add x --apply-mode=bad
+            # --json'), и аварийный JSON-guard молчал бы при ошибке здесь.
+            _CLI_APPLY_MODE="${1#*=}"
+            shift ;;
         --psk)             CLI_ADD_PSK=1; shift ;;
+        --reset-routes)    CLI_RESET_ROUTES=1; shift ;;
         --yes)             CLI_YES=1; shift ;;
         --carrier=*)       CLI_CARRIER="${1#*=}"; shift ;;
-        --*)               echo "Неизвестная опция: $1" >&2; COMMAND="help"; HELP_EXIT_RC=1; break ;;
+        --*)               echo "Неизвестная опция: $1" >&2; for _rest in "$@"; do [[ "$_rest" == "--json" ]] && JSON_OUTPUT=1; done; COMMAND="help"; HELP_EXIT_RC=1; break ;;
         *)
             if [[ -z "$COMMAND" ]]; then
                 COMMAND=$1
@@ -98,6 +215,27 @@ done
 CLIENT_NAME="${ARGS[0]}"
 PARAM="${ARGS[1]}"
 VALUE="${ARGS[2]}"
+
+# Канонизация алиасов (контракт 3.2): бот не должен разбирать, как его набрали.
+# Диспетчер ниже матчит оба написания, поэтому канонизация безопасна и для
+# человеческого пути.
+case "$COMMAND" in
+    status) COMMAND="check" ;;
+    repair) COMMAND="repair-module" ;;
+esac
+
+# Валидация --apply-mode после разбора ВСЕХ опций (--json уже известен).
+# Опечатка (--apply-mode=restrat) молча работала бы как syncconf - пользователь,
+# обходящий проблему режимом restart, не узнал бы, что режим не применился.
+if [[ -n "${_CLI_APPLY_MODE:-}" ]]; then
+    case "$_CLI_APPLY_MODE" in
+        syncconf|restart) export AWG_APPLY_MODE="$_CLI_APPLY_MODE" ;;
+        *)
+            _JSON_ERR="Недопустимое значение --apply-mode: '$_CLI_APPLY_MODE' (ожидается: syncconf или restart)"
+            echo "$_JSON_ERR" >&2
+            exit 1 ;;
+    esac
+fi
 
 # Обновляем пути после возможного переопределения --conf-dir
 CONFIG_FILE="$AWG_DIR/awgsetup_cfg.init"
@@ -136,7 +274,7 @@ log_msg() {
     if [[ "$type" == "ERROR" || "$type" == "WARN" ]]; then
         printf "${color_start}%s${color_end}\n" "$entry" >&2
     elif [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
-        # weaq P2: в режиме --json stdout обязан содержать ТОЛЬКО JSON (jq/automation).
+        # В режиме --json stdout обязан содержать ТОЛЬКО JSON (jq/automation).
         # INFO/DEBUG уводим в stderr, иначе list/show/stats --json печатают INFO-строки
         # перед JSON и ломают парсинг (подтверждено на biHetzner).
         printf "${color_start}%s${color_end}\n" "$entry" >&2
@@ -149,7 +287,9 @@ log()       { log_msg "INFO" "$1"; }
 log_warn()  { log_msg "WARN" "$1"; }
 log_error() { log_msg "ERROR" "$1"; }
 log_debug() { if [[ "$VERBOSE_LIST" -eq 1 ]]; then log_msg "DEBUG" "$1"; fi; }
-die()       { log_error "$1"; exit 1; }
+# die дублирует сообщение в _JSON_ERR: аварийный JSON guard-а несёт
+# осмысленный текст вместо дефолтного "command failed".
+die()       { _JSON_ERR="$1"; log_error "$1"; exit 1; }
 
 # ==============================================================================
 # Утилиты
@@ -167,18 +307,285 @@ escape_sed() {
     printf '%s' "$s"
 }
 
+# Root запускает manage с полными правами, поэтому CLI-пути нельзя проверять
+# одним `-f`: он следует по symlink и позволяет подложить awg_common.sh для
+# `source`. Проверка ниже выполняется ДО первой записи в LOG_FILE и ДО source.
+# Для непривилегированных тестовых запусков она намеренно no-op: реальная
+# защита нужна на границе повышения привилегий, а fixtures живут в mktemp.
+_manage_root_node_trusted() {
+    local path="$1" kind="$2" meta owner mode group_digit other_digit
+    [[ -n "$path" && ! -L "$path" ]] || return 1
+    case "$kind" in
+        dir)  [[ -d "$path" ]] || return 1 ;;
+        file) [[ -f "$path" ]] || return 1 ;;
+        *) return 1 ;;
+    esac
+    meta=$(stat -c '%u %a' -- "$path" 2>/dev/null) || return 1
+    read -r owner mode <<< "$meta"
+    [[ "$owner" == "0" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    group_digit="${mode: -2:1}"
+    other_digit="${mode: -1}"
+    (( (10#$group_digit & 2) == 0 && (10#$other_digit & 2) == 0 ))
+}
+
+_manage_root_parent_chain_trusted() {
+    local path="$1" parent rest current="/" part
+    local -a parts=()
+    [[ "$path" == /* && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
+    case "/${path#/}/" in
+        *"/../"*|*"/./"*) return 1 ;;
+    esac
+    parent="${path%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    _manage_root_node_trusted / dir || return 1
+    rest="${parent#/}"
+    IFS='/' read -r -a parts <<< "$rest"
+    for part in "${parts[@]}"; do
+        [[ -z "$part" ]] && continue
+        current="${current%/}/$part"
+        _manage_root_node_trusted "$current" dir || return 1
+    done
+}
+
+_manage_root_file_trusted() {
+    local path="$1"
+    _manage_root_parent_chain_trusted "$path" \
+        && _manage_root_node_trusted "$path" file
+}
+
+_manage_root_dir_trusted() {
+    local path="$1"
+    [[ "$path" != "/" ]] \
+        && _manage_root_parent_chain_trusted "$path" \
+        && _manage_root_node_trusted "$path" dir
+}
+
+_manage_root_file_or_missing_trusted() {
+    local path="$1"
+    _manage_root_parent_chain_trusted "$path" || return 1
+    if [[ -e "$path" || -L "$path" ]]; then
+        _manage_root_node_trusted "$path" file || return 1
+    fi
+    return 0
+}
+
+_manage_validate_privileged_paths() {
+    _MANAGE_PATH_ERROR=""
+    (( EUID == 0 )) || return 0
+    if ! _manage_root_dir_trusted "$AWG_DIR"; then
+        _MANAGE_PATH_ERROR="Недоверенная директория --conf-dir: $AWG_DIR"
+    elif ! _manage_root_file_trusted "$CONFIG_FILE"; then
+        _MANAGE_PATH_ERROR="Недоверенный файл конфигурации: $CONFIG_FILE"
+    elif ! _manage_root_file_trusted "$COMMON_SCRIPT_PATH"; then
+        _MANAGE_PATH_ERROR="Недоверенная общая библиотека: $COMMON_SCRIPT_PATH"
+    elif ! _manage_root_file_trusted "$SERVER_CONF_FILE"; then
+        _MANAGE_PATH_ERROR="Недоверенный --server-conf: $SERVER_CONF_FILE"
+    elif ! _manage_root_file_or_missing_trusted "$LOG_FILE"; then
+        _MANAGE_PATH_ERROR="Недоверенный путь журнала: $LOG_FILE"
+    else
+        return 0
+    fi
+    return 1
+}
+
+# Читаем только топологические поля, не исполняя init. Честное отсутствие
+# AWG_ROLE остаётся legacy-compatible single; явная битая/дублированная строка
+# уже не может тихо переключить entry-ноду в single. Для старого entry-формата
+# отсутствие AWG_UPSTREAM_IFACE означает исторический awg1.
+_manage_unquote_scalar() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "$value" == \'* ]]; then
+        [[ ${#value} -ge 2 && "$value" == *\' ]] || return 1
+        value="${value#\'}"; value="${value%\'}"
+        [[ "$value" != *\'* ]] || return 1
+    elif [[ "$value" == \"* ]]; then
+        [[ ${#value} -ge 2 && "$value" == *\" ]] || return 1
+        value="${value#\"}"; value="${value%\"}"
+        [[ "$value" != *\"* ]] || return 1
+    fi
+    printf '%s' "$value"
+}
+
+_manage_load_topology_strict() {
+    local file="$1" line key raw value first_line=1
+    local role="single" iface="awg1" role_seen=0 iface_seen=0
+    _MANAGE_TOPOLOGY_ERROR=""
+    [[ -f "$file" && ! -L "$file" ]] || {
+        _MANAGE_TOPOLOGY_ERROR="init-файл отсутствует или является symlink: $file"
+        return 1
+    }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$first_line" -eq 1 ]]; then
+            line="${line#$'\xEF\xBB\xBF'}"
+            first_line=0
+        fi
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*# || "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(AWG_ROLE|AWG_UPSTREAM_IFACE)[[:space:]]*=(.*)$ ]]; then
+            key="${BASH_REMATCH[2]}"
+            raw="${BASH_REMATCH[3]}"
+            value=$(_manage_unquote_scalar "$raw") || {
+                _MANAGE_TOPOLOGY_ERROR="Некорректное quoted-значение $key в $file"
+                return 1
+            }
+            case "$key" in
+                AWG_ROLE)
+                    ((role_seen += 1))
+                    (( role_seen == 1 )) || {
+                        _MANAGE_TOPOLOGY_ERROR="AWG_ROLE продублирован в $file"
+                        return 1
+                    }
+                    role="$value"
+                    ;;
+                AWG_UPSTREAM_IFACE)
+                    ((iface_seen += 1))
+                    (( iface_seen == 1 )) || {
+                        _MANAGE_TOPOLOGY_ERROR="AWG_UPSTREAM_IFACE продублирован в $file"
+                        return 1
+                    }
+                    iface="$value"
+                    ;;
+            esac
+        elif [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?AWG_(ROLE|UPSTREAM_IFACE)([^A-Za-z0-9_]|$) ]]; then
+            _MANAGE_TOPOLOGY_ERROR="Некорректная строка роли/upstream в $file: $line"
+            return 1
+        fi
+    done < "$file"
+    case "$role" in
+        single|exit|entry) ;;
+        *) _MANAGE_TOPOLOGY_ERROR="Некорректный AWG_ROLE='$role' в $file"; return 1 ;;
+    esac
+    if ! [[ "$iface" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] || [[ "$iface" == "awg0" ]]; then
+        _MANAGE_TOPOLOGY_ERROR="Некорректный AWG_UPSTREAM_IFACE='$iface' в $file"
+        return 1
+    fi
+    _MANAGE_CONFIG_ROLE="$role"
+    _MANAGE_CONFIG_UPSTREAM_IFACE="$iface"
+    return 0
+}
+
+_manage_iface_link_present() {
+    local iface="$1"
+    ip link show dev "$iface" >/dev/null 2>&1
+}
+
+_manage_iface_is_live() {
+    local iface="$1"
+    systemctl is-active --quiet "awg-quick@${iface}" 2>/dev/null \
+        || _manage_iface_link_present "$iface"
+}
+
+# Mutation success is stricter than status visibility: RemainAfterExit can
+# leave a unit active after its kernel link was removed manually.
+_manage_iface_is_healthy() {
+    local iface="$1"
+    systemctl is-active --quiet "awg-quick@${iface}" 2>/dev/null \
+        && _manage_iface_link_present "$iface"
+}
+
+_manage_quick_conf_trusted() {
+    local path="$1"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    (( EUID != 0 )) || _manage_root_file_trusted "$path"
+}
+
+_manage_quick_conf_matches_iface() {
+    local iface="$1" path="$2"
+    [[ "${path##*/}" == "${iface}.conf" ]]
+}
+
+_ensure_interface_down() {
+    local iface="$1" conf="$2" unit
+    unit="awg-quick@${iface}"
+    if ! systemctl stop "$unit" >/dev/null 2>&1; then
+        log_warn "systemctl не смог остановить $unit; проверяю live-интерфейс."
+    fi
+    if _manage_iface_link_present "$iface"; then
+        if ! _manage_quick_conf_matches_iface "$iface" "$conf"; then
+            log_error "Нельзя безопасно снять $iface через конфиг с другим basename: $conf"
+        elif ! _manage_quick_conf_trusted "$conf"; then
+            log_error "Нельзя безопасно снять live-интерфейс $iface: недоверенный конфиг $conf"
+        elif ! timeout 15 awg-quick down "$conf" >/dev/null 2>&1; then
+            log_error "awg-quick не смог снять live-интерфейс $iface."
+        fi
+    fi
+    if systemctl is-active --quiet "$unit" 2>/dev/null \
+       || _manage_iface_link_present "$iface"; then
+        log_error "$iface всё ещё активен после попытки остановки."
+        return 1
+    fi
+    return 0
+}
+
+_ensure_awg0_down() {
+    _ensure_interface_down awg0 "$SERVER_CONF_FILE"
+}
+
+_ensure_upstream_down() {
+    local conf
+    conf="$(dirname "$SERVER_CONF_FILE")/${AWG_UPSTREAM_IFACE}.conf"
+    _ensure_interface_down "$AWG_UPSTREAM_IFACE" "$conf"
+}
+
+_restore_awg0_state() {
+    local unit_was_active="$1" link_was_present="$2"
+    if [[ "$unit_was_active" -eq 1 ]]; then
+        if systemctl is-active --quiet awg-quick@awg0 2>/dev/null \
+           && _manage_iface_link_present awg0; then
+            return 0
+        fi
+        if systemctl is-active --quiet awg-quick@awg0 2>/dev/null; then
+            systemctl restart awg-quick@awg0 || return 1
+        else
+            systemctl start awg-quick@awg0 || return 1
+        fi
+        systemctl is-active --quiet awg-quick@awg0 2>/dev/null \
+            && _manage_iface_link_present awg0
+        return $?
+    fi
+    if [[ "$link_was_present" -eq 1 ]]; then
+        _manage_iface_link_present awg0 && return 0
+        _manage_quick_conf_matches_iface awg0 "$SERVER_CONF_FILE" || return 1
+        _manage_quick_conf_trusted "$SERVER_CONF_FILE" || return 1
+        if timeout 15 awg-quick up "$SERVER_CONF_FILE" >/dev/null 2>&1 \
+            && _manage_iface_link_present awg0; then
+            return 0
+        fi
+        # A failed postcondition must not strand a partially created link.
+        timeout 15 awg-quick down "$SERVER_CONF_FILE" >/dev/null 2>&1 || true
+        return 1
+    fi
+    return 0
+}
+
 confirm_action() {
     # CLI флаг --yes или ENV AWG_YES=1 пропускают confirm-prompt — для скриптов,
     # cron, Ansible и интерактивных вызовов где явно подтвердили заранее.
     if [[ "${CLI_YES:-0}" == "1" || "${AWG_YES:-0}" == "1" ]]; then
         return 0
     fi
-    if ! is_interactive; then return 0; fi
+    if ! is_interactive; then
+        # AWG_STRICT_CONFIRM=1 (opt-in, v5.21.0): неинтерактивный запуск без
+        # явного --yes/AWG_YES=1 отклоняется вместо тихого согласия - защита
+        # от destructive-команд из пайплайнов, где никто не смотрит на экран.
+        # Дефолт 0 сохраняет прежнее поведение; строго строка "1", не "true".
+        # ENV действует на один запуск и НЕ персистится в awgsetup_cfg.init.
+        if [[ "${AWG_STRICT_CONFIRM:-0}" == "1" ]]; then
+            _JSON_ERR="AWG_STRICT_CONFIRM=1: non-interactive run requires --yes"
+            log_error "AWG_STRICT_CONFIRM=1: неинтерактивный запуск требует --yes (или AWG_YES=1). Действие отменено."
+            return 1
+        fi
+        return 0
+    fi
     local action="$1" subject="$2"
     read -rp "Вы действительно хотите $action $subject? [y/N]: " confirm < /dev/tty
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    # Принимаем y/yes (регистронезависимо) + случайные пробелы/CR по краям.
+    if [[ "$confirm" =~ ^[[:space:]]*[Yy]([Ee][Ss])?[[:space:]]*$ ]]; then
         return 0
     else
+        _JSON_ERR="confirmation denied"
         log "Действие отменено."
         return 1
     fi
@@ -192,11 +599,53 @@ validate_client_name() {
     return 0
 }
 
+# JSON-запись успешной перегенерации (v5.21.0). qr/vpnuri - пути, если файл
+# существует на момент ответа (regenerate_client обновляет их best-effort;
+# гарантий свежести контракт не даёт - см. доку про гонки).
+_regen_json_entry() {
+    local name="$1" _jqr="null" _juri="null"
+    [[ -f "$AWG_DIR/${name}.png" ]] && _jqr="\"$(json_escape "$AWG_DIR/${name}.png")\""
+    [[ -f "$AWG_DIR/${name}.vpnuri" ]] && _juri="\"$(json_escape "$AWG_DIR/${name}.vpnuri")\""
+    printf '%s' "{\"name\":\"$(json_escape "$name")\",\"status\":\"regenerated\",\"conf\":\"$(json_escape "$AWG_DIR/${name}.conf")\",\"qr\":$_jqr,\"vpnuri\":$_juri}"
+}
+
 # ==============================================================================
 # Проверка зависимостей
 # ==============================================================================
 
+# Сверка совместимости awg_common.sh с этим скриптом. Файлы обновляются парой;
+# если обновили только один, рассинхрон иначе всплывает как "command not found"
+# в случайном месте (issue #183). Сверяем MAJOR.MINOR: расхождение в patch
+# допускаем (в пределах minor ломающих изменений в библиотеку не вносим), а вот
+# другой minor или библиотека без версии (старее этой проверки) = стоп.
+_check_common_compat() {
+    local have="${AWG_COMMON_VERSION:-}"
+    local want="$SCRIPT_VERSION"
+    # Сравниваем MAJOR и MINOR по отдельности как ЧИСЛА, а не через ${v%.*}
+    # (тот схлопывал бы "5.20" и "5.9" в "5"). Формат X.Y.* с числовыми X.Y
+    # обязателен: пустая/двухкомпонентная/нечисловая версия библиотеки не
+    # проходит и приводит к die. Хвост после MINOR (patch, -rc1) игнорируется.
+    local re='^([0-9]+)\.([0-9]+)\.'
+    if [[ "$have" =~ $re ]]; then
+        local have_mj="${BASH_REMATCH[1]}" have_mn="${BASH_REMATCH[2]}"
+        if [[ "$want" =~ $re ]]; then
+            [[ "$have_mj" == "${BASH_REMATCH[1]}" && "$have_mn" == "${BASH_REMATCH[2]}" ]] && return 0
+        fi
+    fi
+    die "awg_common.sh (${have:-без версии}) несовместима с manage_amneziawg.sh ($want). Обнови обе половины из одного Git-снимка (если клона нет — сначала выполни команду clone из README):
+  git -C /root/amneziawg-installer fetch origin feat/v3
+  git -C /root/amneziawg-installer checkout feat/v3
+  git -C /root/amneziawg-installer pull --ff-only origin feat/v3
+  install -m 700 /root/amneziawg-installer/manage_amneziawg.sh $AWG_DIR/manage_amneziawg.sh
+  install -m 700 /root/amneziawg-installer/awg_common.sh $COMMON_SCRIPT_PATH"
+}
+
 check_dependencies() {
+    if ! _manage_validate_privileged_paths; then
+        _JSON_ERR="${_MANAGE_PATH_ERROR:-Проверка доверия к путям не пройдена}"
+        printf 'ERROR: %s\n' "$_JSON_ERR" >&2
+        exit 1
+    fi
     log "Проверка зависимостей..."
     local ok=1
 
@@ -219,9 +668,14 @@ check_dependencies() {
     if ! command -v awg &>/dev/null; then die "'awg' не найден."; fi
     if ! command -v qrencode &>/dev/null; then log_warn "qrencode не найден (QR-коды не будут созданы)."; fi
 
-    # Подключаем общую библиотеку
+    # Подключаем общую библиотеку.
+    # Сбрасываем перед source, чтобы версию задавала ТОЛЬКО библиотека, а не
+    # унаследованное окружение (иначе старая библиотека без переменной могла бы
+    # ложно пройти проверку совместимости).
+    unset AWG_COMMON_VERSION
     # shellcheck source=/dev/null
     source "$COMMON_SCRIPT_PATH" || die "Ошибка загрузки $COMMON_SCRIPT_PATH"
+    _check_common_compat
 
     log "Зависимости OK."
 }
@@ -262,7 +716,7 @@ _backup_configs_nolock() {
     # backup'ах (например, regen → backup → modify → backup в одной секунде).
     ts=$(date +%F_%H-%M-%S.%3N)
     bf="$bd/awg_backup_${ts}.tar.gz"
-    td=$(manage_mktempdir) || die "Ошибка создания временной директории"
+    manage_mktempdir_var td || die "Ошибка создания временной директории"
 
     mkdir -p "$td/server" "$td/clients" "$td/keys"
 
@@ -377,8 +831,25 @@ backup_configs() {
         exec {backup_lock_fd}>&-
         return 1
     fi
+    # Дополнительно берём конфиг-лок: параллельный `manage add/remove` мог
+    # изменить awg0.conf/keys МЕЖДУ копированием server/ и clients/ в tmpdir -
+    # каждый файл в бэкапе цел (atomic mv), но набор рассинхронизирован
+    # (peer-mismatch при restore). restore_backup держит оба лока - бэкап
+    # должен делать так же. ВАЖНО: в restore _backup_configs_nolock вызывается
+    # под уже взятым конфиг-локом - здесь лок берётся только для прямой
+    # команды backup (flock non-reentrant, см. контракт в awg_common.sh).
+    local config_lockfile="${AWG_DIR}/.awg_config.lock"
+    local config_lock_fd
+    exec {config_lock_fd}>"$config_lockfile"
+    if ! flock -x -w 30 "$config_lock_fd"; then
+        log_error "Таймаут ожидания блокировки конфига (30 сек)."
+        exec {config_lock_fd}>&-
+        exec {backup_lock_fd}>&-
+        return 1
+    fi
     _backup_configs_nolock
     local _rc=$?
+    exec {config_lock_fd}>&-
     exec {backup_lock_fd}>&-
     return "$_rc"
 }
@@ -397,7 +868,7 @@ _restore_do_rollback() {
     fi
     log_warn "Откат к состоянию до restore ($(basename "$_snap"))..."
     local _rtd
-    _rtd=$(manage_mktempdir) || {
+    manage_mktempdir_var _rtd || {
         log_error "Не удалось создать tmpdir для отката. Ручное: tar -xzf $_snap -C /"
         return 1
     }
@@ -416,6 +887,9 @@ _restore_do_rollback() {
     [[ -d "$_rtd/expiry" ]] && { mkdir -p "${EXPIRY_DIR:-$AWG_DIR/expiry}"; cp -a "$_rtd/expiry"/* "${EXPIRY_DIR:-$AWG_DIR/expiry}/" 2>/dev/null; }
     [[ -f "$_rtd/awg-expiry" ]] && cp -a "$_rtd/awg-expiry" /etc/cron.d/awg-expiry 2>/dev/null
     rm -rf "$_rtd"
+    # Файлы отката скопированы - для JSON-конверта rolled_back=true даже если
+    # сервис ниже не стартует (состояние ФС уже возвращено к pre-restore).
+    _RESTORE_ROLLED_BACK=1
 
     log "Откат завершён — пытаюсь запустить сервис..."
     if systemctl start awg-quick@awg0; then
@@ -425,6 +899,15 @@ _restore_do_rollback() {
         log_error "Сервис не стартовал после отката — проверьте: systemctl status awg-quick@awg0"
         return 1
     fi
+}
+
+# Возвращает 0, если в пути есть '..' как ЦЕЛЫЙ компонент (parent traversal):
+# ровно "..", префикс "../", "/../" в середине или "/.." в конце. Подстрока
+# ".." внутри имени (my..backup.conf, v1..2) легитимна - прежний substring-чек
+# ложно отклонял такие файлы при restore чужих/модифицированных архивов.
+_path_has_parent_component() {
+    local p="$1"
+    [[ "$p" == ".." || "$p" == "../"* || "$p" == *"/../"* || "$p" == *"/.." ]]
 }
 
 restore_backup() {
@@ -460,6 +943,7 @@ restore_backup() {
     fi
 
     if [[ ! -f "$bf" ]]; then die "Файл бэкапа '$bf' не найден."; fi
+    _RESTORE_SOURCE="$bf"   # для JSON-конверта restore (v5.21.0)
     log "Восстановление из $bf"
     if ! confirm_action "восстановить" "конфигурацию из '$bf'"; then return 1; fi
 
@@ -542,7 +1026,7 @@ restore_backup() {
     # Фиксируем rollback snapshot (устанавливается _backup_configs_nolock)
     _rollback_snap="${LAST_BACKUP_PATH:-}"
 
-    td=$(manage_mktempdir) || {
+    manage_mktempdir_var td || {
         log_error "Ошибка создания временной директории"
         return 1
     }
@@ -553,7 +1037,8 @@ restore_backup() {
     # использовать path traversal (../), абсолютные пути, symlinks или device
     # файлы для перезаписи произвольных системных файлов при распаковке от root.
 
-    # Проверка типов через verbose listing: отклоняем block/char/FIFO/hardlink
+    # Проверка типов через verbose listing: отклоняем block/char/FIFO/symlink ('l')
+    # и hardlink ('h') - оба класса ссылок небезопасны при распаковке.
     local _tar_verbose _vline _tc
     _tar_verbose=$(tar -tvzf "$bf" 2>/dev/null) || {
         log_error "Не удалось прочитать содержимое архива $bf"
@@ -583,8 +1068,8 @@ restore_backup() {
             log_error "Архив содержит абсолютный путь: '$_bad_entry' — восстановление отменено."
             return 1
         fi
-        # Parent directory traversal
-        if [[ "$_bad_entry" == *..* ]]; then
+        # Parent directory traversal ('..' только как компонент пути)
+        if _path_has_parent_component "$_bad_entry"; then
             log_error "Архив содержит path traversal (..): '$_bad_entry' — восстановление отменено."
             return 1
         fi
@@ -701,7 +1186,8 @@ restore_backup() {
         log "Восстановление данных expiry..."
         mkdir -p "${EXPIRY_DIR:-$AWG_DIR/expiry}"
         # C11: expiry НЕ пруним намеренно. Orphan-метки для несуществующих клиентов
-        # безвредны (cron-чистка их игнорирует), а prune здесь был бы небезопасен:
+        # безвредны: check_expired_clients при истечении распознаёт отсутствие peer
+        # в конфиге и зачищает метку с артефактами сам. Prune здесь был бы небезопасен:
         # и rm, и последующий cp - best-effort (|| true), так что сбой copy после
         # prune молча оставил бы expiry пустым. Сами client-артефакты пруним выше.
         cp -a "$td/expiry/"* "${EXPIRY_DIR:-$AWG_DIR/expiry}/" 2>/dev/null || true
@@ -731,6 +1217,10 @@ restore_backup() {
 
     # Успех — rollback не нужен, trap выполнит только cleanup
     _restore_ok=1
+    # Восстановление подменило awg0.conf и пересоздало интерфейс, поэтому снимок
+    # набора device-параметров надо взять заново: он должен описывать то, что
+    # стоит на живом интерфейсе СЕЙЧАС, а не до восстановления.
+    awg_record_device_params
     log "Восстановление завершено."
     return 0
 }
@@ -881,17 +1371,50 @@ modify_client() {
     fi
     log "Бэкап: $bak"
 
+    # Списочные параметры приводим к каноническому "a, b, c" (D#38): установщик
+    # пишет их с пробелом после запятой, и modify не должен оставлять в конфиге
+    # второй, слипшийся вариант того же значения.
+    #
+    # 🔴 Проверка наличия функции обязательна. _check_common_compat сверяет
+    # только MAJOR.MINOR и осознанно пропускает расхождение в patch, а
+    # awg_normalize_csv появилась в патче 5.27.1. На полуобновлённом сервере
+    # (свежий manage рядом со старой библиотекой) вызов дал бы пустую строку,
+    # и она молча уехала бы в конфиг вместо списка маршрутов.
+    case "$param" in
+        AllowedIPs|DNS)
+            command -v awg_normalize_csv >/dev/null 2>&1 || {
+                log_error "awg_common.sh устарела: нет awg_normalize_csv. Обнови обе половины под одну версию."
+                exec {modify_lock_fd}>&-
+                return 1
+            }
+            local _norm
+            _norm=$(awg_normalize_csv "$value")
+            [[ -n "$_norm" ]] || {
+                log_error "Нормализация '$param' дала пустое значение - правка отменена."
+                exec {modify_lock_fd}>&-
+                return 1
+            }
+            value="$_norm"
+            log "Значение приведено к виду: $value"
+            ;;
+    esac
+
     local escaped_value
     escaped_value=$(escape_sed "$value")
     if ! sed -i "s#^${param}[[:space:]]*=[[:space:]]*.*#${param} = ${escaped_value}#" "$cf"; then
         log_error "Ошибка sed. Восстановление..."
-        cp "$bak" "$cf" || log_warn "Ошибка восстановления."
+        # После успешного отката .bak идентичен конфигу - удаляем, чтобы
+        # повторные неудачные modify не копили .bak-файлы в $AWG_DIR.
+        if cp "$bak" "$cf"; then rm -f "$bak"; else log_warn "Ошибка восстановления."; fi
         exec {modify_lock_fd}>&-
         return 1
     fi
-    if ! grep -q -E "^${param} = " "$cf"; then
+    # Требуем НЕПУСТОЕ значение: префиксная проверка пропускала строку вида
+    # "AllowedIPs = ", то есть обнуление настройки рапортовалось как успех, а
+    # бэкап при этом удалялся.
+    if ! grep -q -E "^${param} = .+" "$cf"; then
         log_error "Замена не выполнена для '$param'. Восстановление..."
-        cp "$bak" "$cf" || log_warn "Ошибка восстановления."
+        if cp "$bak" "$cf"; then rm -f "$bak"; else log_warn "Ошибка восстановления."; fi
         exec {modify_lock_fd}>&-
         return 1
     fi
@@ -919,29 +1442,62 @@ modify_client() {
 check_server() {
     log "Проверка состояния сервера AmneziaWG 2.0..."
     local ok=1
+    # Снимок для JSON-конверта (v5.21.0): собирается по ходу человеческих
+    # проверок, чтобы данные и вердикт шли из одного прогона.
+    local _c_svc_active=false _c_present=false _c_mtu=null _c_addrs=""
+    local _c_listen=false _c_mod=false _c_ufw_active=false _c_allowed=false
+    local _c_mod_ver=""
 
     log "Статус сервиса:"
-    if ! systemctl status awg-quick@awg0 --no-pager; then ok=0; fi
+    # В --json сырой вывод systemctl уходит в stderr: stdout занят контрактом.
+    if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        if ! systemctl status awg-quick@awg0 --no-pager >&2; then ok=0; fi
+    else
+        if ! systemctl status awg-quick@awg0 --no-pager; then ok=0; fi
+    fi
+    systemctl is-active --quiet awg-quick@awg0 2>/dev/null && _c_svc_active=true
 
     log "Интерфейс awg0:"
-    if ! ip addr show awg0 &>/dev/null; then
+    local _ip_out
+    if ! _ip_out=$(ip addr show awg0 2>/dev/null); then
         log_error " - Интерфейс не найден!"
         ok=0
     else
-        while IFS= read -r line; do log "  $line"; done < <(ip addr show awg0)
+        _c_present=true
+        while IFS= read -r line; do log "  $line"; done <<< "$_ip_out"
+        _c_mtu=$(sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p' <<< "$_ip_out" | head -n1)
+        [[ "$_c_mtu" =~ ^[0-9]+$ ]] || _c_mtu=null
+        local _a
+        while IFS= read -r _a; do
+            [[ -z "$_a" ]] && continue
+            _c_addrs+="${_c_addrs:+,}\"$(json_escape "$_a")\""
+        done < <(awk '/^[[:space:]]*inet6? /{print $2}' <<< "$_ip_out")
     fi
 
     log "Прослушивание порта:"
-    # shellcheck source=/dev/null
     safe_load_config "$CONFIG_FILE" 2>/dev/null
-    local port=${AWG_PORT:-0}
+    local port
+    port=$(_sanitize_port "${AWG_PORT:-}")
     if [[ "$port" -eq 0 ]]; then
-        log_warn " - Не удалось определить порт."
+        if [[ -n "${AWG_PORT:-}" ]]; then
+            # В конфиге что-то лежит, но портом это не является: файл повреждён,
+            # а не «настройка не задана». Молчать нельзя - для мониторинга это
+            # такая же поломка, как незапущенный сервис. Значение показываю
+            # обрезанным и без управляющих символов: строка там произвольная и
+            # может утащить с собой перевод строки или ESC-последовательность.
+            local _bad_port="${AWG_PORT:0:32}"
+            _bad_port="${_bad_port//[^[:print:]]/?}"
+            log_error " - Порт в конфиге некорректный: '${_bad_port}'."
+            ok=0
+        else
+            log_warn " - Не удалось определить порт."
+        fi
     else
         if ! ss -lunp | grep -q ":${port} "; then
             log_error " - Порт ${port}/udp НЕ прослушивается!"
             ok=0
         else
+            _c_listen=true
             log " - Порт ${port}/udp прослушивается."
         fi
     fi
@@ -956,12 +1512,46 @@ check_server() {
         log " - IP Forwarding включен."
     fi
 
+    log "Модуль ядра:"
+    # Паттерн из diagnose: точное имя модуля в первом столбце lsmod.
+    if lsmod 2>/dev/null | awk '$1 == "amneziawg" {f=1} END {exit !f}'; then
+        _c_mod=true
+        # Версия модуля: у линии 3.0 строка начинается с 3., у 2.0 - с 1.
+        # (имена тегов upstream исторически не совпадают с версией протокола,
+        #  поэтому печатаем сырое значение и не выводим протокол по догадке).
+        # awg_module_version спрашивает ЗАГРУЖЕННЫЙ модуль, а modinfo (файл на
+        # диске) оставляет вторым путём - см. пояснение у функции в awg_common.sh.
+        _c_mod_ver=$(awg_module_version)
+        if [[ -n "$_c_mod_ver" ]]; then
+            log " - Модуль amneziawg загружен (версия $_c_mod_ver)."
+        else
+            log " - Модуль amneziawg загружен."
+        fi
+    else
+        # WARN, не ok=0: на userspace-инсталляциях (amneziawg-go, LXC) модуля
+        # нет и не будет, а сломанный kernel-путь и так валит сервис/интерфейс.
+        log_warn " - Модуль amneziawg не загружен (для userspace-режима это норма)."
+    fi
+
     log "Правила UFW:"
     if command -v ufw &>/dev/null; then
-        if ! ufw status | grep -qw "${port}/udp"; then
-            log_warn " - Правило UFW для ${port}/udp не найдено!"
-        else
+        local _ufw_st
+        _ufw_st=$(ufw status 2>/dev/null | head -1)
+        [[ "$_ufw_st" == "Status: active" ]] && _c_ufw_active=true
+        if [[ "$port" -eq 0 ]]; then
+            # Порт не определился выше - grep по "0/udp" дал бы ложный warning.
+            log_warn " - Порт не определён, проверка правила UFW пропущена."
+        elif [[ "$_c_ufw_active" != true ]]; then
+            # Раньше inactive UFW маскировался под "правило не найдено":
+            # grep по выводу inactive-статуса не находил порт и ругался не на то.
+            log_warn " - UFW не активен (${_ufw_st:-нет статуса})."
+        elif ufw status 2>/dev/null | grep -qE "^${port}/udp[[:space:]]+ALLOW"; then
+            # Строгий паттерн из diagnose: именно ALLOW, а не любое упоминание
+            # порта (прежний grep -qw не отличал ALLOW от DENY).
+            _c_allowed=true
             log " - Правило UFW для ${port}/udp есть."
+        else
+            log_warn " - Правило UFW для ${port}/udp не найдено!"
         fi
     else
         log_warn " - UFW не установлен."
@@ -983,6 +1573,13 @@ check_server() {
         else
             log_warn " - AWG 2.0 параметры обфускации не обнаружены"
         fi
+    fi
+
+    if [[ "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        local _c_clients _jok=false
+        _c_clients=$(grep -c '^\[Peer\]' "$SERVER_CONF_FILE" 2>/dev/null) || _c_clients=0
+        [[ "$ok" -eq 1 ]] && _jok=true
+        json_out "{\"command\":\"check\",\"ok\":$_jok,\"service\":{\"unit\":\"awg-quick@awg0\",\"active\":$_c_svc_active},\"interface\":{\"name\":\"awg0\",\"present\":$_c_present,\"mtu\":$_c_mtu,\"addresses\":[$_c_addrs]},\"port\":{\"number\":$port,\"proto\":\"udp\",\"listening\":$_c_listen},\"module\":{\"loaded\":$_c_mod,\"version\":$([[ -n "$_c_mod_ver" ]] && printf '"%s"' "$(json_escape "$_c_mod_ver")" || printf 'null')},\"clients\":{\"total\":$_c_clients},\"firewall\":{\"ufw_active\":$_c_ufw_active,\"port_allowed\":$_c_allowed}}"
     fi
 
     if [[ "$ok" -eq 1 ]]; then
@@ -1049,7 +1646,16 @@ diagnose_server() {
 
     # 1. Kernel module
     if lsmod 2>/dev/null | awk '$1 == "amneziawg" {f=1} END {exit !f}'; then
-        _diag_line OK "Модуль ядра amneziawg загружен"; ok=$((ok+1))
+        local _d_mod_ver
+        _d_mod_ver=$(awg_module_version)
+        if [[ "$_d_mod_ver" == 3.* ]]; then
+            _diag_line OK "Модуль ядра amneziawg загружен (AmneziaWG 3.0, $_d_mod_ver)"
+        elif [[ -n "$_d_mod_ver" ]]; then
+            _diag_line OK "Модуль ядра amneziawg загружен ($_d_mod_ver)"
+        else
+            _diag_line OK "Модуль ядра amneziawg загружен"
+        fi
+        ok=$((ok+1))
     else
         _diag_line FAIL "Модуль ядра amneziawg НЕ загружен"
         echo "        Fix: sudo bash $0 repair-module"
@@ -1097,13 +1703,30 @@ diagnose_server() {
     fi
 
     # 6. UFW state + AWG port
-    # shellcheck source=/dev/null
     safe_load_config "$CONFIG_FILE" 2>/dev/null
-    local awg_port="${AWG_PORT:-39743}"
+    # Порт берётся без дефолта: подставить 39743 и отчитаться по нему значило бы
+    # утверждать про порт, которого в конфиге нет. Заодно значение больше не
+    # попадает сырым в regex ниже, где '.*' совпадал с любым правилом.
+    local awg_port
+    awg_port=$(_sanitize_port "${AWG_PORT:-}")
     if command -v ufw &>/dev/null; then
         local ufw_st
         ufw_st=$(ufw status 2>/dev/null | head -1)
-        if [[ "$ufw_st" == "Status: active" ]]; then
+        if [[ "$awg_port" -eq 0 ]]; then
+            # Состояние фаервола называю и здесь: это отдельная находка, и
+            # терять её из-за неисправного порта нельзя.
+            local _ufw_state_txt="UFW active"
+            [[ "$ufw_st" == "Status: active" ]] || _ufw_state_txt="UFW не active ($ufw_st)"
+            if [[ -n "${AWG_PORT:-}" ]]; then
+                local _bad_port="${AWG_PORT:0:32}"
+                _bad_port="${_bad_port//[^[:print:]]/?}"
+                _diag_line FAIL "${_ufw_state_txt}; порт в конфиге некорректный ('${_bad_port}'), правило не проверено"
+                fail=$((fail+1))
+            else
+                _diag_line WARN "${_ufw_state_txt}; порт в конфиге не найден, правило не проверено"
+                warn=$((warn+1))
+            fi
+        elif [[ "$ufw_st" == "Status: active" ]]; then
             if ufw status 2>/dev/null | grep -qE "^${awg_port}/udp[[:space:]]+ALLOW"; then
                 _diag_line OK "UFW active, ${awg_port}/udp ALLOW"; ok=$((ok+1))
             else
@@ -1122,12 +1745,13 @@ diagnose_server() {
     peer_count=$(awg show awg0 peers 2>/dev/null | wc -l)
     _diag_line INFO "Peers сконфигурировано: $peer_count"
 
-    # 8. AWG params snapshot
-    local jc jmin jmax i1
-    jc=$(awg show awg0 2>/dev/null   | awk '/^[[:space:]]*jc:/   {print $2; exit}')
-    jmin=$(awg show awg0 2>/dev/null | awk '/^[[:space:]]*jmin:/ {print $2; exit}')
-    jmax=$(awg show awg0 2>/dev/null | awk '/^[[:space:]]*jmax:/ {print $2; exit}')
-    i1=$(awg show awg0 2>/dev/null   | awk -F': ' '/^[[:space:]]*i1:/ {print $2; exit}')
+    # 8. AWG params snapshot (один вызов awg show вместо четырёх)
+    local _awg_show jc jmin jmax i1
+    _awg_show=$(awg show awg0 2>/dev/null)
+    jc=$(awk '/^[[:space:]]*jc:/   {print $2; exit}' <<< "$_awg_show")
+    jmin=$(awk '/^[[:space:]]*jmin:/ {print $2; exit}' <<< "$_awg_show")
+    jmax=$(awk '/^[[:space:]]*jmax:/ {print $2; exit}' <<< "$_awg_show")
+    i1=$(awk -F': ' '/^[[:space:]]*i1:/ {print $2; exit}' <<< "$_awg_show")
     _diag_line INFO "AWG params: Jc=${jc:-?} Jmin=${jmin:-?} Jmax=${jmax:-?} I1=${i1:-absent}"
 
     # 9. Carrier comparison
@@ -1222,7 +1846,7 @@ list_clients() {
     clients=$(grep '^#_Name = ' "$SERVER_CONF_FILE" | sed 's/^#_Name = //' | sort) || clients=""
     if [[ -z "$clients" ]]; then
         if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-            echo "[]"
+            json_out "[]"
         else
             log "Клиенты не найдены."
         fi
@@ -1343,12 +1967,19 @@ list_clients() {
             fi
         fi
 
-        # Expiry info
+        # Expiry info: только для табличного вывода (JSON его не печатает -
+        # лишнее чтение файла на каждого клиента). Принимаем только числовой
+        # timestamp: повреждённый expiry-файл дал бы ошибку bash-арифметики
+        # из format_remaining прямо в таблице.
         local exp_str=""
-        local exp_ts
-        exp_ts=$(get_client_expiry "$name" 2>/dev/null)
-        if [[ -n "$exp_ts" ]]; then
-            exp_str=" [$(format_remaining "$exp_ts")]"
+        if [[ "$JSON_OUTPUT" -ne 1 ]]; then
+            local exp_ts
+            exp_ts=$(get_client_expiry "$name" 2>/dev/null)
+            if [[ "$exp_ts" =~ ^[0-9]+$ ]]; then
+                exp_str=" [$(format_remaining "$exp_ts")]"
+            elif [[ -n "$exp_ts" ]]; then
+                exp_str=" [expiry повреждён]"
+            fi
         fi
 
         if [[ "$JSON_OUTPUT" -eq 1 ]]; then
@@ -1369,7 +2000,8 @@ list_clients() {
     done <<< "$clients"
 
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-        ( IFS=","; echo "[${json_entries[*]}]" )
+        _jarr=$(IFS=","; echo "[${json_entries[*]}]")
+        json_out "$_jarr"
     else
         echo ""
         log "Всего клиентов: $tot, Активных/Недавно: $act"
@@ -1380,16 +2012,9 @@ list_clients() {
 # Статистика трафика
 # ==============================================================================
 
-# Экранирование строки для безопасного включения в JSON
-json_escape() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
-}
+# json_escape определён в блоке JSON-хелперов в начале файла (перенесён в
+# v5.21.0: EXIT-guard зовёт его на любом раннем выходе, значит определение
+# обязано стоять выше установки trap).
 
 # Форматирование размера в человекочитаемый формат
 format_bytes() {
@@ -1411,7 +2036,7 @@ stats_clients() {
     clients=$(grep '^#_Name = ' "$SERVER_CONF_FILE" | sed 's/^#_Name = //' | sort) || clients=""
     if [[ -z "$clients" ]]; then
         if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-            echo "[]"
+            json_out "[]"
         else
             log "Клиенты не найдены."
         fi
@@ -1443,12 +2068,25 @@ stats_clients() {
     local json_entries=()
     local table_rows=()
     local total_rx=0 total_tx=0
+    # date +%s один раз до цикла (а не subprocess на каждого пира);
+    # точности секундного среза для статусов active/recent достаточно.
+    local _stats_now
+    _stats_now=$(date +%s)
 
     # awg show dump: каждая строка пира = pubkey psk endpoint allowed-ips latest-handshake rx tx keepalive
     # shellcheck disable=SC2034
     while IFS=$'\t' read -r pk psk ep aips handshake rx tx keepalive; do
         local cname="${pk_to_name[$pk]:-unknown}"
         if [[ "$cname" == "unknown" ]]; then continue; fi
+
+        # awg show dump - вывод ядерной утилиты, но в JSON и арифметику значения
+        # должны идти каноничными десятичными числами. Регекс требует именно
+        # такой вид (0 либо без ведущего нуля): "08" прошло бы ^[0-9]+$, но дало
+        # бы невалидный JSON ("rx":08) и восьмеричную ошибку в $((...)). Всё
+        # прочее (нечисловое, битая строка dump вида a[$(...)]) тоже обнуляется.
+        [[ "$rx" =~ ^(0|[1-9][0-9]*)$ ]] || rx=0
+        [[ "$tx" =~ ^(0|[1-9][0-9]*)$ ]] || tx=0
+        [[ "$handshake" =~ ^(0|[1-9][0-9]*)$ ]] || handshake=0
 
         local ip="-"
         if [[ -f "$AWG_DIR/${cname}.conf" ]]; then
@@ -1458,9 +2096,7 @@ stats_clients() {
         local hs_str="никогда"
         local status="Неактивен" status_code="inactive"
         if [[ "$handshake" =~ ^[0-9]+$ && "$handshake" -gt 0 ]]; then
-            local now
-            now=$(date +%s)
-            local diff=$((now - handshake))
+            local diff=$((_stats_now - handshake))
             if [[ $diff -lt 180 ]]; then
                 status="Активен"; status_code="active"
             elif [[ $diff -lt 86400 ]]; then
@@ -1483,7 +2119,8 @@ stats_clients() {
     done < <(echo "$awg_dump" | tail -n +2)
 
     if [[ "$JSON_OUTPUT" -eq 1 ]]; then
-        ( IFS=","; echo "[${json_entries[*]}]" )
+        _jarr=$(IFS=","; echo "[${json_entries[*]}]")
+        json_out "$_jarr"
     else
         log "Статистика трафика клиентов:"
         echo ""
@@ -1507,6 +2144,13 @@ usage() {
     # дефолт) -> stderr + exit 1. Явные help-вызовы передают 0, error-вызовы
     # опускают аргумент (получают 1).
     local _rc="${1:-1}"
+    if [[ "$_rc" -ne 0 && "${JSON_OUTPUT:-0}" -eq 1 ]]; then
+        # --json + ошибка использования: текст справки боту не нужен, а exec >&2
+        # ниже угнал бы stdout у аварийного JSON-guard-а (exec переезжает fd
+        # всего процесса, guard стреляет ПОЗЖЕ, на EXIT). Причина уже в stderr.
+        _JSON_ERR="${_JSON_ERR:-invalid usage (unknown option or command)}"
+        exit "$_rc"
+    fi
     [[ "$_rc" -ne 0 ]] && exec >&2
     echo ""
     echo "Скрипт управления AmneziaWG 2.0 (v${SCRIPT_VERSION})"
@@ -1517,12 +2161,15 @@ usage() {
     echo "  -h, --help            Показать эту справку"
     echo "  -v, --verbose         Расширенный вывод (для команды list)"
     echo "  --no-color            Отключить цветной вывод"
-    echo "  --json                Машиночитаемый JSON-вывод (для команд list / stats)"
+    echo "  --json                Машиночитаемый JSON-вывод (большинство команд; детали в ADVANCED.md)"
+    echo "                        ENV AWG_STRICT_CONFIRM=1: не-TTY запуск без --yes отказывает (rc 1)"
     echo "  --expires=ВРЕМЯ       Срок действия при add (1h, 12h, 1d, 7d, 30d, 4w)"
     echo "  --conf-dir=ПУТЬ       Указать директорию AWG (умолч: $AWG_DIR)"
     echo "  --server-conf=ПУТЬ    Указать файл конфига сервера"
     echo "  --apply-mode=РЕЖИМ    syncconf (умолч.) или restart (обход kernel panic)"
     echo "  --psk                 (только для add) сгенерировать PresharedKey для клиента"
+    echo "  --reset-routes        (только для regen) сбросить AllowedIPs клиентов на текущий"
+    echo "                        глобальный режим маршрутизации (Issue #170)"
     echo "  --yes                 Не спрашивать подтверждение (эквивалент ENV AWG_YES=1)"
     echo "  --carrier=NAME        (только для diagnose) сравнить AWG-параметры с профилем оператора"
     echo "                        Доступные: beeline_msk yota_msk tele2_msk tele2_krasnoyarsk"
@@ -1534,7 +2181,7 @@ usage() {
     echo "  remove <имя> [имя2 ...]     Удалить клиента(ов)"
     echo "  list [-v] [--json]    Показать список клиентов (--json: машиночитаемый, с client_ipv6)"
     echo "  stats [--json]        Статистика трафика по клиентам"
-    echo "  regen [имя]           Перегенерировать файлы клиента(ов)"
+    echo "  regen [имя ...] [--reset-routes]  Перегенерировать файлы клиента(ов), можно несколько имён"
     echo "  modify <имя> <пар> <зн> Изменить параметр клиента"
     echo "  backup                Создать бэкап"
     echo "  restore [файл]        Восстановить из бэкапа"
@@ -1544,7 +2191,7 @@ usage() {
     echo "  restart               Перезапустить сервис AmneziaWG"
     echo "  upstream <действие>   Управление каскадом (role=entry):"
     echo "                        show | up | down | restart | apply"
-    echo "  repair-module         Восстановить модуль ядра после kernel upgrade"
+    echo "  repair-module         Восстановить модуль ядра после kernel upgrade (alias: repair)"
     echo "                        (dkms autoinstall + modprobe + запуск awg-quick)"
     echo "  help                  Показать эту справку"
     echo ""
@@ -1562,17 +2209,33 @@ if [[ "$COMMAND" == "help" ]]; then
     usage "$HELP_EXIT_RC"
 fi
 
-check_dependencies || exit 1
+check_dependencies || { _JSON_ERR="отсутствуют зависимости (диагностика в stderr)"; exit 1; }
 cd "$AWG_DIR" || die "Ошибка перехода в $AWG_DIR"
 
 # Подтягиваем роль и upstream-поля из конфига (для команд restart/upstream/check).
-# load_awg_params внутри generate_client/regenerate_client перечитает эти же
-# значения — здесь безвредно предзагрузить для ранних веток диспетчера.
-if [[ -f "$CONFIG_FILE" ]]; then
-    safe_load_config "$CONFIG_FILE" 2>/dev/null || true
+# Жёсткий сброс не даёт sudo -E выбрать unit через окружение. Отдельный строгий
+# проход отличает legacy-отсутствие полей от явной порчи/дубликатов; затем общий
+# whitelist-парсер загружает остальные настройки.
+AWG_ROLE=""
+AWG_UPSTREAM_IFACE=""
+if ! _manage_load_topology_strict "$CONFIG_FILE"; then
+    die "${_MANAGE_TOPOLOGY_ERROR:-Не удалось безопасно прочитать роль из $CONFIG_FILE}"
 fi
-AWG_ROLE="${AWG_ROLE:-single}"
-AWG_UPSTREAM_IFACE="${AWG_UPSTREAM_IFACE:-awg1}"
+safe_load_config "$CONFIG_FILE" 2>/dev/null \
+    || die "Не удалось загрузить настройки из $CONFIG_FILE."
+AWG_ROLE="$_MANAGE_CONFIG_ROLE"
+AWG_UPSTREAM_IFACE="$_MANAGE_CONFIG_UPSTREAM_IFACE"
+# safe_load_config также читает AWG_APPLY_MODE; явный CLI обязан иметь
+# приоритет над сохранённым init независимо от порядка аргументов.
+[[ -n "${_CLI_APPLY_MODE:-}" ]] && AWG_APPLY_MODE="$_CLI_APPLY_MODE"
+case "$AWG_ROLE" in
+    single|exit|entry) ;;
+    *) die "Некорректный AWG_ROLE='$AWG_ROLE' в $CONFIG_FILE." ;;
+esac
+if ! [[ "$AWG_UPSTREAM_IFACE" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]] \
+   || [[ "$AWG_UPSTREAM_IFACE" == "awg0" ]]; then
+    die "Некорректный AWG_UPSTREAM_IFACE='$AWG_UPSTREAM_IFACE' в $CONFIG_FILE."
+fi
 
 log "Запуск команды '$COMMAND'..."
 _cmd_rc=0
@@ -1586,8 +2249,14 @@ case $COMMAND in
         # AWG_SKIP_APPLY=1 (offline/batch edit без apply): пропускаем проверку модуля —
         # apply_config сам сделает no-op, и команда должна работать на dev-машине.
         if [[ "${AWG_SKIP_APPLY:-0}" != "1" ]]; then
-            ensure_amneziawg_kernel_module \
-                || die "Модуль ядра amneziawg недоступен. Запустите 'manage repair-module' и повторите."
+            # rc=2 (модуль OK, сервис не поднялся) не блокирует add: конфиг
+            # записывается, а apply_config сам явно сообщит о неприменении.
+            ensure_amneziawg_kernel_module; _mod_rc=$?
+            if [[ "$_mod_rc" -eq 1 ]]; then
+                die "Модуль ядра amneziawg недоступен. Запустите 'manage repair-module' и повторите."
+            elif [[ "$_mod_rc" -eq 2 ]]; then
+                log_warn "Сервис awg-quick@awg0 не активен - конфиг будет записан, но применение может не сработать."
+            fi
         fi
 
         # --psk: включить опциональный PresharedKey для каждого нового клиента.
@@ -1605,15 +2274,21 @@ case $COMMAND in
         # становился постоянным. Плохой формат теперь рушит команду до изменений.
         if [[ -n "$EXPIRES_DURATION" ]]; then
             parse_duration "$EXPIRES_DURATION" >/dev/null \
-                || die "Некорректный --expires='$EXPIRES_DURATION'. Используйте: 1h, 12h, 1d, 7d, 4w."
+                || die "Некорректный --expires='$EXPIRES_DURATION'. Используйте: 1h, 12h, 1d, 7d, 30d, 4w."
         fi
 
         _added=0
+        _jr=()
         for _cname in "${ARGS[@]}"; do
-            validate_client_name "$_cname" || { _cmd_rc=1; continue; }
+            validate_client_name "$_cname" || { _cmd_rc=1; _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"invalid_name\"}"); continue; }
 
             if grep -qxF "#_Name = ${_cname}" "$SERVER_CONF_FILE"; then
+                # _cmd_rc=1 - паритет с remove ("Нет клиентов для удаления") и
+                # regen ("не найден, пропуск"): no-op по этому имени должен быть
+                # различим по exit-коду для автоматизации (Issue #175).
                 log_warn "Клиент '$_cname' уже существует, пропуск."
+                _cmd_rc=1
+                _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"exists\"}")
                 continue
             fi
 
@@ -1623,10 +2298,22 @@ case $COMMAND in
                 export CLIENT_PSK="auto"
             fi
 
+            # Стейл-артефакты одноимённого клиента из прошлого (QR мог не
+            # пересоздаться, если qrencode пропал): без зачистки проверка
+            # [[ -f ]] ниже рапортовала бы чужой старый файл как свежий -
+            # и в логе, и в JSON.
+            rm -f "$AWG_DIR/${_cname}.png" "$AWG_DIR/${_cname}.vpnuri" "$AWG_DIR/${_cname}.vpnuri.png"
+
             log "Добавление '$_cname'..."
             if generate_client "$_cname"; then
                 log "Клиент '$_cname' добавлен."
-                log "Файлы: $AWG_DIR/${_cname}.conf, $AWG_DIR/${_cname}.png"
+                # .png упоминаем только если QR реально создан (qrencode может
+                # отсутствовать) - симметрично проверке .vpnuri ниже.
+                if [[ -f "$AWG_DIR/${_cname}.png" ]]; then
+                    log "Файлы: $AWG_DIR/${_cname}.conf, $AWG_DIR/${_cname}.png"
+                else
+                    log "Файлы: $AWG_DIR/${_cname}.conf"
+                fi
                 if [[ -f "$AWG_DIR/${_cname}.vpnuri" ]]; then
                     log "vpn:// URI: $AWG_DIR/${_cname}.vpnuri"
                 fi
@@ -1642,24 +2329,43 @@ case $COMMAND in
                     fi
                 fi
                 ((_added++))
+                # JSON-запись успеха: qr/vpnuri - пути, если файл реально
+                # существует на момент ответа (generate_client рапортует успех
+                # и при провале QR/URI); expires_at - epoch или null.
+                _jqr="null"; _juri="null"; _jexp="null"
+                [[ -f "$AWG_DIR/${_cname}.png" ]] && _jqr="\"$(json_escape "$AWG_DIR/${_cname}.png")\""
+                [[ -f "$AWG_DIR/${_cname}.vpnuri" ]] && _juri="\"$(json_escape "$AWG_DIR/${_cname}.vpnuri")\""
+                if [[ -n "$EXPIRES_DURATION" ]]; then
+                    _jexp_val=$(get_client_expiry "$_cname" 2>/dev/null) || _jexp_val=""
+                    [[ "$_jexp_val" =~ ^[0-9]+$ ]] && _jexp="$_jexp_val"
+                fi
+                _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"created\",\"conf\":\"$(json_escape "$AWG_DIR/${_cname}.conf")\",\"qr\":$_jqr,\"vpnuri\":$_juri,\"expires_at\":$_jexp}")
             else
                 log_error "Ошибка добавления клиента '$_cname'."
                 _cmd_rc=1
+                _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"error\"}")
             fi
         done
 
+        _japplied=false
         if [[ $_added -gt 0 ]]; then
-            [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
             if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
                 # apply_config сам залогирует и вернёт 0
                 apply_config
                 log "Добавлено клиентов: $_added. Применение отложено (AWG_SKIP_APPLY=1)."
             elif apply_config; then
+                _japplied=true
                 log "Добавлено клиентов: $_added. Конфигурация применена."
             else
                 log_error "Добавлено клиентов: $_added, но apply_config упал. Конфиг записан, но НЕ применён к live интерфейсу. Проверьте: systemctl status awg-quick@awg0"
                 _cmd_rc=1
             fi
+        fi
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jrj=""
+            [[ ${#_jr[@]} -gt 0 ]] && _jrj=$(IFS=,; printf '%s' "${_jr[*]}")
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            json_out "{\"command\":\"add\",\"ok\":$_jok,\"added\":$_added,\"failed\":$(( ${#ARGS[@]} - _added )),\"applied\":$_japplied,\"results\":[$_jrj]}"
         fi
         # Hygiene: CLIENT_PSK не должен протекать в будущие операции
         unset CLIENT_PSK
@@ -1670,10 +2376,16 @@ case $COMMAND in
 
         # Валидация всех имён перед удалением
         _valid_names=()
+        _jr=()
         for _rname in "${ARGS[@]}"; do
-            validate_client_name "$_rname" || { _cmd_rc=1; continue; }
+            validate_client_name "$_rname" || { _cmd_rc=1; _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"invalid_name\"}"); continue; }
             if ! grep -qxF "#_Name = ${_rname}" "$SERVER_CONF_FILE"; then
+                # _cmd_rc=1 (v5.21.0): раньше частичный not-found давал rc 0 -
+                # асимметрия с add (exists -> rc 1) и regen (not-found -> rc 1).
+                # Спека 3.4: 'remove a ghost' = частичный успех = rc 1.
                 log_warn "Клиент '$_rname' не найден, пропуск."
+                _cmd_rc=1
+                _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"not_found\"}")
                 continue
             fi
             _valid_names+=("$_rname")
@@ -1694,8 +2406,14 @@ case $COMMAND in
             # AWG_SKIP_APPLY=1 (offline/batch edit без apply): пропускаем проверку модуля —
             # apply_config сам сделает no-op, и команда должна работать на dev-машине.
             if [[ "${AWG_SKIP_APPLY:-0}" != "1" ]]; then
-                ensure_amneziawg_kernel_module \
-                    || die "Модуль ядра amneziawg недоступен. Запустите 'manage repair-module' и повторите."
+                # rc=2 (модуль OK, сервис не поднялся) не блокирует remove -
+                # симметрично add: apply_config сам явно сообщит о неприменении.
+                ensure_amneziawg_kernel_module; _mod_rc=$?
+                if [[ "$_mod_rc" -eq 1 ]]; then
+                    die "Модуль ядра amneziawg недоступен. Запустите 'manage repair-module' и повторите."
+                elif [[ "$_mod_rc" -eq 2 ]]; then
+                    log_warn "Сервис awg-quick@awg0 не активен - конфиг будет записан, но применение может не сработать."
+                fi
             fi
 
             _removed=0
@@ -1706,24 +2424,33 @@ case $COMMAND in
                     remove_client_expiry "$_rname"
                     log "Клиент '$_rname' удалён."
                     ((_removed++))
+                    _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"removed\"}")
                 else
                     log_error "Ошибка удаления '$_rname'."
                     _cmd_rc=1
+                    _jr+=("{\"name\":\"$(json_escape "$_rname")\",\"status\":\"error\"}")
                 fi
             done
 
+            _japplied=false
             if [[ $_removed -gt 0 ]]; then
-                [[ -n "${_CLI_APPLY_MODE:-}" ]] && export AWG_APPLY_MODE="$_CLI_APPLY_MODE"
                 if [[ "${AWG_SKIP_APPLY:-0}" == "1" ]]; then
                     apply_config
                     log "Удалено клиентов: $_removed. Применение отложено (AWG_SKIP_APPLY=1)."
                 elif apply_config; then
+                    _japplied=true
                     log "Удалено клиентов: $_removed. Конфигурация применена."
                 else
                     log_error "Удалено клиентов: $_removed, но apply_config упал. Peer-ы убраны из конфига, но могут оставаться на live интерфейсе. Проверьте: systemctl status awg-quick@awg0"
                     _cmd_rc=1
                 fi
             fi
+        fi
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jrj=""
+            [[ ${#_jr[@]} -gt 0 ]] && _jrj=$(IFS=,; printf '%s' "${_jr[*]}")
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            json_out "{\"command\":\"remove\",\"ok\":$_jok,\"removed\":${_removed:-0},\"failed\":$(( ${#ARGS[@]} - ${_removed:-0} )),\"applied\":${_japplied:-false},\"results\":[$_jrj]}"
         fi
         ;;
 
@@ -1737,17 +2464,39 @@ case $COMMAND in
 
     regen)
         log "Перегенерация файлов конфигурации и QR..."
+        # Правка AWG_* в awgsetup_cfg.init после установки на клиентов не влияет
+        # (источник истины - awg0.conf). Раньше это проходило молча (#196).
+        warn_awg_init_drift
+        # --reset-routes (Issue #170): передаём флаг в regenerate_client через
+        # ENV - обычный regen сохраняет индивидуальные AllowedIPs клиентов, с
+        # флагом ставит всем глобальный режим из awgsetup_cfg.init.
+        if [[ "${CLI_RESET_ROUTES:-0}" == "1" ]]; then
+            export AWG_REGEN_RESET_ROUTES=1
+            log "AllowedIPs всех перегенерируемых клиентов будут сброшены на глобальный режим (--reset-routes)."
+        fi
+        _jr=()
+        _regen_count=0
+        _regen_total=0
         if [[ ${#ARGS[@]} -eq 0 ]]; then
             # Без аргументов — все клиенты (сохраняет прежнее поведение).
             all_clients=$(grep '^#_Name = ' "$SERVER_CONF_FILE" | sed 's/^#_Name = //')
             if [[ -z "$all_clients" ]]; then
+                # Пустой список - штатный no-op: rc 0, в JSON regenerated=0.
                 log "Клиенты не найдены."
             else
                 while IFS= read -r cname; do
                     cname="${cname## }"; cname="${cname%% }"
                     [[ -z "$cname" ]] && continue
+                    _regen_total=$((_regen_total + 1))
                     log "Перегенерация '$cname'..."
-                    regenerate_client "$cname" || { log_warn "Ошибка перегенерации '$cname'"; _cmd_rc=1; }
+                    if regenerate_client "$cname"; then
+                        _regen_count=$((_regen_count + 1))
+                        _jr+=("$(_regen_json_entry "$cname")")
+                    else
+                        log_warn "Ошибка перегенерации '$cname'"
+                        _cmd_rc=1
+                        _jr+=("{\"name\":\"$(json_escape "$cname")\",\"status\":\"error\"}")
+                    fi
                 done <<< "$all_clients"
                 log "Перегенерация завершена."
             fi
@@ -1755,43 +2504,86 @@ case $COMMAND in
             # С аргументами — обрабатываем каждое имя отдельно (паритет с add/remove).
             # До v5.11.5 здесь читался только $CLIENT_NAME (=ARGS[0]), остальные имена
             # молча терялись (Issue #70).
-            _regen_count=0
+            _regen_total=${#ARGS[@]}
             for _cname in "${ARGS[@]}"; do
-                validate_client_name "$_cname" || { _cmd_rc=1; continue; }
+                validate_client_name "$_cname" || { _cmd_rc=1; _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"invalid_name\"}"); continue; }
                 if ! grep -qxF "#_Name = ${_cname}" "$SERVER_CONF_FILE"; then
                     log_warn "Клиент '$_cname' не найден, пропуск."
                     _cmd_rc=1
+                    _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"not_found\"}")
                     continue
                 fi
                 log "Перегенерация '$_cname'..."
                 if regenerate_client "$_cname"; then
                     _regen_count=$((_regen_count + 1))
+                    _jr+=("$(_regen_json_entry "$_cname")")
                 else
                     log_error "Ошибка перегенерации '$_cname'."
                     _cmd_rc=1
+                    _jr+=("{\"name\":\"$(json_escape "$_cname")\",\"status\":\"error\"}")
                 fi
             done
             if [[ $_regen_count -gt 0 ]]; then
                 log "Перегенерация завершена. Обработано: $_regen_count из ${#ARGS[@]}."
             fi
         fi
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jrj=""
+            [[ ${#_jr[@]} -gt 0 ]] && _jrj=$(IFS=,; printf '%s' "${_jr[*]}")
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            _jreset=false; [[ "${CLI_RESET_ROUTES:-0}" == "1" ]] && _jreset=true
+            # regen не меняет серверное состояние (ключи и IP переиспользуются,
+            # apply не требуется) - поля applied в конверте нет намеренно.
+            json_out "{\"command\":\"regen\",\"ok\":$_jok,\"regenerated\":$_regen_count,\"failed\":$(( _regen_total - _regen_count )),\"reset_routes\":$_jreset,\"results\":[$_jrj]}"
+        fi
         ;;
 
     modify)
         [[ -z "$CLIENT_NAME" ]] && die "Не указано имя клиента."
-        validate_client_name "$CLIENT_NAME" || exit 1
-        modify_client "$CLIENT_NAME" "$PARAM" "$VALUE" || _cmd_rc=1
+        validate_client_name "$CLIENT_NAME" || { _JSON_ERR="невалидное имя клиента"; exit 1; }
+        if modify_client "$CLIENT_NAME" "$PARAM" "$VALUE"; then
+            # modify правит ТОЛЬКО клиентский конфиг (DNS/MTU/AllowedIPs/...):
+            # серверное состояние не меняется, apply не нужен - поля applied
+            # в конверте нет намеренно (симметрия с regen).
+            json_out "{\"command\":\"modify\",\"ok\":true,\"name\":\"$(json_escape "$CLIENT_NAME")\",\"param\":\"$(json_escape "$PARAM")\",\"value\":\"$(json_escape "$VALUE")\"}"
+        else
+            _cmd_rc=1
+        fi
         ;;
 
     backup)
-        backup_configs || _cmd_rc=1
+        if backup_configs; then
+            _jsize=null
+            if [[ -n "${LAST_BACKUP_PATH:-}" && -f "$LAST_BACKUP_PATH" ]]; then
+                _jsize=$(stat -c%s "$LAST_BACKUP_PATH" 2>/dev/null) || _jsize=null
+            fi
+            json_out "{\"command\":\"backup\",\"ok\":true,\"path\":\"$(json_escape "${LAST_BACKUP_PATH:-}")\",\"size_bytes\":$_jsize}"
+        else
+            _cmd_rc=1
+        fi
         ;;
 
     restore)
-        restore_backup "$CLIENT_NAME" || _cmd_rc=1 # CLIENT_NAME используется как [файл]
+        if restore_backup "$CLIENT_NAME"; then # CLIENT_NAME используется как [файл]
+            _jclients=$(grep -c '^\[Peer\]' "$SERVER_CONF_FILE" 2>/dev/null) || _jclients=0
+            _jkeys=false
+            [[ -n "$(find "$KEYS_DIR" -maxdepth 1 -name '*.private' -print -quit 2>/dev/null)" ]] && _jkeys=true
+            # clients = число [Peer] в ВОССТАНОВЛЕННОМ серверном конфиге
+            # (спека 3.3: не файлов в clients/ - они могут расходиться).
+            json_out "{\"command\":\"restore\",\"ok\":true,\"source\":\"$(json_escape "${_RESTORE_SOURCE:-}")\",\"applied\":true,\"rolled_back\":false,\"restored\":{\"server_conf\":true,\"clients\":$_jclients,\"keys\":$_jkeys}}"
+        else
+            _cmd_rc=1
+            # Конверт и на провале: боту важно знать, был ли откат. error -
+            # человекочитаемый текст, машинные решения по ok/rc.
+            if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+                _jrb=false; [[ "${_RESTORE_ROLLED_BACK:-0}" == "1" ]] && _jrb=true
+                json_out "{\"command\":\"restore\",\"ok\":false,\"error\":\"$(json_escape "${_JSON_ERR:-restore failed (see stderr)}")\",\"source\":\"$(json_escape "${_RESTORE_SOURCE:-}")\",\"applied\":false,\"rolled_back\":$_jrb,\"rc\":1}"
+            fi
+        fi
         ;;
 
     check|status)
+        warn_awg_init_drift
         check_server || _cmd_rc=1
         ;;
 
@@ -1802,28 +2594,74 @@ case $COMMAND in
 
     restart)
         log "Перезапуск сервиса..."
+        # Предупреждение ДО confirm_action: при --yes/AWG_YES=1 подтверждения не
+        # будет, а отрезать себя от сервера можно и неинтерактивным запуском.
+        awg_warn_interface_disruption
         if ! confirm_action "перезапустить" "сервис"; then exit 1; fi
         # Перед systemctl restart убеждаемся, что модуль ядра загружен (mode=module-only,
         # т.к. сам systemctl ниже стартует unit явно — повторный start от ensure избыточен).
         ensure_amneziawg_kernel_module module-only \
             || die "Модуль ядра amneziawg недоступен. Запустите 'manage repair-module' и повторите."
-        if ! systemctl restart awg-quick@awg0; then
-            log_error "Ошибка перезапуска."
-            status_out=$(systemctl status awg-quick@awg0 --no-pager 2>&1) || true
-            while IFS= read -r line; do log_error "  $line"; done <<< "$status_out"
-            exit 1
-        else
-            log "Сервис перезапущен."
-        fi
+        _jactive=false
+        _jupactive=null
+        _restart_main=1
         if [[ "$AWG_ROLE" == "entry" ]]; then
+            # awg0 Requires upstream на entry-ноде. Перезапуск required-unit
+            # может остановить dependent awg0, поэтому support всегда идёт
+            # первым, а основной интерфейс поднимается только после его успеха.
             log "Перезапуск upstream-интерфейса ${AWG_UPSTREAM_IFACE}..."
             if ! systemctl restart "awg-quick@${AWG_UPSTREAM_IFACE}"; then
-                log_warn "Ошибка перезапуска ${AWG_UPSTREAM_IFACE}. Клиенты могут потерять интернет."
+                _JSON_ERR="upstream restart failed"
+                log_error "Ошибка перезапуска ${AWG_UPSTREAM_IFACE}; awg0 оставлен остановленным (fail-closed)."
                 _cmd_rc=1
+                _restart_main=0
+                if ! _ensure_awg0_down; then
+                    _JSON_ERR="upstream restart failed; awg0 could not be stopped"
+                    log_error "Fail-closed неполон: live-интерфейс awg0 всё ещё присутствует."
+                fi
             else
                 log "Upstream ${AWG_UPSTREAM_IFACE} перезапущен."
             fi
+            _jupactive=false
+            _manage_iface_is_healthy "$AWG_UPSTREAM_IFACE" && _jupactive=true
+            if [[ "$_jupactive" != "true" ]]; then
+                _JSON_ERR="upstream inactive after restart"
+                log_error "Upstream ${AWG_UPSTREAM_IFACE} не активен после restart; awg0 не запускается."
+                _cmd_rc=1
+                _restart_main=0
+                if ! _ensure_awg0_down; then
+                    _JSON_ERR="upstream inactive after restart; awg0 could not be stopped"
+                    log_error "Fail-closed неполон: live-интерфейс awg0 всё ещё присутствует."
+                fi
+            fi
         fi
+        if [[ "$_restart_main" -eq 1 ]]; then
+            if ! systemctl restart awg-quick@awg0; then
+                _JSON_ERR="service restart failed"
+                log_error "Ошибка перезапуска awg0."
+                status_out=$(systemctl status awg-quick@awg0 --no-pager 2>&1) || true
+                while IFS= read -r line; do log_error "  $line"; done <<< "$status_out"
+                _cmd_rc=1
+            fi
+        fi
+        if _manage_iface_is_healthy awg0; then
+            _jactive=true
+            if [[ "$_restart_main" -eq 1 && "$_cmd_rc" -eq 0 ]]; then
+                # Только подтверждённый postcondition unit+link означает, что
+                # live-интерфейс действительно догнал конфиг. Иначе snapshot
+                # мог бы скрыть будущее предупреждение о снятом параметре.
+                awg_record_device_params
+                log "Сервис awg0 перезапущен."
+            fi
+        else
+            if [[ "$_restart_main" -eq 1 && "$_cmd_rc" -eq 0 ]]; then
+                _JSON_ERR="service inactive after restart"
+                log_error "awg0 не активен после успешного systemctl restart."
+            fi
+            _cmd_rc=1
+        fi
+        _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+        json_out "{\"command\":\"restart\",\"ok\":$_jok,\"unit\":\"awg-quick@awg0\",\"active\":$_jactive,\"upstream_active\":$_jupactive}"
         ;;
 
     upstream)
@@ -1839,28 +2677,136 @@ case $COMMAND in
             case "$_up_action" in
                 show|status)
                     log "Статус upstream ${AWG_UPSTREAM_IFACE}:"
-                    awg show "${AWG_UPSTREAM_IFACE}" 2>/dev/null || log_warn "awg show ${AWG_UPSTREAM_IFACE}: интерфейс не поднят?"
+                    _up_show=$(awg show "${AWG_UPSTREAM_IFACE}" 2>/dev/null) || _up_show=""
+                    if [[ -n "$_up_show" ]]; then
+                        while IFS= read -r _ln; do log "  $_ln"; done <<< "$_up_show"
+                    else
+                        log_warn "awg show ${AWG_UPSTREAM_IFACE}: интерфейс не поднят?"
+                    fi
                     systemctl status "$_up" --no-pager 2>&1 | while IFS= read -r _ln; do log "  $_ln"; done
                     ;;
-                up|start)
-                    if systemctl start "$_up"; then log "${AWG_UPSTREAM_IFACE} запущен."; else log_error "Ошибка запуска ${AWG_UPSTREAM_IFACE}."; _cmd_rc=1; fi
+                up|start|restart)
+                    # Requires= связывает awg0 с support-unit: restart upstream
+                    # штатно гасит dependent awg0. Сохраняем отдельно systemd и
+                    # live-link: legacy-интерфейс мог быть поднят awg-quick вручную.
+                    _main_was_active=0
+                    _main_was_link=0
+                    systemctl is-active --quiet awg-quick@awg0 2>/dev/null && _main_was_active=1
+                    _manage_iface_link_present awg0 && _main_was_link=1
+                    _support_ok=0
+                    if [[ "$_up_action" == "restart" ]]; then
+                        awg_warn_interface_disruption
+                        if ! confirm_action "перезапустить" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
+                        if systemctl restart "$_up"; then
+                            log "${AWG_UPSTREAM_IFACE} перезапущен."
+                            _support_ok=1
+                        else
+                            log_error "Ошибка перезапуска ${AWG_UPSTREAM_IFACE}."
+                        fi
+                    elif systemctl start "$_up"; then
+                        log "${AWG_UPSTREAM_IFACE} запущен."
+                        _support_ok=1
+                    else
+                        log_error "Ошибка запуска ${AWG_UPSTREAM_IFACE}."
+                    fi
+                    if [[ "$_support_ok" -eq 1 ]] \
+                       && ! _manage_iface_is_healthy "$AWG_UPSTREAM_IFACE"; then
+                        log_error "${AWG_UPSTREAM_IFACE} не активен после ${_up_action}."
+                        _support_ok=0
+                    fi
+                    if [[ "$_support_ok" -eq 0 ]]; then
+                        _JSON_ERR="upstream ${_up_action} failed"
+                        if ! _ensure_awg0_down; then
+                            _JSON_ERR="upstream ${_up_action} failed; awg0 could not be stopped"
+                            log_error "Fail-closed неполон: live-интерфейс awg0 всё ещё присутствует."
+                        fi
+                        _cmd_rc=1
+                    elif [[ "$_main_was_active" -eq 1 || "$_main_was_link" -eq 1 ]]; then
+                        log "Восстановление awg0 после успешного ${_up_action} upstream..."
+                        if _restore_awg0_state "$_main_was_active" "$_main_was_link"; then
+                            awg_record_device_params
+                            log "awg0 активен."
+                        else
+                            _JSON_ERR="awg0 restore after upstream failed"
+                            log_error "Не удалось восстановить прежнее состояние awg0 после ${_up_action} upstream; выполняю fail-closed stop."
+                            _ensure_awg0_down || log_error "Fail-closed неполон: awg0 всё ещё активен."
+                            _cmd_rc=1
+                        fi
+                    fi
                     ;;
                 down|stop)
                     if ! confirm_action "остановить" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
-                    if systemctl stop "$_up"; then log "${AWG_UPSTREAM_IFACE} остановлен."; else log_error "Ошибка остановки."; _cmd_rc=1; fi
-                    ;;
-                restart)
-                    if systemctl restart "$_up"; then log "${AWG_UPSTREAM_IFACE} перезапущен."; else log_error "Ошибка перезапуска."; _cmd_rc=1; fi
+                    # Без upstream клиентский egress entry-ноды недействителен.
+                    # Сначала явно гасим awg0 (включая вручную поднятый legacy без
+                    # Requires), затем проверяем и systemd, и live link. Если
+                    # основной интерфейс снять не удалось, upstream НЕ трогаем:
+                    # иначе получили бы живой awg0 без обязательного egress.
+                    _main_down_ok=1
+                    if _ensure_awg0_down; then
+                        log "awg0 остановлен вместе с upstream (fail-closed)."
+                    else
+                        _main_down_ok=0
+                        _JSON_ERR="awg0 could not be stopped before upstream"
+                        log_error "Upstream ${AWG_UPSTREAM_IFACE} оставлен активным: awg0 всё ещё работает."
+                        _cmd_rc=1
+                    fi
+                    if [[ "$_main_down_ok" -eq 1 ]]; then
+                        if _ensure_upstream_down; then
+                            log "${AWG_UPSTREAM_IFACE} остановлен."
+                        else
+                            _JSON_ERR="upstream could not be stopped"
+                            log_error "${AWG_UPSTREAM_IFACE} всё ещё активен после попытки остановки."
+                            _cmd_rc=1
+                        fi
+                    fi
                     ;;
                 apply)
-                    apply_config "${AWG_UPSTREAM_IFACE}" || { log_error "apply_config ${AWG_UPSTREAM_IFACE} упал."; _cmd_rc=1; }
+                    # syncconf обычно не рвёт туннель, но его fallback и
+                    # --apply-mode=restart перезапускают required-unit и могут
+                    # остановить awg0. Восстанавливаем только ранее активный
+                    # основной интерфейс и лишь после проверки upstream.
+                    awg_warn_interface_disruption
+                    if ! confirm_action "применить конфиг" "upstream ${AWG_UPSTREAM_IFACE}"; then exit 1; fi
+                    _main_was_active=0
+                    _main_was_link=0
+                    systemctl is-active --quiet awg-quick@awg0 2>/dev/null && _main_was_active=1
+                    _manage_iface_link_present awg0 && _main_was_link=1
+                    if apply_config "${AWG_UPSTREAM_IFACE}" \
+                       && _manage_iface_is_healthy "$AWG_UPSTREAM_IFACE"; then
+                        if [[ "$_main_was_active" -eq 1 || "$_main_was_link" -eq 1 ]]; then
+                            if _restore_awg0_state "$_main_was_active" "$_main_was_link"; then
+                                awg_record_device_params
+                                log "awg0 восстановлен после применения upstream-конфига."
+                            else
+                                _JSON_ERR="awg0 restore after upstream apply failed"
+                                log_error "Upstream применён, но awg0 не удалось восстановить."
+                                _ensure_awg0_down || log_error "Fail-closed неполон: awg0 всё ещё активен."
+                                _cmd_rc=1
+                            fi
+                        fi
+                    else
+                        _JSON_ERR="upstream apply failed"
+                        log_error "apply_config ${AWG_UPSTREAM_IFACE} упал или upstream не активен."
+                        if ! _ensure_awg0_down; then
+                            _JSON_ERR="upstream apply failed; awg0 could not be stopped"
+                            log_error "Fail-closed неполон: live-интерфейс awg0 всё ещё присутствует."
+                        fi
+                        _cmd_rc=1
+                    fi
                     ;;
                 *)
                     log_error "Неизвестное действие upstream: '$_up_action'. Допустимо: show, up, down, restart, apply."
+                    _JSON_ERR="unknown upstream action"
                     _cmd_rc=1
                     ;;
             esac
         fi
+        _jupactive=false
+        _jmainactive=false
+        _manage_iface_is_live "$AWG_UPSTREAM_IFACE" && _jupactive=true
+        _manage_iface_is_live awg0 && _jmainactive=true
+        _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+        json_out "{\"command\":\"upstream\",\"action\":\"$(json_escape "${_up_action:-${CLIENT_NAME:-show}}")\",\"ok\":$_jok,\"interface\":\"$(json_escape "$AWG_UPSTREAM_IFACE")\",\"upstream_active\":$_jupactive,\"awg0_active\":$_jmainactive}"
         ;;
 
     repair-module|repair)
@@ -1868,11 +2814,30 @@ case $COMMAND in
         # требовать пересборки DKMS. Здесь разрешаем apt-установку headers
         # (AWG_ALLOW_APT_IN_ENSURE=1) — пользователь явно запросил восстановление.
         log "Восстановление модуля ядра amneziawg (может занять до 5 минут — DKMS rebuild)..."
-        if AWG_ALLOW_APT_IN_ENSURE=1 ensure_amneziawg_kernel_module full; then
-            log "Модуль ядра amneziawg восстановлен, сервис awg-quick@awg0 активен."
-        else
-            log_error "Не удалось восстановить модуль ядра. См. лог выше; при необходимости выполните ручное восстановление."
-            _cmd_rc=1
+        AWG_ALLOW_APT_IN_ENSURE=1 ensure_amneziawg_kernel_module full; _mod_rc=$?
+        _jmod=true; _jsvc=false
+        case "$_mod_rc" in
+            0)
+                _jsvc=true
+                log "Модуль ядра amneziawg восстановлен, сервис awg-quick@awg0 активен."
+                ;;
+            2)
+                # Раньше этот случай маскировался под успех: "сервис активен" +
+                # exit 0 при лежащем сервисе (Issue #175).
+                log_error "Модуль ядра в порядке, но сервис awg-quick@awg0 НЕ запустился."
+                log_error "Диагностика: systemctl status awg-quick@awg0; journalctl -u awg-quick@awg0 -n 50"
+                _cmd_rc=1
+                ;;
+            *)
+                _jmod=false
+                log_error "Не удалось восстановить модуль ядра. См. лог выше; при необходимости выполните ручное восстановление."
+                _cmd_rc=1
+                ;;
+        esac
+        if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+            _jok=false; [[ "$_cmd_rc" -eq 0 ]] && _jok=true
+            # rc здесь = код ensure_amneziawg_kernel_module (0/1/2), не exit-код.
+            json_out "{\"command\":\"repair-module\",\"ok\":$_jok,\"module_loaded\":$_jmod,\"service_active\":$_jsvc,\"rc\":$_mod_rc}"
         fi
         ;;
 
@@ -1880,9 +2845,9 @@ case $COMMAND in
         diagnose_server || _cmd_rc=1
         ;;
 
-    help)
-        usage
-        ;;
+    # Ветки help) здесь нет намеренно: все пути, выставляющие COMMAND="help"
+    # (-h/--help, неизвестная опция, позиционный help), перехватываются ДО
+    # диспетчера ранним `usage` (он завершает процесс через exit).
 
     *)
         log_error "Неизвестная команда: '$COMMAND'"

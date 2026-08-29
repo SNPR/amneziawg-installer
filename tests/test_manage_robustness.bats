@@ -213,9 +213,10 @@ extract_func() {
     body=$(extract_func "$COMMON_RU" "regenerate_client")
     # Lock must be closed before generate_qr; otherwise non-critical
     # QR/URI ops hold the config lock and block add/modify.
-    # Extract the section between the last sed -i and generate_qr.
+    # Extract the section between the last sed -i (AllowedIPs; v5.16.0
+    # switched its delimiter from | to /) and generate_qr.
     local tail
-    tail=$(awk '/if ! sed -i "s\|/,/generate_qr/' <<< "$body" | tail -n 20)
+    tail=$(awk '/if ! sed -i "s\/\^AllowedIPs/,/generate_qr/' <<< "$body" | tail -n 20)
     grep -qE 'exec \{lock_fd\}>&-' <<< "$tail"
 }
 
@@ -223,7 +224,7 @@ extract_func() {
     local body
     body=$(extract_func "$COMMON_EN" "regenerate_client")
     local tail
-    tail=$(awk '/if ! sed -i "s\|/,/generate_qr/' <<< "$body" | tail -n 20)
+    tail=$(awk '/if ! sed -i "s\/\^AllowedIPs/,/generate_qr/' <<< "$body" | tail -n 20)
     grep -qE 'exec \{lock_fd\}>&-' <<< "$tail"
 }
 
@@ -250,8 +251,10 @@ prepare_backup_sandbox() {
     log_error() { :; }
     log_debug() { :; }
     die()       { echo "die: $*" >&2; return 1; }
-    manage_mktempdir() { mktemp -d "$BATS_TMP/mktd-XXXXXX"; }
-    export -f log log_warn log_error log_debug die manage_mktempdir
+    # v5.21.2: manage_mktempdir_var writes the path to a named var (no $() so
+    # the parent's cleanup array registration survives).
+    manage_mktempdir_var() { local d; d=$(mktemp -d "$BATS_TMP/mktd-XXXXXX") || return 1; printf -v "$1" '%s' "$d"; }
+    export -f log log_warn log_error log_debug die manage_mktempdir_var
 }
 
 dynamic_teardown() {
