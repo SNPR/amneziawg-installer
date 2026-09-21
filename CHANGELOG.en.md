@@ -49,6 +49,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Fixed the false policy-routing conflict at step 7 in WARP and cascade modes:** after stripping `:`, AWK compared priorities as strings and treated the standard `32766`/`32767` rules as earlier than `789`/`456`. Both preflight and runtime checks now explicitly compare numbers in RU/EN, retaining real-conflict protection. A regression test executes the embedded AWK validators against synthetic rules without executing either installer.
 - **Rerunning after a step 7 crash no longer restarts an already verified live `awg0`:** the installer checks the unit, link, regular config, `awg-quick strip`, service postcondition, and exact egress state; ambiguous state is left untouched. Rollback for a reused upstream is re-armed after a process restart as well.
 - **Transitions among direct, entry/cascade, and WARP no longer expose partial state:** configs, runtime/link/enabled state, the dependency drop-in, UFW, DNS, and WARP bypass participate in one coherent rollback; unfinished cleanup markers block a second migration until the first one completes safely.
 - **Policy routing and firewall state are verified by exact shape:** foreign rules/routes, occupied priorities, ambiguous defaults, `linkdown` or inactive nexthop interfaces, and incomplete FORWARD/NAT/TCPMSS/isolation rules cannot pass. Uninstall and post-commit cleanup stop or delete only resources with proven ownership.

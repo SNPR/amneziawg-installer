@@ -6859,7 +6859,8 @@ preflight_fork_policy_namespace() {
                     && ($4 == "lookup" || $4 == "table") \
                     && ($5 == "local" || $5 == "255") && NF == 5) zero_local++
                 else collision=1
-            } else if (prio ~ /^[0-9]+$/ && prio < pn) collision=1
+            # sub() leaves a string: force numeric ordering (32766 > 789).
+            } else if (prio ~ /^[0-9]+$/ && (prio + 0) < (pn + 0)) collision=1
             for (i=2; i<NF; i++)
                 if (($i == "lookup" || $i == "table") && $(i+1) == t) collision=1
         }
@@ -6970,7 +6971,8 @@ verify_fork_egress_runtime() {
                     && ($4 == "lookup" || $4 == "table") \
                     && ($5 == "local" || $5 == "255") && NF == 5) zero_local++
                 else earlier=1
-            } else if (prio ~ /^[0-9]+$/ && prio < pn) earlier=1
+            # sub() leaves a string: force numeric ordering (32766 > 789).
+            } else if (prio ~ /^[0-9]+$/ && (prio + 0) < (pn + 0)) earlier=1
             for (i=2; i<NF; i++)
                 if (($i == "lookup" || $i == "table") && $(i+1) == t) table_lookups++
         }
