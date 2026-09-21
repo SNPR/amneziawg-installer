@@ -6891,22 +6891,28 @@ preflight_fork_policy_namespace() {
 verify_fork_firewall_runtime() {
     local iface="$1" source_net="$2" path_mtu="${AWG_MTU:-1280}" mss4=""
     local main_route="" main_nic=""
-    command -v iptables >/dev/null 2>&1 || return 1
-    iptables -w 5 -C FORWARD -i awg0 -o "$iface" -j ACCEPT >/dev/null 2>&1 || return 1
+    command -v iptables >/dev/null 2>&1 || { log_error "Egress [firewall]: iptables не найден."; return 1; }
+    iptables -w 5 -C FORWARD -i awg0 -o "$iface" -j ACCEPT >/dev/null 2>&1 \
+        || { log_error "Egress [firewall]: нет FORWARD ACCEPT awg0 -> $iface."; return 1; }
     iptables -w 5 -C FORWARD -i "$iface" -o awg0 \
-        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || return 1
+        -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 \
+        || { log_error "Egress [firewall]: нет FORWARD RELATED,ESTABLISHED $iface -> awg0."; return 1; }
     if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
         iptables -w 5 -t nat -C POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1 \
-            || return 1
+            || { log_error "Egress [firewall]: нет MASQUERADE через $iface."; return 1; }
     else
         iptables -w 5 -t nat -C POSTROUTING -s "$source_net" -o "$iface" \
-            -j MASQUERADE >/dev/null 2>&1 || return 1
+            -j MASQUERADE >/dev/null 2>&1 \
+            || { log_error "Egress [firewall]: нет MASQUERADE $source_net -> $iface."; return 1; }
         if [[ "${AWG_WARP_BYPASS:-none}" != "none" ]]; then
-            main_route=$(ip -4 route get 1.1.1.1 2>/dev/null) || return 1
+            main_route=$(ip -4 route get 1.1.1.1 2>/dev/null) \
+                || { log_error "Egress [bypass]: не найден основной маршрут к 1.1.1.1."; return 1; }
             main_nic=$(awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' <<< "$main_route")
-            _valid_warp_bypass_route_iface "$main_nic" || return 1
+            _valid_warp_bypass_route_iface "$main_nic" \
+                || { log_error "Egress [bypass]: некорректный основной интерфейс '$main_nic'."; return 1; }
             iptables -w 5 -t nat -C POSTROUTING -s "$source_net" -o "$main_nic" \
-                -j MASQUERADE >/dev/null 2>&1 || return 1
+                -j MASQUERADE >/dev/null 2>&1 \
+                || { log_error "Egress [firewall]: нет bypass MASQUERADE $source_net -> $main_nic."; return 1; }
         fi
     fi
     _validate_mtu "$path_mtu" || path_mtu=1280
@@ -6918,11 +6924,14 @@ verify_fork_firewall_runtime() {
     fi
     mss4=$(( path_mtu - 40 ))
     iptables -w 5 -t mangle -C FORWARD -o awg0 -p tcp \
-        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss4" >/dev/null 2>&1 || return 1
+        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss4" >/dev/null 2>&1 \
+        || { log_error "Egress [firewall]: нет TCPMSS=$mss4 для -o awg0."; return 1; }
     iptables -w 5 -t mangle -C FORWARD -i awg0 -p tcp \
-        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss4" >/dev/null 2>&1 || return 1
+        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss4" >/dev/null 2>&1 \
+        || { log_error "Egress [firewall]: нет TCPMSS=$mss4 для -i awg0."; return 1; }
     if [[ "${CLIENT_ISOLATION:-1}" -eq 1 ]]; then
-        iptables -w 5 -C FORWARD -i awg0 -o awg0 -j DROP >/dev/null 2>&1 || return 1
+        iptables -w 5 -C FORWARD -i awg0 -o awg0 -j DROP >/dev/null 2>&1 \
+            || { log_error "Egress [firewall]: нет DROP awg0 -> awg0 для изоляции клиентов."; return 1; }
     fi
     return 0
 }
@@ -6932,7 +6941,7 @@ verify_fork_firewall_runtime() {
 verify_fork_egress_runtime() {
     local require_complete_bypass="${1:-0}"
     local iface="" unit="" table="" priority="" guard_priority="" source_net="" routes=""
-    local rules="" line="" specific_routes="" blackholes=0 defaults=0
+    local rules="" line="" specific_routes="" support_link="" blackholes=0 defaults=0
     if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
         iface="${AWG_UPSTREAM_IFACE:-awg1}"
         unit="awg-quick@${iface}"
@@ -6947,10 +6956,14 @@ verify_fork_egress_runtime() {
         return 0
     fi
     guard_priority=$(( 10#$priority + 1 ))
-    source_net=$(_awg_network_cidr "${AWG_TUNNEL_SUBNET:-}") || return 1
-    systemctl is-active --quiet "$unit" 2>/dev/null || return 1
-    ip link show up dev "$iface" >/dev/null 2>&1 || return 1
-    rules=$(ip -N -4 rule show 2>/dev/null) || return 1
+    source_net=$(_awg_network_cidr "${AWG_TUNNEL_SUBNET:-}") \
+        || { log_error "Egress [subnet]: некорректная подсеть '${AWG_TUNNEL_SUBNET:-}'."; return 1; }
+    systemctl is-active --quiet "$unit" 2>/dev/null \
+        || { log_error "Egress [service]: $unit не active."; return 1; }
+    support_link=$(ip link show up dev "$iface" 2>/dev/null) && [[ -n "$support_link" ]] \
+        || { log_error "Egress [link]: интерфейс $iface отсутствует или не UP."; return 1; }
+    rules=$(ip -N -4 rule show 2>/dev/null) \
+        || { log_error "Egress [rules]: команда ip -N -4 rule show завершилась ошибкой."; return 1; }
     printf '%s\n' "$rules" | awk -v pn="$priority" -v p="${priority}:" -v g="${guard_priority}:" -v s="$source_net" -v t="$table" '
         $1 == p {
             primary_total++
@@ -6959,8 +6972,9 @@ verify_fork_egress_runtime() {
         }
         $1 == g {
             guard_total++
-            if ((($2 == "from" && $3 == s && $4 == "blackhole") \
-                 || ($2 == "blackhole" && $3 == "from" && $4 == s)) && NF == 4) guard++
+            # ip -N prints FR_ACT_BLACKHOLE as 6, not as its symbolic name.
+            if ((($2 == "from" && $3 == s && ($4 == "blackhole" || $4 == "6")) \
+                 || (($2 == "blackhole" || $2 == "6") && $3 == "from" && $4 == s)) && NF == 4) guard++
         }
         {
             prio=$1
@@ -6981,30 +6995,40 @@ verify_fork_egress_runtime() {
                  && guard_total == 1 && guard == 1 && table_lookups == 1 \
                  && zero_total == 1 && zero_local == 1 && !earlier ? 0 : 1)
         }
-    ' || return 1
-    routes=$(ip -4 route show table "$table" 2>/dev/null) || return 1
+    ' || {
+        log_error "Egress [rules]: ожидались local, from $source_net lookup $table (priority $priority) и blackhole/6 (priority $guard_priority), без конфликтов. Получено: $rules"
+        return 1
+    }
+    routes=$(ip -4 route show table "$table" 2>/dev/null) \
+        || { log_error "Egress [routes]: не удалось прочитать таблицу $table."; return 1; }
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -n "$line" ]] || continue
         if [[ "$line" == blackhole\ default* ]]; then
-            _validate_expected_table_default "$line" blackhole "" 42760 || return 1
+            _validate_expected_table_default "$line" blackhole "" 42760 \
+                || { log_error "Egress [routes]: неожиданный blackhole в table $table: $line"; return 1; }
             blackholes=$(( blackholes + 1 ))
         elif [[ "$line" == default* ]]; then
             if [[ "${AWG_ROLE:-single}" == "entry" ]]; then
-                _validate_expected_table_default "$line" real "$iface" "" || return 1
+                _validate_expected_table_default "$line" real "$iface" "" \
+                    || { log_error "Egress [routes]: неверный default через $iface в table $table: $line"; return 1; }
             else
-                _validate_expected_table_default "$line" real "$iface" 10 || return 1
+                _validate_expected_table_default "$line" real "$iface" 10 \
+                    || { log_error "Egress [routes]: неверный WARP default через $iface с metric 10 в table $table: $line"; return 1; }
             fi
             defaults=$(( defaults + 1 ))
         elif [[ "${AWG_ROLE:-single}" == "entry" ]]; then
+            log_error "Egress [routes]: посторонний маршрут в upstream table $table: $line"
             return 1
         else
             specific_routes+="${specific_routes:+$'\n'}${line}"
         fi
     done <<< "$routes"
-    (( blackholes == 1 && defaults == 1 )) || return 1
+    (( blackholes == 1 && defaults == 1 )) \
+        || { log_error "Egress [routes]: table $table: blackholes=$blackholes, defaults=$defaults; требуется ровно по одному."; return 1; }
     if [[ "${AWG_ROLE:-single}" != "entry" ]]; then
         validate_owned_warp_bypass_route_set \
-            "$specific_routes" "$table" "$require_complete_bypass" || return 1
+            "$specific_routes" "$table" "$require_complete_bypass" \
+            || { log_error "Egress [bypass]: маршруты table $table не совпадают с owned ledger/основным nexthop: $specific_routes"; return 1; }
     fi
     verify_fork_firewall_runtime "$iface" "$source_net" || return 1
     return 0
@@ -7325,7 +7349,7 @@ step7_start_service() {
     fi
 
     verify_fork_egress_runtime \
-        || die "Fork egress не прошёл live-проверку: support/rule/blackhole/default route неполны."
+        || die "Fork egress не прошёл live-проверку; причина указана в сообщении Egress [...] выше."
     # Записываем snapshot только после service + exact egress postcondition.
     awg_record_device_params
     # Критическое окно UFW-delete → bypass/DNS transactions → commit не

@@ -47,10 +47,10 @@ for (const file of ['install_amneziawg.sh', 'install_amneziawg_en.sh']) {
             assert.equal(result.signal, null, `${label}: AWK was interrupted`);
             assert.equal(result.status, expected, `${phase}: ${label}\n${result.stderr}`);
         }
-        function owned(priority = 789, table = 2408) {
+        function owned(priority = 789, table = 2408, action = 'blackhole') {
             return [
                 `${priority}: from ${sourceNet} lookup ${table}`,
-                `${priority + 1}: from ${sourceNet} blackhole`,
+                `${priority + 1}: from ${sourceNet} ${action}`,
             ];
         }
 
@@ -62,6 +62,29 @@ for (const file of ['install_amneziawg.sh', 'install_amneziawg_en.sh']) {
                     check('runtime', [...baseline(named), ...owned(priority, table)], 0,
                         `owned runtime at ${priority}`, priority, table);
                 }
+            }
+        });
+
+        test(`${file} / ${awk}: ip -N numeric blackhole action is accepted`, () => {
+            // iproute2 ip/iprule.c prints rtnl_rtntype_n2a(frh->action).
+            // ip/rtm_map.c prints its integer when -N is set; Linux
+            // include/uapi/linux/fib_rules.h defines FR_ACT_BLACKHOLE = 6.
+            for (const [priority, table] of [[789, 2408], [456, 123]]) {
+                check('runtime', [...baseline(), ...owned(priority, table, '6')], 0,
+                    'numeric action from ip -N -4 rule show', priority, table);
+                check('runtime', [...baseline(), owned(priority, table)[0],
+                    `${priority + 1}: 6 from ${sourceNet}`], 0,
+                    'numeric action before source', priority, table);
+                for (const action of ['0', '1', '2', '3', '7', '8', 'unreachable', 'prohibit']) {
+                    check('runtime', [...baseline(), ...owned(priority, table, action)], 1,
+                        `reject non-blackhole action ${action}`, priority, table);
+                }
+                check('runtime', [...baseline(), owned(priority, table)[0],
+                    `${priority + 1}: from all 6`], 1, 'numeric guard with wrong source', priority, table);
+                check('runtime', [...baseline(), ...owned(priority, table, '6 proto 4')], 1,
+                    'numeric guard with unexpected attributes', priority, table);
+                check('runtime', [...baseline(), ...owned(priority, table, '6'),
+                    owned(priority, table)[1]], 1, 'duplicate numeric and named guards', priority, table);
             }
         });
 
